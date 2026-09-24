@@ -1,35 +1,45 @@
-import carla
 import time
-
+import carla
 def main():
-    # 1. Connect to the CARLA UE4 Server running locally on port 2000
+    # Connect to CARLA Server on default port 2000
     print("Connecting to CARLA server...")
     client = carla.Client('localhost', 2000)
-    client.set_timeout(10.0) # 10 second connection timeout
+    client.set_timeout(10.0) # 10 second timeout limit
 
-    # 2. Get the simulation world instance
+    # Retrieve current world instance
     world = client.get_world()
-    print(f"Connected to CARLA Map: {world.get_map().name}")
+    print(f"Connected to world map: {world.get_map().name}")
 
-    # 3. Retrieve Blueprint Library to spawn actors
-    blueprint_library = world.get_blueprint_library()
-    vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
+    # Set Synchronous Mode (Prevents lag/stutter by syncing step ticks)
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = 0.05  # 20 FPS fixed time-step
+    world.apply_settings(settings)
 
-    # 4. Pick a spawn location from the map definition
-    spawn_points = world.get_map().get_spawn_points()
-    spawn_point = spawn_points[0] if spawn_points else carla.Transform()
-
-    # 5. Spawn the physical representation actor
-    vehicle = world.try_spawn_actor(vehicle_bp, spawn_point)
-    if vehicle:
-        print(f"Successfully spawned vehicle (ID: {vehicle.id}) at {spawn_point.location}")
+    try:
+        # Spawn a vehicle from blueprint library
+        blueprint_library = world.get_blueprint_library()
+        vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
         
-        # Keep alive for 5 seconds then clean up
-        time.sleep(5.0)
-        vehicle.destroy()
-        print("Vehicle destroyed. Connection test complete.")
-    else:
-        print("Failed to spawn vehicle at target transform.")
+        # Pick first available spawn point in map
+        spawn_point = world.get_map().get_spawn_points()[0]
+        vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+        print(f"Spawned Digital Twin Vehicle (ID: {vehicle.id}) at {spawn_point.location}")
+
+        # Simulation loop tick
+        for step in range(100):
+            world.tick()  # Step the simulator explicitly
+            location = vehicle.get_location()
+            print(f"Step {step}: Vehicle Position -> X: {location.x:.2f}, Y: {location.y:.2f}")
+            time.sleep(0.05)
+
+    finally:
+        # Clean up actor and revert settings on exit
+        if 'vehicle' in locals():
+            vehicle.destroy()
+        settings.synchronous_mode = False
+        world.apply_settings(settings)
+        print("Cleaned up simulation actors.")
 
 if __name__ == '__main__':
     main()
