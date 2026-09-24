@@ -1,14 +1,19 @@
-# Python
+# Python Virtual Environments & Cache
+.venv/
+env/
 __pycache__/
 *.pyc
-.venv/
-*.env
 
-# CARLA Logs & Builds
+# IDE / Editor Files
+.vscode/
+.idea/
+
+# CARLA / Unreal Engine Build Artefacts
 *.log
 *_out/
 Saved/
 Intermediate/
+DerivedDataCache/
 
-# Hardware & Config Secrets
+# Local Configurations & Secrets
 config/secrets.json

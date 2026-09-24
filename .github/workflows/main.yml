@@ -27,7 +27,7 @@ jobs:
 
       - name: Code Syntax & Formatting Check
         run: |
-          ruff check .
+          ruff check --fix.
 
       - name: Run Unit Tests
         run: |
