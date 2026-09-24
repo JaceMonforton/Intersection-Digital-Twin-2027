@@ -1,12 +1,17 @@
-# Web & API
-fastapi>=0.110.0
-uvicorn[standard]>=0.28.0
-pydantic>=2.6.0
+# --- CARLA & Simulation ---
+carla>=0.9.13
+numpy>=1.22.0
+scipy>=1.8.0
 
-# Database & ORM
-sqlalchemy>=2.0.0
-alembic>=1.13.0
-
-# Environment & Utilities
-python-dotenv>=1.0.0
+# --- Middleware & Communication (Eclipse Ditto / MQTT) ---
+paho-mqtt>=1.6.1
+websockets>=11.0.3
 requests>=2.31.0
+
+# --- Configuration & Utility ---
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# --- Testing & Code Quality ---
+pytest>=7.4.0
+ruff>=0.1.0
