@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # --- System Configuration ---
 CARLA_HOST = "localhost"
 CARLA_PORT = 2000
-DITTO_WS_URL = "ws://localhost:8080/ws/2"
+DITTO_WS_URL = "ws://192.168.0.101:8080/ws/2"
 SCALE_FACTOR = 10.0
 
 
@@ -56,7 +56,7 @@ class DittoCarlaBridge:
         # MANDATORY: Ditto protocol requires plain-text
         # 'START-SEND-EVENTS' to begin streaming
         ws.send("START-SEND-EVENTS")
-
+        
     def on_error(self, ws, error):
         logger.error("WebSocket Error: %s", error)
 
@@ -76,10 +76,20 @@ class DittoCarlaBridge:
             )
             return
 
+        # -------------------------------------------------------------
+        # OPTION A: Print the raw incoming string message to the screen
+        # -------------------------------------------------------------
+        print(f"\n--- [RAW INCOMING DITTO DATA] ---\n{message}\n")
+
         try:
             data = json.loads(message)
             path = data.get("path", "")
             value = data.get("value", {})
+
+            # -------------------------------------------------------------
+            # OPTION B: Print nicely formatted (pretty-print) JSON data
+            # -------------------------------------------------------------
+            # print(json.dumps(data, indent=4)) 
 
             # Match kinematics update path
             if "/features/kinematics" in path and isinstance(value, dict):
@@ -92,16 +102,8 @@ class DittoCarlaBridge:
                 carla_y = -y_phys * SCALE_FACTOR
                 carla_yaw = -heading_deg
 
-                location = carla.Location(
-                    x=carla_x,
-                    y=carla_y,
-                    z=0.5,
-                )
-                rotation = carla.Rotation(
-                    pitch=0.0,
-                    yaw=carla_yaw,
-                    roll=0.0,
-                )
+                location = carla.Location(x=carla_x, y=carla_y, z=0.5)
+                rotation = carla.Rotation(pitch=0.0, yaw=carla_yaw, roll=0.0)
                 transform = carla.Transform(location, rotation)
 
                 if self.actor is not None:
@@ -120,15 +122,10 @@ class DittoCarlaBridge:
                     )
 
         except json.JSONDecodeError:
-            logger.debug(
-                "Non-JSON message received: %s",
-                message,
-            )
+            logger.debug("Non-JSON message received: %s", message)
         except (ValueError, TypeError, KeyError) as err:
-            logger.error(
-                "Error processing update: %s",
-                err,
-            )
+            logger.error("Error processing update: %s", err)
+
 
     def start(self):
         logger.info(
