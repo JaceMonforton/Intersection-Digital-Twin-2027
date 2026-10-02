@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # --- System Configuration ---
 CARLA_HOST = "localhost"
 CARLA_PORT = 2000
-DITTO_WS_URL = "ws://192.168.0.101:8080/ws/2"
+DITTO_WS_URL = "ws://192.168.0.102:8080/ws/2"
 SCALE_FACTOR = 10.0
 
 
