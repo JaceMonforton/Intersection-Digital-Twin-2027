@@ -1,0 +1,125 @@
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: intersection-digital-twin-2027-mongodb-1
+    command: mongod --storageEngine wiredTiger --noscripting
+    ports:
+      - "27017:27017"
+    environment:
+      - TZ=UTC
+    volumes:
+      - mongo-data:/data/db
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+
+  policies:
+    image: eclipse/ditto-policies:latest
+    container_name: intersection-digital-twin-2027-policies-1
+    environment:
+      - BIND_HOSTNAME=0.0.0.0
+      - MONGO_DB_HOSTNAME=mongodb
+    depends_on:
+      - mongodb
+    networks:
+      default:
+        aliases:
+          - ditto-cluster
+
+  things:
+    image: eclipse/ditto-things:latest
+    container_name: intersection-digital-twin-2027-things-1
+    environment:
+      - BIND_HOSTNAME=0.0.0.0
+      - MONGO_DB_HOSTNAME=mongodb
+    depends_on:
+      - mongodb
+    networks:
+      default:
+        aliases:
+          - ditto-cluster
+
+  things-search:
+    image: eclipse/ditto-things-search:latest
+    container_name: intersection-digital-twin-2027-things-search-1
+    environment:
+      - BIND_HOSTNAME=0.0.0.0
+      - MONGO_DB_HOSTNAME=mongodb
+    depends_on:
+      - mongodb
+    networks:
+      default:
+        aliases:
+          - ditto-cluster
+
+  connectivity:
+    image: eclipse/ditto-connectivity:latest
+    container_name: intersection-digital-twin-2027-connectivity-1
+    environment:
+      - BIND_HOSTNAME=0.0.0.0
+      - MONGO_DB_HOSTNAME=mongodb
+    depends_on:
+      - mongodb
+      - mosquitto
+    networks:
+      default:
+        aliases:
+          - ditto-cluster
+
+  gateway:
+    image: eclipse/ditto-gateway:latest
+    container_name: intersection-digital-twin-2027-gateway-1
+    # Direct access to the Ditto gateway from the host (bypasses nginx).
+    # Dev only: pre-authentication is enabled, so send the header
+    #   x-ditto-pre-authenticated: nginx:ditto
+    ports:
+      - "8081:8080"
+    environment:
+      - BIND_HOSTNAME=0.0.0.0
+      - ENABLE_PRE_AUTHENTICATION=true
+    depends_on:
+      - policies
+      - things
+    networks:
+      default:
+        aliases:
+          - ditto-cluster
+
+  swagger-ui:
+    image: swaggerapi/swagger-ui
+    container_name: intersection-digital-twin-2027-swagger-ui-1
+    environment:
+      - 'URLS=[{"url": "http://localhost:8080/apidoc/openapi/ditto-api-2.0.json", "name": "Ditto API 2.0"}]'
+
+  ditto-ui:
+    image: eclipse/ditto-ui:latest
+    container_name: intersection-digital-twin-2027-ditto-ui-1
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: intersection-digital-twin-2027-nginx-1
+    # Host 8080 -> nginx listening on 80 inside the container.
+    # If your nginx.conf says "listen 8080;", change this to "8080:8080".
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - gateway
+      - ditto-ui
+      - swagger-ui
+
+  # Optional: Kuksa databroker (uncomment if you want it in this stack).
+  # kuksa-databroker:
+  #   image: ghcr.io/eclipse-kuksa/kuksa-databroker:latest
+  #   container_name: intersection-digital-twin-2027-kuksa-1
+  #   command: ["--insecure"]
+  #   ports:
+  #     - "55555:55555"
+
+volumes:
+  mongo-data:

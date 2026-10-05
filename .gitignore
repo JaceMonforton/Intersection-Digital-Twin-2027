@@ -17,3 +17,58 @@ DerivedDataCache/
 
 # Local Configurations & Secrets
 config/secrets.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+nginx.htpasswd
+.htpasswd
+docker-compose.override.yml
+
+# --- Docker / local data ---
+mongo-data/
+data/
+
+# --- CARLA artifacts (large, machine-specific) ---
+*.whl
+CarlaUE4/
+PythonAPI/
+Saved/
+*.rec
+recordings/
+
+# --- Logs, captures, outputs ---
+*.log
+logs/
+screenshots/
+output/
+tmp/
+
+# --- IDEs / editors ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini

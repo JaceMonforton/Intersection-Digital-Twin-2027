@@ -1,0 +1,1 @@
+{"entries":{"DEFAULT":{"subjects":{"nginx:ditto":{"type":"pre-authenticated"}},"resources":{"thing:/":{"grant":["READ","WRITE"],"revoke":[]},"policy:/":{"grant":["READ","WRITE"],"revoke":[]}}}}}
