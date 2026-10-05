@@ -1,7 +1,8 @@
-import carla
-import time
 import math
 import sys
+import time
+
+import carla
 
 CARLA_HOST = 'localhost'
 CARLA_PORT = 2000
@@ -31,7 +32,7 @@ def main():
         actors = world.get_actors().filter('vehicle.*')
         
         # Categorize vehicles
-        ego_vehicles = [a for a in actors if 'ego' in a.attributes.get('role_name', '')]
+        [a for a in actors if 'ego' in a.attributes.get('role_name', '')]
         all_vehicles = list(actors)
 
         print(f"--- Sample {sample}/5 (Total Vehicles in World: {len(all_vehicles)}) ---")
@@ -63,7 +64,7 @@ def main():
     print(" VERIFICATION SUMMARY")
     print("=" * 65)
     
-    unique_roles = set(a.attributes.get('role_name', 'npc') for a in world.get_actors().filter('vehicle.*'))
+    unique_roles = {a.attributes.get('role_name', 'npc') for a in world.get_actors().filter('vehicle.*')}
     print(f"Detected Vehicle Roles: {list(unique_roles)}")
 
     if len(initial_positions) >= 2:

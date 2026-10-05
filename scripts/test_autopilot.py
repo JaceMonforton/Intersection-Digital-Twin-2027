@@ -1,9 +1,9 @@
+import math
+import time
+
 import carla
 import numpy as np
 import pygame
-import sys
-import time
-import math
 
 # --- Configuration Constants ---
 WINDOW_WIDTH = 1280
@@ -133,7 +133,7 @@ class AutonomousAgent:
 
         # Render Information Strings
         hud_lines = [
-            f"AUTOPILOT: ACTIVE (Traffic Manager)",
+            "AUTOPILOT: ACTIVE (Traffic Manager)",
             f"Speed:     {speed_kmh:5.1f} km/h",
             f"Throttle:  {control.throttle * 100:3.0f}%",
             f"Brake:     {control.brake * 100:3.0f}%",

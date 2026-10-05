@@ -1,5 +1,6 @@
 import pytest
 
+
 # Example helper function to test physical-to-CARLA scale conversion
 def scale_physical_to_carla(phys_x: float, phys_y: float, scale_factor: float = 10.0):
     """Converts scaled physical lab coordinates to CARLA world coordinates."""

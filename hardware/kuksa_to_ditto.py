@@ -1,7 +1,8 @@
 import json
 import time
+
 import paho.mqtt.client as mqtt
-from kuksa_client.grpc import VSSClient, Datapoint
+from kuksa_client.grpc import Datapoint, VSSClient
 
 # Configuration
 KUKSA_HOST = "localhost" # KUKSA Databroker running on vehicle
@@ -16,7 +17,7 @@ mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 
 # Connect to KUKSA Databroker via gRPC
 with VSSClient(KUKSA_HOST, KUKSA_PORT) as kuksa:
-    print(f"Connected to KUKSA Databroker on vehicle. Exporting to Ditto...")
+    print("Connected to KUKSA Databroker on vehicle. Exporting to Ditto...")
     
     # Subscribe to target VSS signal paths
     vss_paths = [
@@ -35,7 +36,7 @@ with VSSClient(KUKSA_HOST, KUKSA_PORT) as kuksa:
 
         # Construct Eclipse Ditto Protocol JSON payload
         ditto_payload = {
-            "topic": f"org.eclipse.ditto/vehicle_01/things/twin/commands/modify",
+            "topic": "org.eclipse.ditto/vehicle_01/things/twin/commands/modify",
             "headers": {"content-type": "application/json"},
             "path": "/features/kinematics/properties",
             "value": {
@@ -48,7 +49,7 @@ with VSSClient(KUKSA_HOST, KUKSA_PORT) as kuksa:
 
         # Publish update to Eclipse Ditto Ingestion Topic
         mqtt_client.publish(
-            f"telemetry/vehicle_01", 
+            "telemetry/vehicle_01", 
             json.dumps(ditto_payload)
         )
         time.sleep(0.05) # 20 Hz update rate

@@ -243,9 +243,7 @@ class DigitalTwinAgent:
                 self.world.tick()
 
                 for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
-                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    if event.type == pygame.QUIT or event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                         running = False
 
                 if self.current_surface is not None:

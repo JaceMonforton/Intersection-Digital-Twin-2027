@@ -1,5 +1,7 @@
 import time
+
 import carla
+
 
 def main():
     print("Connecting to CARLA server...")
