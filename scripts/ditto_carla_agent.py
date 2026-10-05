@@ -79,7 +79,7 @@ class DittoTelemetryConsumer(threading.Thread):
                 else:
                     t["connected"] = False
                     self._log_error(f"HTTP {response.status_code}: {response.text[:200]}")
-            except Exception as e:
+            except Exception as e: # noqa: BLE001
                 t["connected"] = False
                 self._log_error(f"{type(e).__name__}: {e}")
 
@@ -270,7 +270,7 @@ class DigitalTwinAgent:
                     if hasattr(actor, "stop"):
                         actor.stop()
                     actor.destroy()
-            except Exception:
+            except Exception: # noqa: BLE001, S110
                 pass
 
         pygame.quit()

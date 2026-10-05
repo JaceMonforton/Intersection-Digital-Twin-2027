@@ -16,7 +16,7 @@ def main():
         client = carla.Client(CARLA_HOST, CARLA_PORT)
         client.set_timeout(5.0)
         world = client.get_world()
-    except Exception as e:
+    except Exception as e: # noqa: BLE001
         print(f"[ERROR] Could not connect to CARLA server: {e}")
         sys.exit(1)
 
@@ -32,7 +32,7 @@ def main():
         actors = world.get_actors().filter('vehicle.*')
         
         # Categorize vehicles
-        [a for a in actors if 'ego' in a.attributes.get('role_name', '')]
+        _ego_vehicles = [a for a in actors if 'ego' in a.attributes.get('role_name', '')]
         all_vehicles = list(actors)
 
         print(f"--- Sample {sample}/5 (Total Vehicles in World: {len(all_vehicles)}) ---")
