@@ -4,16 +4,29 @@ A small-scale digital twin of an urban intersection. Physical robotic vehicles i
 
 This is a university capstone project, built as a small-scale proof of concept. It is not intended for use on public roads.
 
+## Contents
+
+- [Status](#status)
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Prerequisites](#prerequisites)
+- [Quick start](#quick-start)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Engineering targets](#engineering-targets)
+- [Roadmap](#roadmap)
+- [License](#license)
+
 ## Status
 
 The project is being developed incrementally:
 
-| Stage | Description | State |
-|---|---|---|
-| 1 | Synthetic vehicle data validates the communication and digital twin infrastructure | In progress |
-| 2 | One physical robotic vehicle (Rosmaster R2) synchronized with CARLA | Planned |
-| 3 | Two or more physical vehicles, scripted and repeatable scenarios | Planned |
-| 4 | SkyEye view, AI-assisted safety recommendations, Kafka streaming and logging | Planned |
+| Stage | Description                                                                  | State       |
+| ----- | ---------------------------------------------------------------------------- | ----------- |
+| 1     | Synthetic vehicle data validates the communication and digital twin infrastructure | In progress |
+| 2     | One physical robotic vehicle (Rosmaster R2) synchronized with CARLA          | Planned     |
+| 3     | Two or more physical vehicles, scripted and repeatable scenarios             | Planned     |
+| 4     | SkyEye view, AI-assisted safety recommendations, Kafka streaming and logging | Planned     |
 
 ## Architecture
 
@@ -27,16 +40,16 @@ flowchart LR
     D -.-> Q[Apache Kafka<br/>streaming / logging]
 ```
 
-This is a simplified view. See Appendix A (Figure A.1) of the project report for the full proposed architecture.
+Solid arrows are implemented or in progress; dashed arrows are planned. This is a simplified view. See Appendix A (Figure A.1) of the project report for the full proposed architecture.
 
-| Component | Role |
-|---|---|
-| ROS2 | Communication between physical vehicles and software components |
-| Eclipse KUKSA Databroker | Vehicle signals (gRPC) |
-| Eclipse Ditto | Digital representation and current state of each vehicle |
-| CARLA | Virtual simulation environment (AWSIM was also evaluated) |
-| Apache Kafka | Data streaming, storage and later analysis (planned) |
-| Docker | Runs the Ditto stack locally |
+| Component                | Role                                                            |
+| ------------------------ | --------------------------------------------------------------- |
+| ROS2                     | Communication between physical vehicles and software components |
+| Eclipse KUKSA Databroker | Vehicle signals (gRPC)                                          |
+| Eclipse Ditto            | Digital representation and current state of each vehicle        |
+| CARLA                    | Virtual simulation environment (AWSIM was also evaluated)       |
+| Apache Kafka             | Data streaming, storage and later analysis (planned)            |
+| Docker                   | Runs the Ditto stack locally                                    |
 
 ## Repository layout
 
@@ -63,48 +76,54 @@ requirements.txt     Python dependencies
 
 ## Quick start
 
-All commands are run from the repository root.
+All commands are run from the repository root. Commands below are for Windows (PowerShell or Command Prompt).
 
-**1. Install Python dependencies**
+### 1. Install Python dependencies
 
-```
+```powershell
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 pip install config\carla-0.9.16-cp310-cp310-win_amd64.whl
 ```
 
-**2. Start the Ditto stack**
+### 2. Start the Ditto stack
 
-```
+```powershell
 docker compose up -d
 docker ps --format "table {{.Names}}\t{{.Ports}}"
 ```
 
 Wait 60 to 90 seconds for the Ditto services to form their cluster. Every container should be `Up`.
 
-| Port | Service |
-|---|---|
-| 8080 | nginx, proxying the Ditto API and UI (basic auth `ditto` / `ditto`) |
-| 8081 | Ditto gateway, direct access (**dev only, no authentication**) |
-| 1883 / 9001 | Mosquitto (MQTT / WebSocket) |
-| 27017 | MongoDB (data is kept in the `mongo-data` volume) |
+| Port        | Service                                                             |
+| ----------- | ------------------------------------------------------------------- |
+| 8080        | nginx, proxying the Ditto API and UI (basic auth `ditto` / `ditto`) |
+| 8081        | Ditto gateway, direct access (**dev only, no authentication**)      |
+| 1883 / 9001 | Mosquitto (MQTT / WebSocket)                                        |
+| 27017       | MongoDB (data is kept in the `mongo-data` volume)                   |
 
-Check that Ditto answers:
+> **Warning:** The default `ditto` / `ditto` credentials and the open gateway on port 8081 are for local development only. Do not expose these ports beyond your machine.
 
-```
+Check that Ditto answers (`curl.exe` is used so PowerShell doesn't call its own `curl` alias):
+
+```powershell
 curl.exe -u ditto:ditto http://localhost:8080/api/2/things
 ```
 
-**3. Start the CARLA server**, then run the agent. It connects, loads `Town02`, spawns a vehicle and prints some spawn points:
+### 3. Start the CARLA server and run the agent
 
-```
+Start the CARLA 0.9.16 server (for example by launching `CarlaUE4.exe` from your CARLA install folder), then run the agent. It connects, loads `Town02`, spawns a vehicle and prints some spawn points:
+
+```powershell
 python scripts/ditto_carla_agent.py
 ```
 
-**4. Publish synthetic telemetry.** The feeder creates the policy and thing if they don't exist, then streams position updates at about 20 Hz. Pick a spawn point printed by the agent so the vehicle starts on a road:
+### 4. Publish synthetic telemetry
 
-```
+The feeder creates the policy and thing if they don't exist, then streams position updates at about 20 Hz. Pick a spawn point printed by the agent so the vehicle starts on a road (the values below are an example):
+
+```powershell
 python tests/test_feeder.py --x -7.5 --y 142.2 --yaw 90
 ```
 
@@ -112,7 +131,7 @@ The agent's window should show `SYNCED` and the vehicle should move. The feeder 
 
 ## Testing
 
-```
+```powershell
 pytest
 ```
 
@@ -131,24 +150,28 @@ Tests that talk to CARLA or Ditto need those services running first. CI cannot r
 
 Targets from the project report. They are subject to validation.
 
-| Requirement | Target |
-|---|---|
-| Telemetry payload (REQ-SYS-001) | Structured state vector (x, y, z, speed, heading, yaw rate, trajectory), JSON over MQTT/HTTP |
-| End-to-end latency (REQ-SYS-002) | At most 100 ms, from sensor to CARLA rendering |
-| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) |
-| Position accuracy (REQ-SYS-004) | Within 5 cm after mapping lab coordinates into CARLA (e.g. 1:10 scale) |
-| Heading accuracy (REQ-SYS-005) | Within 2 degrees |
-| Bird's-eye rendering (REQ-SYS-006, 007) | At least 30 FPS, at most 100 ms display delay |
-| Scalability (REQ-SYS-008, 009) | 10 concurrent vehicles within 150 ms; add vehicles without restarting |
-| Logging (REQ-SYS-010) | 10 Hz, UTC timestamps at 1 ms precision |
-| Safety metrics (REQ-SYS-011) | Compute time-to-collision and headway; flag events when TTC drops below 1.5 s |
+| Requirement                             | Target                                                                                       |
+| --------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Telemetry payload (REQ-SYS-001)         | Structured state vector (x, y, z, speed, heading, yaw rate, trajectory), JSON over MQTT/HTTP |
+| End-to-end latency (REQ-SYS-002)        | At most 100 ms, from sensor to CARLA rendering                                               |
+| Update rate (REQ-SYS-003)               | At least 10 Hz (target 20 Hz)                                                                |
+| Position accuracy (REQ-SYS-004)         | Within 5 cm after mapping lab coordinates into CARLA (e.g. 1:10 scale)                       |
+| Heading accuracy (REQ-SYS-005)          | Within 2 degrees                                                                             |
+| Bird's-eye rendering (REQ-SYS-006, 007) | At least 30 FPS, at most 100 ms display delay                                                |
+| Scalability (REQ-SYS-008, 009)          | 10 concurrent vehicles within 150 ms; add vehicles without restarting                        |
+| Logging (REQ-SYS-010)                   | 10 Hz, UTC timestamps at 1 ms precision                                                      |
+| Safety metrics (REQ-SYS-011)            | Compute time-to-collision and headway; flag events when TTC drops below 1.5 s                |
 
 ## Roadmap
 
-- Connect a physical Rosmaster R2 through ROS2 and KUKSA
-- Coordinate-frame mapping from the lab room to CARLA world space
-- Multi-vehicle support and scripted scenarios (straight, turn, stop, speed change, set routes)
-- SkyEye bird's-eye view
-- Safety metrics (TTC, headway) and an AI-assisted recommendation component (warnings, slow down, stop, re-plan)
-- Kafka streaming and a local database for logging
-- CI/CD
+- [ ] Connect a physical Rosmaster R2 through ROS2 and KUKSA
+- [ ] Coordinate-frame mapping from the lab room to CARLA world space
+- [ ] Multi-vehicle support and scripted scenarios (straight, turn, stop, speed change, set routes)
+- [ ] SkyEye bird's-eye view
+- [ ] Safety metrics (TTC, headway) and an AI-assisted recommendation component (warnings, slow down, stop, re-plan)
+- [ ] Kafka streaming and a local database for logging
+- [ ] Extend CI/CD beyond the current pipeline
+
+## License
+
+No license has been specified yet. Add a `LICENSE` file (for example MIT or Apache-2.0) and name it here. Without one, the code is "all rights reserved" by default.
