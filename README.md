@@ -282,7 +282,3 @@ Targets from the project report. They are subject to validation.
 ### Acknowledgements
 
 Built on [CARLA](https://carla.org/), [Eclipse Ditto](https://eclipse.dev/ditto/), [Eclipse KUKSA](https://eclipse.dev/kuksa/), and [ROS2](https://docs.ros.org/).
-
-### License
-
-No license has been specified yet. Add a `LICENSE` file (for example MIT or Apache-2.0) and name it here. Without one, the code is "all rights reserved" by default.
