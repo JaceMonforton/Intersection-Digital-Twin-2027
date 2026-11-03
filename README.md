@@ -2,161 +2,54 @@
 
 # Smart Digital Twin of an Urban Intersection
 
-**Real robotic vehicles in a lab, mirrored live in a CARLA simulation, to make intersection safety analysis possible at small scale.**
+**A CARLA and Eclipse Ditto simulation that watches an intersection from above, predicts where vehicles are going, and brakes a vehicle before a collision.**
 
-![Status](https://img.shields.io/badge/stage-1%20of%204%20in%20progress-orange)
+![Simulation](https://img.shields.io/badge/simulation-working-brightgreen)
+![Hardware](https://img.shields.io/badge/physical%20vehicles-untested-orange)
 ![Python](https://img.shields.io/badge/python-3.10-blue)
 ![CARLA](https://img.shields.io/badge/CARLA-0.9.16-green)
 ![Docker](https://img.shields.io/badge/docker-compose-2496ED)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 
-[Overview](#overview) · [How it works](#how-it-works) · [Run it](#run-it) · [Targets](#engineering-targets) · [Roadmap](#roadmap) · [Troubleshooting](#troubleshooting)
+<img src="docs/images/near_miss.gif" width="720" alt="Overhead view of an orange car turning left across a blue car. The orange car brakes, the blue car passes within centimetres, and the orange car then finishes its turn.">
+
+*An unsafe left turn. The safety brake stops the orange car 0.29 m short of the oncoming blue car, then it finishes the turn.*
+
+[What it does](#what-it-does) · [Run it](#run-it) · [Results](#left-turn-results) · [How it works](#how-it-works) · [Project status](#project-status) · [Limitations](#known-limitations)
 
 </div>
 
-<!-- TODO (biggest single upgrade): add a screenshot or short GIF of the lab vehicle and the CARLA vehicle moving together, e.g.
-<p align="center"><img src="docs/demo.gif" width="720" alt="Physical vehicle mirrored in CARLA"></p>
--->
+---
+
+## What it does
+
+You can't stage near-collisions on a real road, so this project studies them in a digital twin of an intersection. It's a university capstone research project and a proof of concept, not for use on public roads.
+
+Running it plays out one scenario in CARLA: a car turns left across oncoming traffic, once unsafely and once safely. While that happens, the system:
+
+- **Tracks every vehicle** at `Town01_Intersection_01` from an overhead gantry, keeping each one's state in an Eclipse Ditto digital twin.
+- **Predicts each vehicle's next 3 seconds**, following the road and using turn signals and turn rate to choose a branch (the red lines).
+- **Scores the risk** with surrogate safety metrics: time-to-collision (TTC), post-encroachment time (PET) and deceleration rate to avoid a crash (DRAC).
+- **Brakes the ML vehicle** when a collision is predicted, sending the command through Ditto and MQTT to a safety gate that cuts the motors. In the simulation those motors are simulated.
+- **Reports the result**, comparing what happened with the same plan replayed with no brake.
+
+| The car pulls out too soon | The brake stops it just short | It finishes the turn | The safe turn, for comparison |
+| :---: | :---: | :---: | :---: |
+| <img src="docs/images/unsafe_approach.jpg" alt="The orange car has started its turn. Its red predicted path crosses the blue car's."> | <img src="docs/images/near_miss.jpg" alt="The two cars side by side, almost touching, as the blue car passes."> | <img src="docs/images/finishes_turn.jpg" alt="The blue car has gone and the orange car continues through the junction."> | <img src="docs/images/safe_turn.jpg" alt="The orange car turns after the blue car has already passed, at the top of the frame."> |
+
+Yellow boxes mark tracked vehicles, red lines are predicted paths, and the square marks the point where the two paths cross.
 
 ---
 
-## Overview
+## Run it
 
-An intersection is hard to study safely: you can't stage near-collisions on a real road. This project builds a **small-scale digital twin** instead. Robotic vehicles (Rosmaster R2) drive in a controlled lab, and each one has a virtual counterpart in the [CARLA](https://carla.org/) simulator that follows it in real time.
+### You'll need
 
-Together they give a shared bird's-eye view, the **SkyEye**, of the whole intersection. That view is the foundation for safety analysis:
+- Windows with **Docker Desktop** (WSL2 backend)
+- **Python 3.10**
+- **CARLA 0.9.16** and a GPU that can run it. The client and server versions must match; see the [CARLA install guide](https://carla.readthedocs.io/en/latest/start_quickstart/)
 
-| Hazard | What the twin can reveal |
-| ------ | ------------------------ |
-| Occlusion | What a vehicle cannot see, but the SkyEye can |
-| Conflicting trajectories | Paths that will cross at the same time |
-| Unsafe proximity | Time-to-collision and headway dropping below thresholds |
-
-> A university capstone research project, built as a small-scale proof of concept. It is not intended for use on public roads.
-
-### Where the project is today
-
-The system is built in four stages. Stage 1 proves the whole data pipeline using **synthetic** vehicle data, so the infrastructure is validated before any hardware is added.
-
-| Stage | Goal | State |
-| :---: | ---- | :---: |
-| 1 | Synthetic vehicle data validates the communication and digital twin infrastructure | In progress |
-| 2 | One physical vehicle (Rosmaster R2) synchronized with CARLA | Planned |
-| 3 | Two or more physical vehicles, scripted and repeatable scenarios | Planned |
-| 4 | SkyEye view, AI-assisted safety recommendations, Kafka streaming and logging | Planned |
-
----
-
-## How it works
-
-Every vehicle is described by a **digital twin** (an Eclipse Ditto "thing") that always holds its latest state: position, speed, heading. Anything that can update that state, a real robot or a test script, drives the simulation the same way.
-
-```mermaid
-flowchart LR
-    subgraph Vehicles["Physical vehicles"]
-        R["Rosmaster R2<br/>(ROS2)"] --> K["Eclipse KUKSA<br/>Databroker"]
-        G["physical_ml_subscriber<br/>safety gate"] --> M["Motor PWM"]
-    end
-    subgraph Infra["Docker stack"]
-        Q["Mosquitto<br/>MQTT :1883"]
-        N["nginx :8080"] --> D["Eclipse Ditto<br/>twin state"]
-    end
-    subgraph GPU["Central GPU machine"]
-        C["CARLA"] --> P["central_gpu_processor<br/>TTC / PET / DRAC"]
-        C --> W["waymo_predictor_node<br/>3 s trajectories"]
-    end
-    K -->|telemetry/name| Q
-    Q <--> D
-    N -->|WebSocket events| P
-    P -->|"HTTP: emergency_brake when TTC < 1.5 s"| N
-    Q -->|device/vehicle_ml/commands| G
-```
-
-| Thing | Role |
-| ----- | ---- |
-| `org.example:intersection_01` | The intersection; holds the latest `SafetyMetrics` |
-| `org.example:vehicle_ml` | The ML vehicle; the only one with a `SafetyGate` |
-| `org.example:human_vehicle` | The human-driven RC car |
-
-The full proposed architecture is in Appendix A (Figure A.1) of the project report.
-
-**Why this design?** The twin layer decouples the vehicles from the simulator: anything that writes the same telemetry, a real robot or a test script, drives everything downstream the same way.
-
-<details>
-<summary><b>Technology choices</b></summary>
-
-| Component | Role |
-| --------- | ---- |
-| ROS2 | Communication between physical vehicles and software components |
-| Eclipse KUKSA Databroker | Vehicle signals (gRPC) |
-| Eclipse Ditto | Digital representation and current state of each vehicle |
-| CARLA | Virtual simulation environment (AWSIM was also evaluated) |
-| Apache Kafka | Data streaming, storage and later analysis (planned) |
-| Docker | Runs the Ditto stack locally |
-
-</details>
-
-<details>
-<summary><b>Repository layout</b></summary>
-
-```
-.github/workflows/   CI pipeline
-run_simulation.py    Starts everything and runs the left-turn analysis
-docker/              Ditto stack: docker-compose.yml, mosquitto.conf, nginx.conf
-config/              ditto_policies.json, ditto_entities.json, ditto_connections.json,
-                     settings, and the CARLA 0.9.16 Python client (wheel and egg)
-models/              ONNX weights and the contract they must meet (see models/README.md)
-scripts/
-  setup_entities.py           Provisions Ditto from config/
-  central_gpu_processor.py    Master tick, overhead LiDAR, state fusion, safety metrics, brake trigger
-  waymo_predictor_node.py     History buffer, 3 s trajectory prediction, debug drawing
-  physical_ml_subscriber.py   Onboard safety gate (runs on the vehicle)
-  left_turn_scenario.py       Safe vs unsafe left turn, and its analysis
-  ditto_carla_agent.py        Mirrors one vehicle Thing in CARLA, with a chase camera
-  test_carla_connection.py    CARLA connection check
-  test_traffic.py             Spawns background traffic in CARLA
-tests/               Safety logic unit tests and the end-to-end latency benchmark
-bridge/              Standalone Ditto to CARLA synchronization (ditto_carla_sync.py)
-hardware/            KUKSA to Ditto publisher (kuksa_to_ditto.py)
-requirements.txt     Python dependencies
-```
-
-</details>
-
----
-
-## Quick start
-
-```powershell
-python run_simulation.py
-```
-
-That one command starts whatever isn't already running (Docker, the Ditto stack, CARLA), provisions the twins, starts the processor, safety subscriber and predictor, runs the safe and unsafe left turn, prints the comparison, then shuts down what it started. Add `--case safe` or `--case unsafe` to run one, and `--leave-running` to keep CARLA and Docker up for faster repeat runs. If CARLA isn't found automatically, pass `--carla-exe` or set `CARLA_EXE`. Logs go to `output/logs/`.
-
-### The left-turn analysis
-
-`vehicle_ml` waits at the stop line to turn left across `human_vehicle`, which comes straight through at 10 m/s without slowing. Both runs use the same paths and speeds and differ only in when the turner goes: the unsafe one pulls out to arrive 1 s after the oncoming car, too soon to clear it, and the safe one waits to arrive 3 s after it. In the unsafe run the safety brake stops the turner just short of the oncoming car, which passes it narrowly. The scenario then releases the brake, as an operator would, and the turner finishes its turn. Outside this scenario the brake stays latched until `--clear-brake`.
-
-A run is **UNSAFE** if the vehicle outlines overlap or come within 1 m, TTC drops under 1.5 s, PET drops under 1.5 s, DRAC goes over 3.35 m/s2, or the safety brake fires. Each run is shown next to the same plan replayed with no brake, so you can see what the brake changed. The report and per-tick data go to `output/`.
-
-Measured PET is the time between one vehicle leaving a 2.5 m zone around the conflict point and the other entering it. Oncoming traffic never reacts in this scenario.
-
----
-
-## Run it step by step
-
-By the end, a vehicle on a collision course gets its motors cut before impact.
-
-### Before you begin
-
-- [ ] Windows with **Docker Desktop** (WSL2 backend)
-- [ ] **Python 3.10**
-- [ ] **CARLA 0.9.16** server installed. Follow the [CARLA quick start installation guide](https://carla.readthedocs.io/en/latest/start_quickstart/) and make sure you download version 0.9.16, because the client in this repo must match the server
-- [ ] A GPU capable of running CARLA
-
-All commands run from the repository root in PowerShell or Command Prompt.
-
-### 1. Install the Python dependencies
+### Install
 
 ```powershell
 python -m venv .venv
@@ -165,23 +58,170 @@ pip install -r requirements.txt
 pip install config\carla-0.9.16-cp310-cp310-win_amd64.whl
 ```
 
-### 2. Spin up the infrastructure
+### Start everything with one command
+
+```powershell
+python run_simulation.py
+```
+
+This starts whatever isn't already running (Docker, the Ditto stack, CARLA), sets up the twins, runs the unsafe and safe left turns in the CARLA window, prints the comparison, then shuts down only what it started. A first CARLA launch can take several minutes.
+
+| Option | What it does |
+| ------ | ------------ |
+| `--case unsafe` or `--case safe` | Runs just one |
+| `--leave-running` | Keeps CARLA and Docker up, for faster repeat runs |
+| `--carla-exe <path>` | Points at `CarlaUE4.exe`, if it isn't found automatically. Setting `CARLA_EXE` does the same |
+
+The report and per-tick data go to `output/`, and logs go to `output/logs/`. Without trained models, the scripts use the stand-ins described under [Known limitations](#known-limitations) and say so at startup.
+
+<details>
+<summary><b>Run the pieces yourself</b></summary>
+
+Run these from the repository root, each long-running one in its own terminal.
+
+**1. Start the stack and set up the twins.** Wait 60 to 90 seconds for Ditto between these two commands. Re-running the second one resets the Things.
 
 ```powershell
 docker compose -f docker/docker-compose.yml up -d
+python scripts/setup_entities.py
 ```
 
-Wait **60 to 90 seconds** for the services to form a cluster, then check that every container is `Up`:
+**2. Start CARLA, then the processor.** It must come first, because it owns the simulation: it loads `Town01`, enables synchronous mode at 10 Hz and drives `world.tick()`. Wait for `Master tick running at 10 Hz`, and exit with Ctrl+C so it can restore CARLA's settings.
 
 ```powershell
-docker ps --format "table {{.Names}}\t{{.Ports}}"
-curl.exe http://localhost:8080/api/2/things
+python scripts/central_gpu_processor.py
 ```
 
-**You should see:** all containers `Up`, and the `curl` call returning a JSON list.
+**3. Start the safety gate.** `--driver sim` uses no motors. On a vehicle, use `--broker <central machine IP>`; it only needs `pip install paho-mqtt`.
+
+```powershell
+python scripts/physical_ml_subscriber.py --driver sim
+```
+
+**4. Start the predictor and run the scenario.**
+
+```powershell
+python scripts/waymo_predictor_node.py
+python scripts/left_turn_scenario.py --case both
+```
+
+**To mirror your own vehicles instead of running the scenario,** start an agent for each Thing. Each one opens a chase-camera window and spawns a CARLA vehicle named after the Thing, which is how the processor recognises it. These twins hold still while the brake is on, and `human_vehicle` has no safety gate.
+
+```powershell
+python scripts/ditto_carla_agent.py
+python scripts/ditto_carla_agent.py --thing human_vehicle
+```
+
+**The brake latches.** Outside the scenario, release it with:
+
+```powershell
+python scripts/setup_entities.py --clear-brake
+```
+
+**Shut down** with this. Add `-v` only if you want to wipe the Ditto data.
+
+```powershell
+docker compose -f docker/docker-compose.yml down
+```
+
+</details>
+
+---
+
+## Left-turn results
+
+`vehicle_ml` waits to turn left across `human_vehicle`, which comes straight through at 10 m/s and never reacts. Both runs use the same paths and speeds and differ only in when the turning car goes: the unsafe one pulls out to arrive 1 s after the oncoming car, and the safe one waits to arrive 3 s after it.
+
+| | Unsafe, no brake | Unsafe, with brake | Safe |
+| - | :---: | :---: | :---: |
+| **Verdict** | UNSAFE | UNSAFE | SAFE |
+| **Contact** | yes | no | no |
+| **Closest gap between cars** | 0.00 m | 0.29 m | 1.90 m |
+| **Measured PET** | 0.30 s | 2.10 s | 2.30 s |
+| **Brake fired** | no | at 6.6 s | no |
+
+The "no brake" column replays the same plan in calculation, not in CARLA. The result was identical on all 4 runs checked.
+
+A run is **UNSAFE** if the car outlines overlap or come within 1 m, TTC drops under 1.5 s, PET drops under 1.5 s, DRAC goes over 3.35 m/s², or the brake fires. In the scenario, once the oncoming car has passed, the script releases the brake as an operator would so the car can finish its turn. Nothing else auto-releases it.
+
+### The brake doesn't catch everything
+
+0.29 m is right at the edge of what the brake can handle. These runs varied only the turning car's arrival time:
+
+| Arrives after the oncoming car | Brake | Result |
+| :---: | :---: | ---- |
+| 0.9 s | fires at 6.3 s | miss by 1.11 m |
+| **1.0 s (the unsafe run above)** | **fires at 6.6 s** | **miss by 0.29 m** |
+| 1.1 s | fires at 7.5 s, too late | **contact** |
+| 1.2 s and 1.3 s | never fires | **contact** |
+| 1.4 s | never fires | miss by 0.07 m |
+
+The cause isn't confirmed. Likely factors are the 2.5 m collision circle being used on 4.8 m cars, and the prediction holding current speed while the car is accelerating.
+
+---
+
+## How it works
+
+Each vehicle has a **digital twin** in Eclipse Ditto that holds its latest state. Anything that writes the same telemetry, a real robot or a test script, drives everything downstream the same way, so the vehicles are decoupled from the simulator.
+
+```mermaid
+flowchart LR
+    subgraph GPU["Central GPU machine"]
+        C["CARLA<br/>Town01"] --> P["central_gpu_processor<br/>clock, tracking, TTC / PET / DRAC"]
+        C --> W["waymo_predictor_node<br/>3 s paths"]
+        S["left_turn_scenario"] --> C
+    end
+    subgraph Infra["Docker stack"]
+        N["nginx :8080"] --> D["Eclipse Ditto<br/>twin state"]
+        Q["Mosquitto<br/>MQTT :1883"]
+    end
+    subgraph Vehicle["Vehicle, or simulated motors"]
+        G["physical_ml_subscriber<br/>safety gate"] --> M["Motors"]
+    end
+    N -->|WebSocket events| P
+    P -->|"HTTP: emergency_brake"| N
+    D <--> Q
+    Q -->|device/vehicle_ml/commands| G
+    S -->|polls the gate over HTTP| N
+```
+
+**The brake fires** when straight-line TTC to `vehicle_ml` drops under 1.5 s, or when the vehicles' predicted paths meet within 3 s. The path check was added because straight-line TTC can't see a turn coming: in the left turn it only fired once the car was already crossing the lane, too late to prevent contact.
+
+**The safety gate fails safe.** It holds the motors off before it receives its first state, whenever it loses the broker, and until it hears an explicit release.
+
+| Thing | Role |
+| ----- | ---- |
+| `org.example:intersection_01` | The intersection; holds the latest `SafetyMetrics` |
+| `org.example:vehicle_ml` | The ML vehicle; the only one with a `SafetyGate` |
+| `org.example:human_vehicle` | The other vehicle |
 
 <details>
-<summary><b>What runs on which port</b></summary>
+<summary><b>Repository layout</b></summary>
+
+```
+run_simulation.py    Starts everything and runs the left-turn analysis
+docker/              Ditto stack: docker-compose.yml, mosquitto.conf, nginx.conf
+config/              Ditto policies, Things and connections, and the CARLA 0.9.16 client
+models/              Where trained models go, and the contract they must meet
+scripts/
+  central_gpu_processor.py    Simulation clock, overhead sensors, fusion, metrics, brake trigger
+  waymo_predictor_node.py     History buffer, 3 s path prediction, red lines
+  physical_ml_subscriber.py   Safety gate that cuts the motors (runs on the vehicle)
+  left_turn_scenario.py       Safe vs unsafe left turn, and its analysis
+  setup_entities.py           Provisions Ditto from config/
+  ditto_carla_agent.py        Mirrors one Thing into CARLA, with a chase camera
+  test_carla_connection.py    CARLA connection check
+  test_traffic.py             Spawns background traffic in CARLA
+tests/               Unit tests and the end-to-end latency benchmark
+hardware/            KUKSA to Ditto publisher, for physical vehicles
+bridge/              Older standalone Ditto to CARLA sync
+docs/images/         The pictures on this page
+```
+
+</details>
+
+<details>
+<summary><b>Ports and telemetry format</b></summary>
 
 | Port | Service |
 | ---- | ------- |
@@ -192,72 +232,7 @@ curl.exe http://localhost:8080/api/2/things
 
 > **Warning:** Nothing here authenticates. Anyone who can reach 8080 can write to the twins, and anyone who can reach 1883 can publish telemetry or brake commands. Keep these ports on a trusted lab network.
 
-</details>
-
-### 3. Provision the twin entities
-
-```powershell
-python scripts/setup_entities.py
-```
-
-**You should see:** each policy, Thing and connection reported with a 2xx status, then `Done`. Re-running this resets the Things to their initial state.
-
-### 4. Start the onboard vehicle listener
-
-On the vehicle's computer (Raspberry Pi or Jetson), which only needs `pip install paho-mqtt`:
-
-```bash
-python scripts/physical_ml_subscriber.py --broker <central machine IP>
-```
-
-Use `--driver sim` to try it without motors, on any machine.
-
-**You should see:** `MOTORS CUT: waiting for first SafetyGate state`, then `Hold released`.
-
-> The gate holds the motors off until it hears an explicit release, and again whenever it loses the broker. If the Rosmaster's ROS2 driver owns the serial port, this script cannot open it; the stop needs to go through that driver instead.
-
-### 5. Launch the central GPU processor
-
-Start the CARLA server (for example `CarlaUE4.exe` from your CARLA install folder), then:
-
-```powershell
-python scripts/central_gpu_processor.py
-```
-
-**You should see:** `Master tick running at 10 Hz`, and the CARLA window looking straight down at the intersection. Use `--no-carla` to run the safety engine on Ditto telemetry alone. A cold map load can take several minutes.
-
-This process owns the simulation: it loads `Town01`, enables synchronous mode (`fixed_delta_seconds=0.1`) and drives `world.tick()` in real time. **Start it before the scripts below**, which attach to its world without changing the map or settings. Exit with Ctrl+C so it can restore asynchronous mode and remove its sensors. If it dies uncleanly, the next processor takes over and warns that it did.
-
-Then, each in its own terminal:
-
-```powershell
-python scripts/ditto_carla_agent.py
-python scripts/ditto_carla_agent.py --thing human_vehicle
-python scripts/waymo_predictor_node.py
-```
-
-The agents mirror each Thing into a CARLA vehicle named after it, spawned near the intersection. That name is how the processor recognises them, so the brake logic works with no external telemetry at all. The predictor draws each vehicle's next 3 s as red lines that follow the road, using its turn signal or turn rate to choose a branch, and the processor draws yellow boxes (green when they come from a model).
-
-> `scripts/test_traffic.py` ticks the world itself unless you pass `--asynch`, and `scripts/test_carla_connection.py` always does. Two tickers will fight, so stop the processor first, or use `test_traffic.py --asynch` alongside it.
-
-### 6. Run the scenario
-
-Publish telemetry from each vehicle with `hardware/kuksa_to_ditto.py`, then drive the human RC car around the blind corner toward the ML car's path.
-
-**You should see:** `[ALERT] EMERGENCY BRAKE sent` from the processor and `MOTORS CUT` on the vehicle, before impact.
-
-The `vehicle_ml` twin also stops on screen and its window shows `EMERGENCY BRAKE - HOLDING`. `human_vehicle` has no safety gate, so it keeps moving.
-
-The brake **latches**. Once the area is clear, release it (a twin following live poses then jumps back to the feed; one dead reckoning resumes from where it stopped):
-
-```powershell
-python scripts/setup_entities.py --clear-brake
-```
-
-<details>
-<summary><b>Telemetry format</b></summary>
-
-Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.html) JSON to `telemetry/<thing name>`. The engine reads `location` + `velocity` (m/s), or `kinematics` as written by `hardware/kuksa_to_ditto.py` (`x`, `y`, `heading` in degrees, `speed` in km/h).
+Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.html) JSON to `telemetry/<thing name>`. The processor reads `location` + `velocity` (m/s), or `kinematics` as written by `hardware/kuksa_to_ditto.py` (`x`, `y`, `heading` in degrees, `speed` in km/h). Poses must already be in the CARLA frame.
 
 ```json
 {
@@ -271,27 +246,50 @@ Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.ht
 }
 ```
 
-Poses must already be in the CARLA frame. Lab-to-CARLA mapping is still on the roadmap; `TELEMETRY_SCALE` in `central_gpu_processor.py` covers scale only.
-
 </details>
 
-<details>
-<summary><b>Known limitations</b></summary>
+---
 
-- **No model weights are in the repo.** Without them, the processor uses CARLA ground truth instead of LiDAR detections, and the predictor follows the road at the vehicle's current speed. Both say so at startup. See [models/README.md](models/README.md), including why a stock CenterPoint is unlikely to work from an overhead sensor.
-- **The vehicle can't tell if the processor has died.** The gate fails safe when the broker link drops, but a crashed processor just stops sending hazards. The processor does warn when `vehicle_ml` telemetry goes stale, since it can't protect a vehicle it can't see.
-- **PET is predicted**, from current velocities at the path crossing point, because true PET is only known after both actors have passed.
-- **The brake's two triggers have different blind spots.** Straight-line TTC under 1.5 s can't see a turn coming. The path check brakes if the predicted paths meet within 3 s, but it holds current speed, so it can't foresee a stop or an unsignalled turn, and it only works with CARLA actors, not model detections or telemetry alone.
+## Project status
 
-</details>
+| Area | State |
+| ---- | ----- |
+| Docker stack, Ditto twins, MQTT safety path | **Working**, tested live |
+| One-command launcher | **Working** when CARLA and Docker are already up. Starting them itself isn't tested yet |
+| Master tick, overhead view, on-screen overlays | **Working** in CARLA |
+| Left-turn scenario and analysis | **Working**, for this one junction and these fixed speeds |
+| Path prediction | **Road-following stand-in**. No Waymo model yet |
+| Vehicle detection | **CARLA's true positions, as a stand-in.** The overhead LiDAR runs and its data is formatted for a model, but there's no model yet |
+| Physical vehicles (Rosmaster R2, KUKSA) | **Written, not yet run on hardware.** The motor drivers and KUKSA publisher have never run |
+| Lab-to-CARLA coordinate mapping, SkyEye view, Kafka logging, AI recommendations | **Not started** |
 
-### Shutting down
+### Engineering targets
 
-```powershell
-docker compose -f docker/docker-compose.yml down
-```
+These are the targets from the project report, against what has been measured so far.
 
-This keeps your Ditto data. Add `-v` only if you want to wipe it.
+| Requirement | Target | Measured so far |
+| ----------- | ------ | --------------- |
+| End-to-end latency (REQ-SYS-002) | At most 100 ms, sensor to CARLA rendering | About 60 ms (p95) from Ditto write to simulated motor cut, on one machine. The sensor-to-rendering path isn't measured |
+| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) | 10.0 Hz simulation tick, at real-time speed |
+| Safety metrics (REQ-SYS-011) | TTC and headway; flag TTC under 1.5 s | TTC, PET and DRAC done, and the 1.5 s flag works. Headway isn't implemented |
+| Telemetry payload (REQ-SYS-001) | Full state vector, JSON over MQTT/HTTP | Position and velocity only |
+| Position and heading accuracy (REQ-SYS-004, 005) | Within 5 cm and 2 degrees | Not measured; needs physical vehicles |
+| Bird's-eye rendering (REQ-SYS-006, 007) | At least 30 FPS, at most 100 ms delay | Not measured |
+| Scalability (REQ-SYS-008, 009) | 10 vehicles within 150 ms | Not measured |
+| Logging (REQ-SYS-010) | 10 Hz, UTC timestamps at 1 ms precision | Scenario data only, in simulation time |
+
+---
+
+## Known limitations
+
+- **The brake misses some collisions.** See [the table above](#the-brake-doesnt-catch-everything). All of this comes from one junction, with fixed speeds and an oncoming car that never reacts.
+- **It relies on a turn signal.** The turning car signals in every run. An unsignalled turn is untested, and the brake will probably fire later.
+- **The path check only works on CARLA actors.** Telemetry alone and model detections fall back to the 1.5 s TTC rule. That includes physical vehicles until lab positions are mapped into CARLA.
+- **No trained models are in the repo.** A stock CenterPoint is unlikely to work from an overhead sensor. See [models/README.md](models/README.md).
+- **The vehicle can't tell if the processor has died.** The gate fails safe if the broker link drops, but a crashed processor simply stops sending hazards.
+- **A silent Wi-Fi drop took 3.8 s to detect** in testing, which is longer than the 1.5 s brake window. Lowering `MQTT_KEEPALIVE` shortens it.
+- **Live PET is predicted.** The `SafetyMetrics` Thing holds PET extrapolated from current velocities. The scenario report's PET is measured after the fact.
+- **`bridge/ditto_carla_sync.py` is out of date.** It still points at `org.ovin:my-vehicle` on `192.168.0.100`.
 
 ---
 
@@ -301,11 +299,36 @@ This keeps your Ditto data. Add `-v` only if you want to wipe it.
 pytest
 ```
 
-`tests/test_safety_logic.py` needs nothing running. `tests/test_mqtt_pipeline.py` runs the full telemetry-to-motor-cut path and the latency benchmark against the Docker stack (no CARLA needed). It skips itself when the stack is down, as on CI, and it resets Thing state. Add `-s` to see the timings.
+| Test file | Needs |
+| --------- | ----- |
+| `test_safety_logic.py`, `test_left_turn.py` | Nothing running |
+| `test_agent_brake.py` | The `carla` and `pygame` packages; skips itself without them |
+| `test_mqtt_pipeline.py` | The Docker stack, not CARLA. Skips itself when the stack is down, as on CI, and resets Thing state. Add `-s` to see the timings |
 
 ---
 
 ## Troubleshooting
+
+<details>
+<summary><b>The launcher fails, or a script dies during a run</b></summary>
+
+Check `output/logs/`, which has a log for the processor, subscriber and predictor. A CARLA client aborting with `_episode != nullptr` was seen on a freshly started server; the launcher retries the processor once.
+
+</details>
+
+<details>
+<summary><b>CARLA import or connection errors</b></summary>
+
+The client and server versions must match. The wheel in `config/` is for CARLA 0.9.16 and Python 3.10 on Windows.
+
+</details>
+
+<details>
+<summary><b>Other scripts conflict with the processor</b></summary>
+
+Only one process may tick the world. `scripts/test_traffic.py` ticks unless you pass `--asynch`, and `scripts/test_carla_connection.py` always does, so stop the processor first or use `test_traffic.py --asynch`.
+
+</details>
 
 <details>
 <summary><b>Ditto resets or won't answer on Windows</b></summary>
@@ -322,67 +345,14 @@ Ditto only accepts `Content-Type: application/merge-patch+json` for PATCH. Plain
 </details>
 
 <details>
-<summary><b>The vehicle appears under the map</b></summary>
-
-The vehicle's height comes from the road surface at the received x/y, not from the published `z`. Check that the published coordinates are on a road in the loaded map (use the spawn points the agent prints).
-
-</details>
-
-<details>
-<summary><b>Empty replies or resets after changing the compose file</b></summary>
-
-Run `docker compose -f docker/docker-compose.yml down`, then `up -d`, and wait a minute. Make sure no two services publish the same host port.
-
-</details>
-
-<details>
 <summary><b>Ditto data disappeared</b></summary>
 
 `down -v` deletes the `mongo-data` volume. Plain `down` keeps it.
 
 </details>
 
-<details>
-<summary><b>CARLA import or connection errors</b></summary>
-
-The client and server versions must match. The wheel in `config/` is for CARLA 0.9.16 and Python 3.10 on Windows.
-
-</details>
-
----
-
-## Engineering targets
-
-Targets from the project report. They are subject to validation.
-
-| Requirement | Target |
-| ----------- | ------ |
-| Telemetry payload (REQ-SYS-001) | Structured state vector (x, y, z, speed, heading, yaw rate, trajectory), JSON over MQTT/HTTP |
-| End-to-end latency (REQ-SYS-002) | At most 100 ms, from sensor to CARLA rendering |
-| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) |
-| Position accuracy (REQ-SYS-004) | Within 5 cm after mapping lab coordinates into CARLA (e.g. 1:10 scale) |
-| Heading accuracy (REQ-SYS-005) | Within 2 degrees |
-| Bird's-eye rendering (REQ-SYS-006, 007) | At least 30 FPS, at most 100 ms display delay |
-| Scalability (REQ-SYS-008, 009) | 10 concurrent vehicles within 150 ms; add vehicles without restarting |
-| Logging (REQ-SYS-010) | 10 Hz, UTC timestamps at 1 ms precision |
-| Safety metrics (REQ-SYS-011) | Compute time-to-collision and headway; flag events when TTC drops below 1.5 s |
-
----
-
-## Roadmap
-
-- [ ] Connect a physical Rosmaster R2 through ROS2 and KUKSA
-- [ ] Coordinate-frame mapping from the lab room to CARLA world space
-- [ ] Multi-vehicle support and scripted scenarios (straight, turn, stop, speed change, set routes)
-- [ ] SkyEye bird's-eye view
-- [x] Safety metrics (TTC, PET, DRAC) and an emergency brake trigger
-- [ ] Trained detection and trajectory models in `models/`
-- [ ] AI-assisted recommendation component (warnings, slow down, re-plan)
-- [ ] Kafka streaming and a local database for logging
-- [ ] Extend CI/CD beyond the current pipeline
-
 ---
 
 ### Acknowledgements
 
-Built on [CARLA](https://carla.org/), [Eclipse Ditto](https://eclipse.dev/ditto/), [Eclipse KUKSA](https://eclipse.dev/kuksa/), and [ROS2](https://docs.ros.org/).
+Built on [CARLA](https://carla.org/), [Eclipse Ditto](https://eclipse.dev/ditto/), [Eclipse KUKSA](https://eclipse.dev/kuksa/), and [Eclipse Mosquitto](https://mosquitto.org/).
