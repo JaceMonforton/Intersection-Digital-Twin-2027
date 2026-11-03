@@ -3,8 +3,10 @@ Trajectory prediction node: keeps 1 s of history per CARLA actor, predicts the n
 actor's own ego frame, and draws the result in the simulator. Attaches to the world run by
 central_gpu_processor.py and follows its clock.
 
-Without models/waymo_trajectory.onnx it extrapolates at constant velocity, which is a baseline
-and not intent inference: it cannot anticipate a turn or a stop.
+Without models/waymo_trajectory.onnx it follows the road instead, at the vehicle's current speed:
+along its lane, taking the branch its turn signal or turn rate points to, or along its current
+curve when it isn't on a lane. That is a baseline and not learned inference: it cannot anticipate
+a stop, or a turn nothing has signalled yet.
 
 Usage:
     python scripts/waymo_predictor_node.py
@@ -28,7 +30,18 @@ STEP_SECONDS = 0.1
 
 DRAW_HEIGHT = 0.5     # metres above the actor, so lines don't z-fight with the road
 DRAW_THICKNESS = 0.1
+DRAW_COLOR = (70, 0, 0)  # debug lines are unlit, so full brightness blooms at high render quality
 DRAW_LIFE_TIME = 0.11  # must outlive one 0.1 s tick: at exactly 0.1 a line expires before it renders
+
+
+LANE_STEP = 1.0        # metres between waypoints when walking a lane
+BRANCH_LOOKAHEAD = 15  # waypoints walked down a branch to see where it heads
+TURN_RATE_INTENT = 8.0 # deg/s; turning faster than this shows which way a vehicle is going
+YAW_HISTORY = 5        # samples used to measure the turn rate
+LANE_MAX_OFFSET = 3.0  # metres from a lane's centre to still count as on that lane
+LANE_MAX_HEADING = 45.0  # degrees from a lane's direction to still count as following it
+OTHER_TURN_PENALTY = 2.0  # lane score penalty when a lane doesn't turn the way the vehicle intends
+LEFT, STRAIGHT, RIGHT = -1, 0, 1  # the sign of the yaw change in CARLA's frame
 
 
 # ---------------------------------------------------------------------------
@@ -84,11 +97,63 @@ def history_to_ego(history, yaw):
     return np.concatenate((positions, velocities), axis=1).astype(np.float32)
 
 
-def constant_velocity(ego_histories, steps=FUTURE_STEPS, step_seconds=STEP_SECONDS):
-    """Baseline predictor: N x steps x (x, y) from each actor's latest velocity."""
-    velocity = ego_histories[:, -1, 2:4]
-    times = step_seconds * np.arange(1, steps + 1, dtype=np.float32)
-    return velocity[:, None, :] * times[None, :, None]
+def yaw_difference(a, b):
+    """b - a in degrees, wrapped to (-180, 180]. Negative is a left turn in CARLA's frame."""
+    return (b - a + 180.0) % 360.0 - 180.0
+
+
+def turn_rate(yaws, step_seconds=STEP_SECONDS):
+    """Degrees per second over a list of recent yaws, oldest first."""
+    if len(yaws) < 2:
+        return 0.0
+    return yaw_difference(yaws[0], yaws[-1]) / (step_seconds * (len(yaws) - 1))
+
+
+def turn_intent(signal, rate):
+    """Which way a vehicle is going next: its turn signal, or else the way it's already turning."""
+    if signal != STRAIGHT:
+        return signal
+    if abs(rate) > TURN_RATE_INTENT:
+        return LEFT if rate < 0 else RIGHT
+    return STRAIGHT
+
+
+def turn_class(yaw_change):
+    if yaw_change < -45.0:
+        return LEFT
+    return RIGHT if yaw_change > 45.0 else STRAIGHT
+
+
+def pick_branch(yaw_changes, intent):
+    """Index of the branch to follow, given how far each one turns. The sharpest turn that way
+    if the vehicle intends one and there is one; otherwise the straightest."""
+    if intent != STRAIGHT:
+        matching = [i for i, change in enumerate(yaw_changes) if turn_class(change) == intent]
+        if matching:
+            return max(matching, key=lambda i: abs(yaw_changes[i]))
+    return min(range(len(yaw_changes)), key=lambda i: abs(yaw_changes[i]))
+
+
+def curve_path(x, y, yaw_deg, speed, rate, steps=FUTURE_STEPS, step_seconds=STEP_SECONDS):
+    """steps x (x, y) holding the current speed and turn rate, for a vehicle not on a lane."""
+    points = np.zeros((steps, 2))
+    yaw = yaw_deg
+    for i in range(steps):
+        yaw += rate * step_seconds
+        x += speed * step_seconds * math.cos(math.radians(yaw))
+        y += speed * step_seconds * math.sin(math.radians(yaw))
+        points[i] = (x, y)
+    return points
+
+
+def along_polyline(points, speed, steps=FUTURE_STEPS, step_seconds=STEP_SECONDS):
+    """steps x (x, y) travelling a polyline at constant speed, stopping where it ends."""
+    points = np.asarray(points, dtype=float)
+    segments = np.diff(points, axis=0)
+    distance = np.concatenate(([0.0], np.cumsum(np.hypot(segments[:, 0], segments[:, 1]))))
+    travelled = speed * step_seconds * np.arange(1, steps + 1)
+    return np.stack((np.interp(travelled, distance, points[:, 0]),
+                     np.interp(travelled, distance, points[:, 1])), axis=-1)
 
 
 class OnnxPredictor:
@@ -132,8 +197,107 @@ def predict_world_paths(ready, yaws, predictor):
 # ---------------------------------------------------------------------------
 # CARLA node
 # ---------------------------------------------------------------------------
+class LaneFollower:
+    """The road baseline: where a vehicle goes if it stays on its lane and keeps its speed."""
+
+    def __init__(self, carla, world_map):
+        self.carla = carla
+        self.map = world_map
+        self.junction_lanes = {}  # junction id -> [(turn class, [waypoints])]
+
+    def _lanes_of(self, junction):
+        if junction.id not in self.junction_lanes:
+            lanes = []
+            for entry, exit_wp in junction.get_waypoints(self.carla.LaneType.Driving):
+                change = yaw_difference(entry.transform.rotation.yaw, exit_wp.transform.rotation.yaw)
+                lanes.append((turn_class(change), [entry, *entry.next_until_lane_end(LANE_STEP)]))
+            self.junction_lanes[junction.id] = lanes
+        return self.junction_lanes[junction.id]
+
+    def _start(self, x, y, yaw, intent):
+        """The waypoint this vehicle is on, or None if it isn't following a lane. Lanes overlap
+        inside a junction, so the nearest one isn't enough there: score them by fit and intent."""
+        here = self.carla.Location(x=x, y=y, z=0.0)
+        wp = self.map.get_waypoint(here, project_to_road=True, lane_type=self.carla.LaneType.Driving)
+        if wp is None:
+            return None
+        candidates = [(turn_class(0.0), [wp])]
+        if wp.is_junction:
+            candidates = self._lanes_of(wp.get_junction())
+        best, best_score = None, math.inf
+        for lane_class, waypoints in candidates:
+            for candidate in waypoints:
+                location = candidate.transform.location
+                offset = math.hypot(location.x - x, location.y - y)
+                heading = abs(yaw_difference(candidate.transform.rotation.yaw, yaw))
+                if offset > LANE_MAX_OFFSET or heading > LANE_MAX_HEADING:
+                    continue
+                score = offset + heading / 30.0
+                if wp.is_junction and lane_class != intent:
+                    score += OTHER_TURN_PENALTY
+                if score < best_score:
+                    best, best_score = candidate, score
+        return best
+
+    def _branch_change(self, wp):
+        end = wp
+        for _ in range(BRANCH_LOOKAHEAD):
+            following = end.next(LANE_STEP)
+            if not following:
+                break
+            end = following[0]
+        return end.transform.rotation.yaw
+
+    def path(self, x, y, yaw, speed, intent):
+        """FUTURE_STEPS x (x, y), or None if the vehicle isn't on a lane."""
+        wp = self._start(x, y, yaw, intent)
+        if wp is None:
+            return None
+        points = [(x, y)]
+        needed = speed * STEP_SECONDS * FUTURE_STEPS
+        walked = 0.0
+        while walked < needed:
+            following = wp.next(LANE_STEP)
+            if not following:
+                break
+            if len(following) > 1:
+                heading = wp.transform.rotation.yaw
+                changes = [yaw_difference(heading, self._branch_change(f)) for f in following]
+                wp = following[pick_branch(changes, intent)]
+                intent = STRAIGHT  # the signal was for this junction, not the next one
+            else:
+                wp = following[0]
+            points.append((wp.transform.location.x, wp.transform.location.y))
+            walked += LANE_STEP
+        return along_polyline(points, speed)
+
+
+def signalled_turn(carla, actor):
+    try:
+        lights = int(actor.get_light_state())
+    except RuntimeError:  # destroyed since this tick's actor list was taken
+        return STRAIGHT
+    if lights & int(carla.VehicleLightState.LeftBlinker):
+        return LEFT
+    if lights & int(carla.VehicleLightState.RightBlinker):
+        return RIGHT
+    return STRAIGHT
+
+
+def baseline_paths(carla, lanes, actors, ready, yaws, recent_yaws):
+    paths = {}
+    for actor_id, history in ready.items():
+        x, y, vx, vy = history[-1]
+        speed = math.hypot(vx, vy)
+        rate = turn_rate(list(recent_yaws[actor_id]))
+        intent = turn_intent(signalled_turn(carla, actors[actor_id]), rate)
+        path = lanes.path(x, y, yaws[actor_id], speed, intent)
+        paths[actor_id] = path if path is not None else curve_path(x, y, yaws[actor_id], speed, rate)
+    return paths
+
+
 def draw_paths(carla, world, actors, paths):
-    color = carla.Color(255, 0, 0)
+    color = carla.Color(*DRAW_COLOR)
     for actor_id, path in paths.items():
         z = actors[actor_id].get_location().z + DRAW_HEIGHT
         begin = actors[actor_id].get_location()
@@ -151,14 +315,16 @@ def run(args):
         predictor = OnnxPredictor(args.model)
         print(f"[PREDICT] Using model {args.model}")
     else:
-        predictor = constant_velocity
-        print(f"[PREDICT] {args.model} not found: using the CONSTANT-VELOCITY baseline, not Waymo inference.")
+        predictor = None
+        print(f"[PREDICT] {args.model} not found: using the LANE-FOLLOWING baseline, not Waymo inference.")
 
     client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(20.0)
     world = client.get_world()
     print(f"[CARLA] Connected to {world.get_map().name}. Ctrl+C to exit.")
 
+    lanes = LaneFollower(carla, world.get_map())
+    recent_yaws = {}
     history = HistoryBuffer()
     last_sample = None
     last_log = 0.0
@@ -176,6 +342,8 @@ def run(args):
 
         actors = {a.id: a for a in world.get_actors().filter("vehicle.*")}
         history.retain(actors)
+        for actor_id in set(recent_yaws) - set(actors):
+            del recent_yaws[actor_id]
         yaws = {}
         for actor_id, actor in actors.items():
             tf, v = actor.get_transform(), actor.get_velocity()
@@ -183,9 +351,13 @@ def run(args):
             vx, vy = measured_velocity(v.x, v.y, x, y, history.latest(actor_id), dt)
             history.add(actor_id, x, y, vx, vy)
             yaws[actor_id] = tf.rotation.yaw
+            recent_yaws.setdefault(actor_id, deque(maxlen=YAW_HISTORY)).append(tf.rotation.yaw)
 
         started = time.perf_counter()
-        paths = predict_world_paths(history.ready(), yaws, predictor)
+        if predictor is not None:
+            paths = predict_world_paths(history.ready(), yaws, predictor)
+        else:
+            paths = baseline_paths(carla, lanes, actors, history.ready(), yaws, recent_yaws)
         inference_ms = (time.perf_counter() - started) * 1000.0
         draw_paths(carla, world, actors, paths)
 

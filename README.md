@@ -101,6 +101,7 @@ The full proposed architecture is in Appendix A (Figure A.1) of the project repo
 
 ```
 .github/workflows/   CI pipeline
+run_simulation.py    Starts everything and runs the left-turn analysis
 docker/              Ditto stack: docker-compose.yml, mosquitto.conf, nginx.conf
 config/              ditto_policies.json, ditto_entities.json, ditto_connections.json,
                      settings, and the CARLA 0.9.16 Python client (wheel and egg)
@@ -110,6 +111,7 @@ scripts/
   central_gpu_processor.py    Master tick, overhead LiDAR, state fusion, safety metrics, brake trigger
   waymo_predictor_node.py     History buffer, 3 s trajectory prediction, debug drawing
   physical_ml_subscriber.py   Onboard safety gate (runs on the vehicle)
+  left_turn_scenario.py       Safe vs unsafe left turn, and its analysis
   ditto_carla_agent.py        Mirrors one vehicle Thing in CARLA, with a chase camera
   test_carla_connection.py    CARLA connection check
   test_traffic.py             Spawns background traffic in CARLA
@@ -123,7 +125,25 @@ requirements.txt     Python dependencies
 
 ---
 
-## Run it
+## Quick start
+
+```powershell
+python run_simulation.py
+```
+
+That one command starts whatever isn't already running (Docker, the Ditto stack, CARLA), provisions the twins, starts the processor, safety subscriber and predictor, runs the safe and unsafe left turn, prints the comparison, then shuts down what it started. Add `--case safe` or `--case unsafe` to run one, and `--leave-running` to keep CARLA and Docker up for faster repeat runs. If CARLA isn't found automatically, pass `--carla-exe` or set `CARLA_EXE`. Logs go to `output/logs/`.
+
+### The left-turn analysis
+
+`vehicle_ml` waits at the stop line to turn left across `human_vehicle`, which comes straight through at 10 m/s without slowing. Both runs use the same paths and speeds and differ only in when the turner goes: the unsafe one pulls out to arrive 0.8 s ahead of the oncoming car, and the safe one waits to arrive 3 s after it.
+
+A run is **UNSAFE** if the vehicle outlines overlap, TTC drops under 1.5 s, PET drops under 1.5 s, DRAC goes over 3.35 m/s2, or the safety brake fires. Each run is shown next to the same plan replayed with no brake, so you can see what the brake changed. The report and per-tick data go to `output/`.
+
+Measured PET is the time between one vehicle leaving a 2.5 m zone around the conflict point and the other entering it. Oncoming traffic never reacts in this scenario.
+
+---
+
+## Run it step by step
 
 By the end, a vehicle on a collision course gets its motors cut before impact.
 
@@ -216,7 +236,7 @@ python scripts/ditto_carla_agent.py --thing human_vehicle
 python scripts/waymo_predictor_node.py
 ```
 
-The agents mirror each Thing into a CARLA vehicle named after it, spawned near the intersection. That name is how the processor recognises them, so the brake logic works with no external telemetry at all. The predictor draws each vehicle's next 3 s as red lines, and the processor draws yellow boxes (green when they come from a model).
+The agents mirror each Thing into a CARLA vehicle named after it, spawned near the intersection. That name is how the processor recognises them, so the brake logic works with no external telemetry at all. The predictor draws each vehicle's next 3 s as red lines that follow the road, using its turn signal or turn rate to choose a branch, and the processor draws yellow boxes (green when they come from a model).
 
 > `scripts/test_traffic.py` ticks the world itself unless you pass `--asynch`, and `scripts/test_carla_connection.py` always does. Two tickers will fight, so stop the processor first, or use `test_traffic.py --asynch` alongside it.
 
@@ -258,10 +278,10 @@ Poses must already be in the CARLA frame. Lab-to-CARLA mapping is still on the r
 <details>
 <summary><b>Known limitations</b></summary>
 
-- **No model weights are in the repo.** Without them, the processor uses CARLA ground truth instead of LiDAR detections, and the predictor uses constant velocity. Both say so at startup. See [models/README.md](models/README.md), including why a stock CenterPoint is unlikely to work from an overhead sensor.
+- **No model weights are in the repo.** Without them, the processor uses CARLA ground truth instead of LiDAR detections, and the predictor follows the road at the vehicle's current speed. Both say so at startup. See [models/README.md](models/README.md), including why a stock CenterPoint is unlikely to work from an overhead sensor.
 - **The vehicle can't tell if the processor has died.** The gate fails safe when the broker link drops, but a crashed processor just stops sending hazards. The processor does warn when `vehicle_ml` telemetry goes stale, since it can't protect a vehicle it can't see.
 - **PET is predicted**, from current velocities at the path crossing point, because true PET is only known after both actors have passed.
-- **TTC assumes constant velocity**, so it won't anticipate a turn or a sudden stop.
+- **The brake's two triggers have different blind spots.** Straight-line TTC under 1.5 s can't see a turn coming. The path check brakes if the predicted paths meet within 3 s, but it holds current speed, so it can't foresee a stop or an unsignalled turn, and it only works with CARLA actors, not model detections or telemetry alone.
 
 </details>
 
