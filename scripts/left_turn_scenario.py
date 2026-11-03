@@ -3,11 +3,13 @@ Safe vs unsafe unprotected left turn, driven purely inside CARLA.
 
 vehicle_ml waits at the stop line to turn left across human_vehicle, which comes straight through
 without slowing. Both runs use the same paths and speeds and differ only in when the turner goes:
-    unsafe: it pulls out just ahead of the oncoming car
+    unsafe: it pulls out too soon, into the oncoming car's path, and needs the brake to avoid contact
     safe:   it waits for the oncoming car to clear, then goes
 
 The running central_gpu_processor.py decides whether to brake, from straight-line TTC and from the
-vehicles' predicted paths, and the turner obeys its SafetyGate.
+vehicles' predicted paths, and the turner obeys its SafetyGate. The brake latches in the processor,
+so once the oncoming car has passed, this script releases it, as an operator would, and the turner
+finishes its turn.
 Each run is compared with the same plan replayed with no brake, to show what the brake changed.
 
 Normally started by run_simulation.py. To run it alone, start the processor first:
@@ -48,7 +50,7 @@ TURN_SPEED = 6.0          # m/s, the turner's speed once rolling
 TURN_ACCEL = 2.5          # m/s^2, pulling away from the stop line
 BRAKE_DECEL = 6.0         # m/s^2, firm braking on dry road
 ONCOMING_ARRIVAL = 7.0    # s after the run starts that the oncoming car reaches the conflict point
-UNSAFE_LEAD = 0.8         # s the unsafe turner arrives ahead of the oncoming car
+UNSAFE_GAP = 1.0          # s the unsafe turner would arrive after the oncoming car, too close to clear it
 SAFE_GAP = 3.0            # s the safe turner arrives after the oncoming car
 STOP_LINE_SETBACK = 3.0   # m before the junction entry
 UPSTREAM = 80.0           # m of road modelled before the junction entry
@@ -56,6 +58,7 @@ DOWNSTREAM = 30.0         # m of road modelled after the junction exit
 ZONE_RADIUS = COLLISION_RADIUS  # m around the conflict point counted as "in the conflict zone"
 WAYPOINT_STEP = 1.0       # m
 RUN_LIMIT = 25.0          # s of simulation before a run is cut off
+PASSED_BY = 8.0           # m beyond the conflict point the oncoming car must be before the brake is released
 SETTLE_AFTER = 1.5        # s kept running after the run's outcome is decided
 Z_CLEARANCE = 0.3         # m above the road
 VEHICLE_LENGTH = 4.8      # m, Tesla Model 3
@@ -67,6 +70,7 @@ SIGNAL_OFF_AFTER = 15.0   # m past the conflict point that the turn signal is ca
 MAX_OFF_VIEW = 30.0       # m the conflict point may be from directly under the spectator
 
 PET_UNSAFE = 1.5          # s; below this, a crossing is commonly treated as a serious conflict
+NEAR_MISS_GAP = 1.0       # m between outlines; closer than this while passing counts as a near miss
 DRAC_UNSAFE = 3.35        # m/s^2; a widely used threshold for a conflict needing hard braking
 
 
@@ -128,7 +132,7 @@ def time_to_cover(distance, cruise, accel):
 
 def departure_time(case, distance_to_conflict):
     """When the turner should leave the stop line for this case."""
-    arrival = ONCOMING_ARRIVAL - UNSAFE_LEAD if case == "unsafe" else ONCOMING_ARRIVAL + SAFE_GAP
+    arrival = ONCOMING_ARRIVAL + (UNSAFE_GAP if case == "unsafe" else SAFE_GAP)
     return arrival - time_to_cover(distance_to_conflict, TURN_SPEED, TURN_ACCEL)
 
 
@@ -175,6 +179,7 @@ class Result:
     reasons: list = field(default_factory=list)
     contact: bool = False
     min_separation: float = math.inf
+    min_gap: float = math.inf  # m between the vehicle outlines at their closest; 0 means touching
     min_ttc: float = math.inf
     min_predicted_pet: float = math.inf
     max_drac: float = 0.0
@@ -207,9 +212,26 @@ def rectangles_overlap(a, b):
     return True
 
 
-def outlines_overlap(s):
-    return rectangles_overlap(outline(s.turner_x, s.turner_y, s.turner_yaw),
-                              outline(s.oncoming_x, s.oncoming_y, s.oncoming_yaw))
+def point_to_segment(p, a, b):
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy))
+
+
+def rectangles_gap(a, b):
+    """Metres between two rectangles' nearest edges; 0 if they overlap."""
+    if rectangles_overlap(a, b):
+        return 0.0
+    return min(point_to_segment(p, *edge)
+               for corners, other in ((a, b), (b, a))
+               for p in corners
+               for edge in itertools.pairwise([*other, other[0]]))
+
+
+def outline_gap(s):
+    return rectangles_gap(outline(s.turner_x, s.turner_y, s.turner_yaw),
+                          outline(s.oncoming_x, s.oncoming_y, s.oncoming_yaw))
 
 
 def zone_times(samples, x_attr, y_attr, center):
@@ -241,7 +263,8 @@ def analyse(case, samples, center):
         # Only while heading for contact: a car passing in its own lane is "closing" but no conflict
         if ttc < math.inf and separation - COLLISION_RADIUS >= DRAC_MIN_GAP:
             result.max_drac = max(result.max_drac, deceleration_to_avoid_crash(a, b))
-        result.contact = result.contact or outlines_overlap(s)
+        result.min_gap = min(result.min_gap, outline_gap(s))
+        result.contact = result.contact or result.min_gap == 0.0
         if s.braked and result.brake_fired_at is None:
             result.brake_fired_at = s.t
             result.ttc_when_braked = ttc
@@ -261,7 +284,9 @@ def classify(r):
     """UNSAFE if anything about the run crossed a conflict threshold."""
     reasons = []
     if r.contact:
-        reasons.append(f"contact: vehicle outlines overlapped (centres {r.min_separation:.1f} m apart)")
+        reasons.append("contact: vehicle outlines overlapped")
+    elif r.min_gap < NEAR_MISS_GAP:
+        reasons.append(f"near miss: outlines {r.min_gap:.2f} m apart (under {NEAR_MISS_GAP} m)")
     if r.min_ttc < TTC_BRAKE:
         reasons.append(f"min TTC {r.min_ttc:.2f} s (under {TTC_BRAKE} s)")
     if r.pet is not None and r.pet < PET_UNSAFE:
@@ -315,7 +340,7 @@ def print_comparison(runs):
         ("Min TTC", lambda r: format_seconds(r.min_ttc)),
         ("Measured PET", lambda r: format_seconds(r.pet)),
         ("Max DRAC", lambda r: f"{r.max_drac:.2f} m/s2"),
-        ("Closest centres", lambda r: f"{r.min_separation:.2f} m"),
+        ("Closest gap", lambda r: f"{r.min_gap:.2f} m"),
         ("Contact", lambda r: "YES" if r.contact else "no"),
         ("Brake fired", lambda r: format_seconds(r.brake_fired_at).replace("never", "no")),
     ]
@@ -462,8 +487,13 @@ def run_case(carla, world, session, case, turner_path, oncoming_path, turner_sta
             braked = True
             print(f"[{case.upper()}] t={t:.1f} s: brake received, turner stopping.")
 
-        s, v = turner.step(t, dt, braked)
         oncoming_s = oncoming_start + ONCOMING_SPEED * t
+        if braked and oncoming_s > oncoming_conflict_s + PASSED_BY:
+            release_gate(session)
+            braked = False
+            print(f"[{case.upper()}] t={t:.1f} s: oncoming car has passed, brake released, finishing the turn.")
+
+        s, v = turner.step(t, dt, braked)
         ml.set_transform(twin_transform(carla, turner_path, s))
         human.set_transform(twin_transform(carla, oncoming_path, oncoming_s))
         samples.append(make_sample(t, turner_path, s, v, oncoming_path, oncoming_s, braked))
@@ -475,7 +505,7 @@ def run_case(carla, world, session, case, turner_path, oncoming_path, turner_sta
         world.debug.draw_string(label_at, f"{case.upper()} LEFT TURN  t={t:.1f}s", color=color, life_time=0.11)
         world.debug.draw_point(carla.Location(x=cx, y=cy, z=0.5), size=0.2, color=color, life_time=0.11)
 
-        turner_done = s >= turner_path.length or (braked and v == 0.0)
+        turner_done = s >= turner_path.length
         oncoming_done = oncoming_s >= oncoming_path.length
         if settle_until is None and turner_done and oncoming_done:
             settle_until = t + SETTLE_AFTER

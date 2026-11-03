@@ -135,9 +135,9 @@ That one command starts whatever isn't already running (Docker, the Ditto stack,
 
 ### The left-turn analysis
 
-`vehicle_ml` waits at the stop line to turn left across `human_vehicle`, which comes straight through at 10 m/s without slowing. Both runs use the same paths and speeds and differ only in when the turner goes: the unsafe one pulls out to arrive 0.8 s ahead of the oncoming car, and the safe one waits to arrive 3 s after it.
+`vehicle_ml` waits at the stop line to turn left across `human_vehicle`, which comes straight through at 10 m/s without slowing. Both runs use the same paths and speeds and differ only in when the turner goes: the unsafe one pulls out to arrive 1 s after the oncoming car, too soon to clear it, and the safe one waits to arrive 3 s after it. In the unsafe run the safety brake stops the turner just short of the oncoming car, which passes it narrowly. The scenario then releases the brake, as an operator would, and the turner finishes its turn. Outside this scenario the brake stays latched until `--clear-brake`.
 
-A run is **UNSAFE** if the vehicle outlines overlap, TTC drops under 1.5 s, PET drops under 1.5 s, DRAC goes over 3.35 m/s2, or the safety brake fires. Each run is shown next to the same plan replayed with no brake, so you can see what the brake changed. The report and per-tick data go to `output/`.
+A run is **UNSAFE** if the vehicle outlines overlap or come within 1 m, TTC drops under 1.5 s, PET drops under 1.5 s, DRAC goes over 3.35 m/s2, or the safety brake fires. Each run is shown next to the same plan replayed with no brake, so you can see what the brake changed. The report and per-tick data go to `output/`.
 
 Measured PET is the time between one vehicle leaving a 2.5 m zone around the conflict point and the other entering it. Oncoming traffic never reacts in this scenario.
 
