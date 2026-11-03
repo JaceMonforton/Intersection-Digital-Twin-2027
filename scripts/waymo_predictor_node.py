@@ -31,6 +31,10 @@ STEP_SECONDS = 0.1
 DRAW_HEIGHT = 0.5     # metres above the actor, so lines don't z-fight with the road
 DRAW_THICKNESS = 0.1
 DRAW_COLOR = (70, 0, 0)  # debug lines are unlit, so full brightness blooms at high render quality
+DRAW_COLOR_ML = (90, 0, 90)  # the ML car's line matches its magenta paint and box
+DRAW_RADIUS = 70.0     # metres from the spectator; each line is a call to the server, and off-screen ones
+                       # slowed the whole simulation from 10 to 7 ticks per second with 40 cars
+DRAW_EVERY = 3         # draw every Nth step of other cars' lines, for the same reason
 DRAW_LIFE_TIME = 0.11  # must outlive one 0.1 s tick: at exactly 0.1 a line expires before it renders
 
 
@@ -297,12 +301,17 @@ def baseline_paths(carla, lanes, actors, ready, yaws, recent_yaws):
 
 
 def draw_paths(carla, world, actors, paths):
-    color = carla.Color(*DRAW_COLOR)
+    view = world.get_spectator().get_transform().location
     for actor_id, path in paths.items():
+        is_ml = actors[actor_id].attributes.get("role_name") == "vehicle_ml"
+        location = actors[actor_id].get_location()
+        if not is_ml and math.hypot(location.x - view.x, location.y - view.y) > DRAW_RADIUS:
+            continue
+        color = carla.Color(*(DRAW_COLOR_ML if is_ml else DRAW_COLOR))
         z = actors[actor_id].get_location().z + DRAW_HEIGHT
         begin = actors[actor_id].get_location()
         begin = carla.Location(x=begin.x, y=begin.y, z=z)
-        for px, py in path:
+        for px, py in (path if is_ml else path[DRAW_EVERY - 1::DRAW_EVERY]):
             end = carla.Location(x=float(px), y=float(py), z=z)
             world.debug.draw_line(begin, end, thickness=DRAW_THICKNESS, color=color, life_time=DRAW_LIFE_TIME)
             begin = end

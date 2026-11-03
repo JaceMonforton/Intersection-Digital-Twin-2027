@@ -23,7 +23,7 @@ WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 CARLA_HOST = "127.0.0.1"
 CARLA_PORT = 2000
-CARLA_MAP = "Town01"     # expected, not loaded: the processor owns the map
+CARLA_MAP = "Town10HD_Opt"  # expected, not loaded: the processor owns the map
 
 DITTO_BASE = "http://localhost:8080/api/2/things/"
 NAMESPACE = "org.example"

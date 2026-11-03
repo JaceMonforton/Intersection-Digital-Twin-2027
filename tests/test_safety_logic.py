@@ -5,20 +5,25 @@ import math
 import numpy as np
 import pytest
 from central_gpu_processor import (
+    Box,
     CentroidTracker,
     SafetyEngine,
     Track,
     apply_event,
+    approaching_from_behind,
     deceleration_to_avoid_crash,
     fit_model_input,
     fuse,
     lidar_to_model_frame,
     model_box_to_world,
+    overhead_marker,
     parse_lidar,
+    path_check_applies,
     path_time_to_collision,
     post_encroachment_time,
     thing_to_track,
     time_to_collision,
+    ttc_check_applies,
 )
 from physical_ml_subscriber import SafetyGateSubscriber, SimMotors, parse_gate_event
 from waymo_predictor_node import (
@@ -265,6 +270,102 @@ def test_no_brake_when_predicted_paths_stay_apart():
     ditto = FakeDitto(turning_across(path_ttc_steps=0))
     SafetyEngine(ditto).step(100.0)
     assert ditto.brakes == []
+
+
+@pytest.mark.parametrize("other,expected", [
+    (Track("o", -10, 0, yaw=0.0), True),      # behind, same way: the case braking can't help
+    (Track("o", 10, 0, yaw=0.0), False),      # ahead, same way
+    (Track("o", 10, 0, yaw=180.0), False),    # ahead, oncoming
+    (Track("o", -10, 0, yaw=180.0), False),   # behind, going away
+    (Track("o", -5, -5, yaw=90.0), False),    # behind and crossing: moving could still clear it
+    (Track("o", -10, 0), False),              # heading unknown, so assume it might matter
+])
+def test_approaching_from_behind(other, expected):
+    assert approaching_from_behind(Track("me", 0, 0, yaw=0.0), other) is expected
+
+
+def test_approaching_from_behind_follows_my_heading():
+    me = Track("me", 0, 0, yaw=90.0)  # facing +y
+    assert approaching_from_behind(me, Track("o", 0, -10, yaw=90.0)) is True
+    assert approaching_from_behind(me, Track("o", 0, 10, yaw=90.0)) is False
+
+
+def test_no_brake_for_a_car_coming_up_from_behind():
+    # Stopped at a light, with a car closing from behind: every trigger fires, and braking is no use
+    path = straight_path(0, 0, 0, 0)
+    tracks = [Track("vehicle_ml", 0, 0, 0, 0, path, 0.0), Track("carla:1", -10, 0, 8, 0, path, 0.0)]
+    ditto = FakeDitto(tracks)
+    SafetyEngine(ditto).step(100.0)
+    assert ditto.brakes == []
+
+
+def test_path_check_ignores_a_stopped_car_ahead_until_ttc_says_so():
+    path = straight_path(0, 0, 7, 0)
+    stopped = straight_path(20, 0, 0, 0)
+    tracks = [Track("vehicle_ml", 0, 0, 7, 0, path, 0.0), Track("carla:1", 20, 0, 0, 0, stopped, 0.0)]
+    ditto = FakeDitto(tracks)
+    SafetyEngine(ditto).step(100.0)
+    assert ditto.brakes == []  # paths meet within 3 s, but this is just a car to slow down for
+
+    tracks = [Track("vehicle_ml", 0, 0, 7, 0, path, 0.0), Track("carla:1", 10, 0, 0, 0, stopped, 0.0)]
+    ditto = FakeDitto(tracks)
+    SafetyEngine(ditto).step(100.0)
+    assert len(ditto.brakes) == 1  # TTC under 1.5 s still brakes
+
+
+def test_path_check_ignores_a_slower_car_being_followed():
+    path = straight_path(0, 0, 8, 0)
+    tracks = [Track("vehicle_ml", 0, 0, 8, 0, path, 0.0), Track("carla:1", 20, 0, 3, 0, straight_path(20, 0, 3, 0), 5.0)]
+    ditto = FakeDitto(tracks)
+    SafetyEngine(ditto).step(100.0)
+    assert ditto.brakes == []
+
+
+def test_path_check_applies_to_crossing_traffic():
+    # A car crossing from the side, with no straight-line conflict at this offset
+    me = Track("vehicle_ml", 0, 0, 5, 0, yaw=0.0)
+    assert path_check_applies(me, Track("o", 10, -10, 0, 5, yaw=90.0))
+    assert not path_check_applies(me, Track("o", 10, -10, 0, 0, yaw=90.0))  # stopped
+    assert not path_check_applies(me, Track("o", 10, 0, 5, 0, yaw=0.0))     # following
+
+
+def test_straight_line_ttc_ignores_stopped_cars_mid_turn():
+    turning = Track("me", 0, 0, 5, 0, yaw=0.0, yaw_rate=-30.0)
+    straight = Track("me", 0, 0, 5, 0, yaw=0.0)
+    assert not ttc_check_applies(turning, Track("o", 8, 0))        # a queue it happens to be pointing at
+    assert ttc_check_applies(turning, Track("o", 8, 0, -5, 0))     # a moving car still counts
+    assert ttc_check_applies(straight, Track("o", 8, 0))           # going straight, it's really ahead
+
+
+def test_overhead_marker_looks_identical_from_the_gantry():
+    # Project corners onto the road from a gantry 40 m up: raised marker and real box must coincide
+    def on_road(x, y, z, gantry=(100.0, 50.0, 40.0)):
+        scale = gantry[2] / (gantry[2] - z)
+        return gantry[0] + (x - gantry[0]) * scale, gantry[1] + (y - gantry[1]) * scale
+
+    box = Box(120.0, 60.0, 0.75, 4.8, 2.1, 1.5, 30.0, True)
+    marker = overhead_marker(box, 100.0, 50.0, 40.0, marker_height=7.0)
+    assert marker.z == pytest.approx(7.0)
+    assert on_road(marker.x, marker.y, marker.z) == pytest.approx(on_road(box.x, box.y, 0.0))
+    assert on_road(marker.x + marker.length / 2, marker.y, marker.z)[0] == pytest.approx(
+        on_road(box.x + box.length / 2, box.y, 0.0)[0])
+    assert marker.yaw == box.yaw
+
+
+def test_no_brake_while_already_stopped():
+    # Waiting at the stop line with a car heading straight at it: braking changes nothing
+    tracks = [Track("vehicle_ml", 0, 0, 0, 0, yaw=0.0), Track("carla:1", 5, 0, -5, 0, yaw=180.0)]
+    ditto = FakeDitto(tracks)
+    SafetyEngine(ditto).step(100.0)
+    assert ditto.brakes == []
+
+
+def test_still_brakes_for_a_stopped_car_ahead():
+    tracks = [Track("vehicle_ml", 0, 0, 8, 0, straight_path(0, 0, 8, 0), 0.0),
+              Track("carla:1", 10, 0, 0, 0, straight_path(10, 0, 0, 0), 0.0)]
+    ditto = FakeDitto(tracks)
+    SafetyEngine(ditto).step(100.0)
+    assert len(ditto.brakes) == 1
 
 
 def test_no_brake_above_threshold():

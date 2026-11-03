@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import signal
 import time
 
 import carla
@@ -9,6 +10,10 @@ from carla.command import DestroyActor, FutureActor, SetAutopilot, SpawnActor
 from numpy import random
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
 
 
 def get_actor_blueprints(world, filter, generation):
@@ -147,7 +152,20 @@ def main():
         help="Activate no rendering mode",
     )
 
+    argparser.add_argument(
+        "--near-view",
+        action="store_true",
+        help="Spawn vehicles nearest the spectator, so traffic starts on-screen",
+    )
     args = argparser.parse_args()
+
+    # Without this, Ctrl+Break or a closed console skips the cleanup and leaves the traffic behind
+    for name in ("SIGBREAK", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
+
+    # With --asynch another process owns the clock, so nothing here may tick the world
+    do_tick = not args.asynch
 
     logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 
@@ -180,18 +198,15 @@ def main():
             if not settings.synchronous_mode:
                 settings.synchronous_mode = True
                 settings.fixed_delta_seconds = 0.05
-        else:
-            print(
-                "You are currently in asynchronous mode. If this is a traffic simulation, "
-                "you could experience some issues. If it's not working correctly, switch to "
-                "synchronous mode by using traffic_manager.set_synchronous_mode(True)"
-            )
 
         if args.no_rendering:
             settings.no_rendering_mode = True
-        print(f"apply_world_settings {settings}")
-        world.apply_settings(settings)
-        print("settings applied")
+        # With --asynch another process owns the clock and these settings. Applying them here too
+        # stops the ticks arriving, even when nothing would change.
+        if not args.asynch:
+            print(f"apply_world_settings {settings}")
+            world.apply_settings(settings)
+            print("settings applied")
 
         blueprints = get_actor_blueprints(world, args.filterv, args.generationv)
         if not blueprints:
@@ -208,7 +223,16 @@ def main():
         spawn_points = world.get_map().get_spawn_points()
         number_of_spawn_points = len(spawn_points)
 
-        if args.number_of_vehicles < number_of_spawn_points:
+        if args.near_view:
+            world.wait_for_tick()  # until the first tick, a new client reads the spectator as (0, 0)
+            view = world.get_spectator().get_transform().location
+            # A car only learns about a light by entering its trigger zone, so one that starts inside
+            # the zone ignores that light. Start them all well back from the stop lines.
+            stop_lines = [stop.transform.location for light in world.get_actors().filter("traffic.traffic_light")
+                          for stop in light.get_stop_waypoints()]
+            spawn_points = [p for p in spawn_points if all(p.location.distance(s) >= 25.0 for s in stop_lines)]
+            spawn_points = sorted(spawn_points, key=lambda p: p.location.distance(view))
+        elif args.number_of_vehicles < number_of_spawn_points:
             random.shuffle(spawn_points)
         elif args.number_of_vehicles > number_of_spawn_points:
             msg = "requested %d vehicles, but could only find %d spawn points"
@@ -243,11 +267,16 @@ def main():
                 )
             )
 
-        for response in client.apply_batch_sync(batch, do_tick=True):
+        for response in client.apply_batch_sync(batch, do_tick):
             if response.error:
                 logger.error(response.error)
             else:
                 vehicles_list.append(response.actor_id)
+
+        # Every car obeys traffic lights and stop signs
+        for actor in world.get_actors(vehicles_list):
+            traffic_manager.ignore_lights_percentage(actor, 0.0)
+            traffic_manager.ignore_signs_percentage(actor, 0.0)
 
         # Set automatic vehicle lights update if specified
         if args.car_lights_on:
@@ -295,7 +324,7 @@ def main():
                 print("Walker has no speed")
                 walker_speed.append(0.0)
             batch.append(SpawnActor(walker_bp, spawn_point))
-        results = client.apply_batch_sync(batch, do_tick=True)
+        results = client.apply_batch_sync(batch, do_tick)
         walker_speed2 = []
         for i in range(len(results)):
             if results[i].error:
@@ -309,7 +338,7 @@ def main():
         walker_controller_bp = world.get_blueprint_library().find("controller.ai.walker")
         for i in range(len(walkers_list)):
             batch.append(SpawnActor(walker_controller_bp, carla.Transform(), walkers_list[i]["id"]))
-        results = client.apply_batch_sync(batch, do_tick=True)
+        results = client.apply_batch_sync(batch, do_tick)
         for i in range(len(results)):
             if results[i].error:
                 logger.error(results[i].error)

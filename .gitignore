@@ -44,6 +44,9 @@ nginx.htpasswd
 .htpasswd
 docker-compose.override.yml
 
+# --- Trained weights: check the Waymo Open Dataset licence before sharing these ---
+models/*.onnx
+
 # --- Docker / local data ---
 mongo-data/
 data/
@@ -74,3 +77,4 @@ Thumbs.db
 Desktop.ini
 
 CLAUDE.md
+data/*
