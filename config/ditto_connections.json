@@ -1,0 +1,34 @@
+[
+  {
+    "id": "mqtt-vehicles",
+    "name": "mqtt-vehicles",
+    "connectionType": "mqtt",
+    "connectionStatus": "open",
+    "failoverEnabled": true,
+    "uri": "tcp://mosquitto:1883",
+    "sources": [
+      {
+        "addresses": ["telemetry/#"],
+        "consumerCount": 1,
+        "qos": 0,
+        "authorizationContext": ["ditto:mqtt-bridge"],
+        "enforcement": {
+          "input": "{{ source:address }}",
+          "filters": ["telemetry/{{ thing:name }}"]
+        },
+        "replyTarget": { "enabled": false }
+      }
+    ],
+    "targets": [
+      {
+        "address": "device/{{ thing:name }}/commands",
+        "topics": [
+          "_/_/things/twin/events?namespaces=org.example&filter=and(eq(thingId,'org.example:vehicle_ml'),like(resource:path,'/features/SafetyGate*'))"
+        ],
+        "qos": 1,
+        "authorizationContext": ["ditto:mqtt-bridge"],
+        "headerMapping": { "mqtt.retain": "true" }
+      }
+    ]
+  }
+]

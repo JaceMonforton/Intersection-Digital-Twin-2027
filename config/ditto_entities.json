@@ -1,1 +1,44 @@
-{"policyId":"org.example:policy","attributes":{"location":{"x":100.0,"y":-190.0,"z":0.5},"orientation":{"yaw":0.0},"kuksa":{"Vehicle.Speed":35.0}}}
+{
+  "org.example:intersection_01": {
+    "policyId": "org.example:policy",
+    "attributes": {
+      "name": "Town01_Intersection_01",
+      "carla_map": "Town01"
+    },
+    "features": {
+      "SafetyMetrics": {
+        "properties": {
+          "ttc": null,
+          "pet": null,
+          "drac": null,
+          "pair": null,
+          "updated_at": null
+        }
+      }
+    }
+  },
+  "org.example:vehicle_ml": {
+    "policyId": "org.example:policy",
+    "attributes": {
+      "role": "ml",
+      "physical": true
+    },
+    "features": {
+      "SafetyGate": {
+        "properties": {
+          "emergency_brake": false,
+          "reason": null,
+          "ttc": null,
+          "updated_at": null
+        }
+      }
+    }
+  },
+  "org.example:human_vehicle": {
+    "policyId": "org.example:policy",
+    "attributes": {
+      "role": "human",
+      "physical": true
+    }
+  }
+}

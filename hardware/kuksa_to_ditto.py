@@ -9,7 +9,7 @@ KUKSA_HOST = "localhost" # KUKSA Databroker running on vehicle
 KUKSA_PORT = 55555
 MQTT_BROKER = "192.168.1.100" # Central IP running Mosquitto / Eclipse Ditto
 MQTT_PORT = 1883
-VEHICLE_ID = "org.eclipse.ditto:vehicle_01"
+VEHICLE_NAME = "vehicle_ml"  # or "human_vehicle"; must match a Thing in config/ditto_entities.json
 
 # Setup MQTT Client
 mqtt_client = mqtt.Client()
@@ -36,7 +36,7 @@ with VSSClient(KUKSA_HOST, KUKSA_PORT) as kuksa:
 
         # Construct Eclipse Ditto Protocol JSON payload
         ditto_payload = {
-            "topic": "org.eclipse.ditto/vehicle_01/things/twin/commands/modify",
+            "topic": f"org.example/{VEHICLE_NAME}/things/twin/commands/modify",
             "headers": {"content-type": "application/json"},
             "path": "/features/kinematics/properties",
             "value": {
@@ -49,7 +49,7 @@ with VSSClient(KUKSA_HOST, KUKSA_PORT) as kuksa:
 
         # Publish update to Eclipse Ditto Ingestion Topic
         mqtt_client.publish(
-            "telemetry/vehicle_01", 
+            f"telemetry/{VEHICLE_NAME}", 
             json.dumps(ditto_payload)
         )
         time.sleep(0.05) # 20 Hz update rate

@@ -1,7 +1,13 @@
 """
 CARLA digital twin mirror: polls Eclipse Ditto and moves a vehicle in CARLA to match.
-Run AFTER the CARLA server is up. Press ESC to quit.
+Attaches to the world run by central_gpu_processor.py, which owns the map and the simulation
+clock, so start that first. Press ESC to quit.
+
+Usage:
+    python scripts/ditto_carla_agent.py                         # mirrors org.example:vehicle_ml
+    python scripts/ditto_carla_agent.py --thing human_vehicle   # a second twin, in its own window
 """
+import argparse
 import json
 import math
 import threading
@@ -17,10 +23,11 @@ WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 CARLA_HOST = "127.0.0.1"
 CARLA_PORT = 2000
-CARLA_MAP = "Town02"
+CARLA_MAP = "Town01"     # expected, not loaded: the processor owns the map
 
-DITTO_BASE = "http://192.168.0.100:8080/api/2/things/"
-THING_ID = "org.ovin:my-vehicle"
+DITTO_BASE = "http://localhost:8080/api/2/things/"
+NAMESPACE = "org.example"
+DEFAULT_THING = "vehicle_ml"
 DITTO_AUTH = ("ditto", "ditto")
 
 FPS = 30
@@ -44,12 +51,16 @@ STALE_AFTER = 2.0       # seconds without a pose change before the HUD warns
 
 # --- Dead reckoning (used when the thing has NO x/y, only Speed + SteeringAngle) ---
 DEAD_RECKON = True
-DR_SPEED_TO_MS = 1.0        # multiply Ditto "Speed" to get m/s (0.2778 if it is km/h)
+DR_SPEED_TO_MS = 3.0        # multiply Ditto "Speed" to get m/s (0.2778 if it is km/h)
 DR_DISTANCE_SCALE = 1.0     # 10.0 to render a 1:10 robot as a full-size car
 DR_STEER_IN_DEGREES = False # True if SteeringAngle is degrees; False = radians
 DR_LEFT_POSITIVE = True     # True if positive steering = turn left (ROS convention)
-DR_WHEELBASE = 2.87         # metres in CARLA (Tesla Model 3)
+DR_WHEELBASE = 1.5          # metres in CARLA (smaller = tighter turns)
 DR_SPEED_DEADBAND = 0.05    # ignore |speed| below this (sensor noise at standstill)
+DR_STEER_HOLD = 0.5         # s the steering value may stay unchanged before it starts recentring
+DR_STEER_RETURN = 0.7       # s to ease back to 0 after the hold (0 = snap to 0 instantly)
+DR_STEER_GAIN = 1.0        # >1 = sharper steering (e.g. 5.0 turns 5x harder)
+DR_MAX_STEER = 0.6          # clamp after gain, radians (~34 deg); keeps tan() sane
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +107,11 @@ def parse_pose(thing):
     return pose, missing
 
 
+def parse_emergency_brake(thing):
+    """True only when the Thing's SafetyGate says so; a Thing with no gate is never braked."""
+    return _dig(thing, "features", "SafetyGate", "properties", "emergency_brake") is True
+
+
 def parse_drive(thing):
     """(speed, steering) from features.Speed/SteeringAngle .properties.value (either may be None)."""
     def val(name):
@@ -109,12 +125,23 @@ def parse_drive(thing):
     return val("Speed"), val("SteeringAngle")
 
 
+def recentre_factor(age):
+    """1.0 while SteeringAngle is fresh; ramps to 0.0 once it has been unchanged too long.
+    Ditto keeps the last value after the wheel is released, so we recentre ourselves."""
+    if age <= DR_STEER_HOLD:
+        return 1.0
+    if DR_STEER_RETURN <= 0:
+        return 0.0
+    return max(0.0, 1.0 - (age - DR_STEER_HOLD) / DR_STEER_RETURN)
+
+
 def step_bicycle(x, y, yaw_deg, speed, steer, dt):
     """Kinematic bicycle model in the CARLA frame. Returns new (x, y, yaw_deg)."""
     v = speed * DR_SPEED_TO_MS * DR_DISTANCE_SCALE
     if abs(speed * DR_SPEED_TO_MS) < DR_SPEED_DEADBAND:
         v = 0.0
     delta = math.radians(steer) if DR_STEER_IN_DEGREES else steer
+    delta = max(-DR_MAX_STEER, min(DR_MAX_STEER, delta * DR_STEER_GAIN))
     # CARLA yaw increases clockwise (left-handed), so a left turn lowers yaw
     sign = -1.0 if DR_LEFT_POSITIVE else 1.0
     yaw_rate = sign * (v / DR_WHEELBASE) * math.tan(delta)  # rad/s
@@ -165,6 +192,8 @@ class DittoTelemetryConsumer(threading.Thread):
             "has_drive": False,   # payload contained Speed / SteeringAngle
             "drive_speed": 0.0,
             "drive_steer": 0.0,
+            "steer_changed": 0.0, # time SteeringAngle last changed value
+            "emergency_brake": False,
         }
 
     def _log_error(self, msg):
@@ -183,12 +212,16 @@ class DittoTelemetryConsumer(threading.Thread):
                         print("[DITTO POLL] Connected, receiving telemetry.")
                         print(f"[DITTO RAW] {json.dumps(thing)[:1000]}")
                     t["connected"] = True
+                    t["emergency_brake"] = parse_emergency_brake(thing)
 
                     speed, steer = parse_drive(thing)
                     if speed is not None and steer is not None:
+                        if steer != t["drive_steer"] or not t["has_drive"]:
+                            t["steer_changed"] = time.time()
+                        if (speed, steer) != (t["drive_speed"], t["drive_steer"]):
+                            t["last_change"] = time.time()
                         t["drive_speed"], t["drive_steer"] = speed, steer
                         t["has_drive"] = True
-                        t["last_change"] = time.time()
 
                     pose, missing = parse_pose(thing)
                     if missing:
@@ -237,7 +270,9 @@ class DittoTelemetryConsumer(threading.Thread):
 
 
 class DigitalTwinAgent:
-    def __init__(self):
+    def __init__(self, thing_name):
+        self.thing_name = thing_name
+        self.thing_id = f"{NAMESPACE}:{thing_name}"
         pygame.init()
         pygame.font.init()
         self.display = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
@@ -258,26 +293,21 @@ class DigitalTwinAgent:
         self.actor_list = []
         self._dr = None
         self._last_step = 0.0
+        self._warned_no_tick = False
+        self._braked = False
 
-        self.telemetry_consumer = DittoTelemetryConsumer(THING_ID, DITTO_BASE, DITTO_AUTH)
+        self.telemetry_consumer = DittoTelemetryConsumer(self.thing_id, DITTO_BASE, DITTO_AUTH)
 
     def setup_world(self):
         print(f"[CARLA] Connecting to {CARLA_HOST}:{CARLA_PORT}...")
         self.client = carla.Client(CARLA_HOST, CARLA_PORT)
         self.client.set_timeout(60.0)  # map loads can be slow
 
-        current_map = self.client.get_world().get_map().name
-        if CARLA_MAP not in current_map:
-            print(f"[CARLA] Loading map {CARLA_MAP}...")
-            self.world = self.client.load_world(CARLA_MAP)
-        else:
-            self.world = self.client.get_world()
+        self.world = self.client.get_world()
         self.carla_map = self.world.get_map()
-
-        settings = self.world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 1.0 / FPS
-        self.world.apply_settings(settings)
+        if CARLA_MAP not in self.carla_map.name:
+            print(f"[WARN] CARLA is on {self.carla_map.name}, not {CARLA_MAP}. "
+                  "Start central_gpu_processor.py first: it will replace this world and its actors.")
 
         # Handy for choosing publisher start coordinates
         spawn_points = self.carla_map.get_spawn_points()
@@ -288,9 +318,11 @@ class DigitalTwinAgent:
     def spawn_ego_vehicle(self):
         bp_lib = self.world.get_blueprint_library()
         vehicle_bp = bp_lib.find("vehicle.tesla.model3")
-        vehicle_bp.set_attribute("role_name", "ego_ditto_twin")
+        vehicle_bp.set_attribute("role_name", self.thing_name)  # how the processor identifies the twin
 
-        spawn_points = self.carla_map.get_spawn_points()
+        # Nearest to where the processor aimed the spectator, so the twin starts on-screen
+        view = self.world.get_spectator().get_transform().location
+        spawn_points = sorted(self.carla_map.get_spawn_points(), key=lambda sp: sp.location.distance(view))
         candidates = spawn_points if spawn_points else [carla.Transform()]
         for sp in candidates:
             self.vehicle = self.world.try_spawn_actor(vehicle_bp, sp)
@@ -336,8 +368,11 @@ class DigitalTwinAgent:
         dt = min(now - self._last_step, 0.25) if self._last_step else 0.0
         self._last_step = now
 
-        if not t["connected"]:
-            return
+        if t["emergency_brake"] != self._braked:
+            self._braked = t["emergency_brake"]
+            print(f"[SAFETY] {'EMERGENCY BRAKE: holding twin' if self._braked else 'Brake released'}")
+        if not t["connected"] or self._braked:
+            return  # stay put; dead reckoning resumes from here, a live pose jumps back to the feed
         if t["has_pose"]:
             x, y, yaw = map_to_carla(t["x"], t["y"], t["yaw"])
             self._dr = None  # re-seed dead reckoning from the real pose if pose later vanishes
@@ -345,7 +380,8 @@ class DigitalTwinAgent:
             if self._dr is None:
                 tf = self.vehicle.get_transform()
                 self._dr = (tf.location.x, tf.location.y, tf.rotation.yaw)
-            x, y, yaw = step_bicycle(*self._dr, t["drive_speed"], t["drive_steer"], dt)
+            steer = t["drive_steer"] * recentre_factor(now - t["steer_changed"])
+            x, y, yaw = step_bicycle(*self._dr, t["drive_speed"], steer, dt)
             self._dr = (x, y, yaw)
         else:
             return
@@ -367,12 +403,24 @@ class DigitalTwinAgent:
             )
         )
 
+    def wait_for_tick(self):
+        """The processor drives the clock. Time out regularly so the window stays responsive."""
+        try:
+            self.world.wait_for_tick(1.0)
+            self._warned_no_tick = False
+        except RuntimeError:
+            if not self._warned_no_tick:
+                print("[CARLA] No ticks arriving. Is central_gpu_processor.py running?")
+                self._warned_no_tick = True
+
     def render_hud(self):
         if not self.vehicle:
             return
         t = self.telemetry_consumer.latest_telemetry
         if not t["connected"]:
             status, status_color = "OFFLINE / SEARCHING", (255, 80, 80)
+        elif self._braked:
+            status, status_color = "EMERGENCY BRAKE - HOLDING", (255, 0, 0)
         elif not t["has_pose"] and DEAD_RECKON and t["has_drive"]:
             status, status_color = "DEAD RECKONING (speed + steering only)", (255, 220, 0)
         elif not t["has_pose"]:
@@ -392,7 +440,7 @@ class DigitalTwinAgent:
         lines = [
             ("MODE:      DITTO TWIN MIRROR", (0, 200, 255)),
             (f"Status:    {status}", status_color),
-            (f"Target ID: {THING_ID}", (255, 255, 255)),
+            (f"Target ID: {self.thing_id}", (255, 255, 255)),
             (f"Speed:     {t['speed_kmh']:5.1f} km/h (Ditto)", (255, 255, 255)),
             (f"Ditto raw: X={t['x']:.2f}, Y={t['y']:.2f}, yaw={t['yaw']:.2f}", (255, 255, 255)),
             (f"CARLA pos: X={tf.location.x:.1f}, Y={tf.location.y:.1f}, Z={tf.location.z:.1f}",
@@ -427,8 +475,8 @@ class DigitalTwinAgent:
 
             running = True
             while running:
+                self.wait_for_tick()
                 self.update_vehicle_from_ditto()
-                self.world.tick()
 
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT or (
@@ -448,12 +496,6 @@ class DigitalTwinAgent:
         print("[CLEANUP] Stopping threads and removing actors...")
         self.telemetry_consumer.stop()
 
-        if self.world:
-            settings = self.world.get_settings()
-            settings.synchronous_mode = False
-            settings.fixed_delta_seconds = None
-            self.world.apply_settings(settings)
-
         for actor in reversed(self.actor_list):
             try:
                 if actor is not None and actor.is_alive:
@@ -468,4 +510,6 @@ class DigitalTwinAgent:
 
 
 if __name__ == "__main__":
-    DigitalTwinAgent().run()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--thing", default=DEFAULT_THING, help=f"Thing name in the {NAMESPACE} namespace")
+    DigitalTwinAgent(parser.parse_args().thing).run()

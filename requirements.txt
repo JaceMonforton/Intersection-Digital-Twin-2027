@@ -1,5 +1,5 @@
 # --- Middleware & Communication (Eclipse Ditto / MQTT) ---
-paho-mqtt>=1.6.1
+paho-mqtt>=2.0.0
 websockets>=11.0.3
 websocket-client>=1.6.0
 requests>=2.31.0
@@ -14,6 +14,9 @@ roslibpy>=1.5.0
 # --- CARLA & Math ---
 carla>=0.9.13
 numpy>=1.22.0
+
+# --- Inference (swap for onnxruntime-gpu on the GPU machine) ---
+onnxruntime>=1.16.0
 
 # --- Testing & Quality ---
 pytest>=7.4.0

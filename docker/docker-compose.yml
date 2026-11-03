@@ -1,3 +1,7 @@
+# Pinned because the default project name comes from this file's folder. Without it,
+# moving the file to docker/ would orphan the existing mongo-data volume.
+name: intersection-digital-twin-2027
+
 services:
   mongodb:
     image: mongo:7.0
@@ -16,6 +20,8 @@ services:
     ports:
       - "1883:1883"
       - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
 
   policies:
     image: eclipse/ditto-policies:latest

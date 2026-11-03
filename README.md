@@ -10,7 +10,7 @@
 ![Docker](https://img.shields.io/badge/docker-compose-2496ED)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 
-[Overview](#overview) · [How it works](#how-it-works) · [Run it in 5 steps](#run-it-in-5-steps) · [Targets](#engineering-targets) · [Roadmap](#roadmap) · [Troubleshooting](#troubleshooting)
+[Overview](#overview) · [How it works](#how-it-works) · [Run it](#run-it) · [Targets](#engineering-targets) · [Roadmap](#roadmap) · [Troubleshooting](#troubleshooting)
 
 </div>
 
@@ -53,25 +53,34 @@ Every vehicle is described by a **digital twin** (an Eclipse Ditto "thing") that
 
 ```mermaid
 flowchart LR
-    subgraph Source["Vehicle data"]
+    subgraph Vehicles["Physical vehicles"]
         R["Rosmaster R2<br/>(ROS2)"] --> K["Eclipse KUKSA<br/>Databroker"]
-        F["Test feeder<br/>(synthetic data)"]
+        G["physical_ml_subscriber<br/>safety gate"] --> M["Motor PWM"]
     end
-    subgraph Twin["Digital twin"]
-        D["Eclipse Ditto<br/>current state of each vehicle"]
+    subgraph Infra["Docker stack"]
+        Q["Mosquitto<br/>MQTT :1883"]
+        N["nginx :8080"] --> D["Eclipse Ditto<br/>twin state"]
     end
-    subgraph Sim["Simulation"]
-        B["Ditto-CARLA<br/>bridge"] --> C["CARLA<br/>Town02"]
+    subgraph GPU["Central GPU machine"]
+        C["CARLA"] --> P["central_gpu_processor<br/>TTC / PET / DRAC"]
+        C --> W["waymo_predictor_node<br/>3 s trajectories"]
     end
-    K --> D
-    F --> D
-    D --> B
-    D -.->|planned| Q["Apache Kafka<br/>streaming / logging"]
+    K -->|telemetry/name| Q
+    Q <--> D
+    N -->|WebSocket events| P
+    P -->|"HTTP: emergency_brake when TTC < 1.5 s"| N
+    Q -->|device/vehicle_ml/commands| G
 ```
 
-Solid arrows exist today. The dashed arrow is planned. The full proposed architecture is in Appendix A (Figure A.1) of the project report.
+| Thing | Role |
+| ----- | ---- |
+| `org.example:intersection_01` | The intersection; holds the latest `SafetyMetrics` |
+| `org.example:vehicle_ml` | The ML vehicle; the only one with a `SafetyGate` |
+| `org.example:human_vehicle` | The human-driven RC car |
 
-**Why this design?** The twin layer decouples the vehicles from the simulator. Stage 1 uses the feeder, Stage 2 swaps in a real robot, and nothing downstream has to change.
+The full proposed architecture is in Appendix A (Figure A.1) of the project report.
+
+**Why this design?** The twin layer decouples the vehicles from the simulator: anything that writes the same telemetry, a real robot or a test script, drives everything downstream the same way.
 
 <details>
 <summary><b>Technology choices</b></summary>
@@ -92,15 +101,21 @@ Solid arrows exist today. The dashed arrow is planned. The full proposed archite
 
 ```
 .github/workflows/   CI pipeline
-bridge/              Ditto to CARLA synchronization (ditto_carla_sync.py)
-hardware/            KUKSA to Ditto bridge (kuksa_to_ditto.py)
-scripts/             CARLA connection checks, traffic/autopilot tests, Ditto-CARLA agent
-tests/               Unit tests and the synthetic telemetry feeder
-config/              Settings and the CARLA 0.9.16 Python client (wheel and egg)
-docker-compose.yml   Ditto stack (MongoDB, Ditto services, nginx, Mosquitto, UIs)
-nginx.conf           Reverse proxy and basic auth in front of the Ditto gateway
-policy.json          Ditto policy used for the test vehicle
-thing.json           Ditto thing (vehicle_01) used for the test vehicle
+docker/              Ditto stack: docker-compose.yml, mosquitto.conf, nginx.conf
+config/              ditto_policies.json, ditto_entities.json, ditto_connections.json,
+                     settings, and the CARLA 0.9.16 Python client (wheel and egg)
+models/              ONNX weights and the contract they must meet (see models/README.md)
+scripts/
+  setup_entities.py           Provisions Ditto from config/
+  central_gpu_processor.py    Master tick, overhead LiDAR, state fusion, safety metrics, brake trigger
+  waymo_predictor_node.py     History buffer, 3 s trajectory prediction, debug drawing
+  physical_ml_subscriber.py   Onboard safety gate (runs on the vehicle)
+  ditto_carla_agent.py        Mirrors one vehicle Thing in CARLA, with a chase camera
+  test_carla_connection.py    CARLA connection check
+  test_traffic.py             Spawns background traffic in CARLA
+tests/               Safety logic unit tests and the end-to-end latency benchmark
+bridge/              Standalone Ditto to CARLA synchronization (ditto_carla_sync.py)
+hardware/            KUKSA to Ditto publisher (kuksa_to_ditto.py)
 requirements.txt     Python dependencies
 ```
 
@@ -108,9 +123,9 @@ requirements.txt     Python dependencies
 
 ---
 
-## Run it in 5 steps
+## Run it
 
-By the end you will see a virtual vehicle driving in CARLA, fed by synthetic data flowing through the full digital twin pipeline.
+By the end, a vehicle on a collision course gets its motors cut before impact.
 
 ### Before you begin
 
@@ -130,66 +145,133 @@ pip install -r requirements.txt
 pip install config\carla-0.9.16-cp310-cp310-win_amd64.whl
 ```
 
-### 2. Start the Ditto stack
+### 2. Spin up the infrastructure
 
 ```powershell
-docker compose up -d
+docker compose -f docker/docker-compose.yml up -d
 ```
 
 Wait **60 to 90 seconds** for the services to form a cluster, then check that every container is `Up`:
 
 ```powershell
 docker ps --format "table {{.Names}}\t{{.Ports}}"
-curl.exe -u ditto:ditto http://localhost:8080/api/2/things
+curl.exe http://localhost:8080/api/2/things
 ```
 
-**You should see:** all containers `Up`, and the `curl` call returning a JSON response (an empty list on a fresh start).
+**You should see:** all containers `Up`, and the `curl` call returning a JSON list.
 
 <details>
 <summary><b>What runs on which port</b></summary>
 
 | Port | Service |
 | ---- | ------- |
-| 8080 | nginx, proxying the Ditto API and UI (basic auth `ditto` / `ditto`) |
-| 8081 | Ditto gateway, direct access (**dev only, no authentication**) |
+| 8080 | nginx, proxying the Ditto API and WebSocket. It injects the `x-ditto-pre-authenticated` header |
+| 8081 | Ditto gateway, direct access |
 | 1883 / 9001 | Mosquitto (MQTT / WebSocket) |
 | 27017 | MongoDB (data is kept in the `mongo-data` volume) |
 
-> **Warning:** The default `ditto` / `ditto` credentials and the open gateway on port 8081 are for local development only. Do not expose these ports beyond your machine.
+> **Warning:** Nothing here authenticates. Anyone who can reach 8080 can write to the twins, and anyone who can reach 1883 can publish telemetry or brake commands. Keep these ports on a trusted lab network.
 
 </details>
 
-### 3. Start CARLA
+### 3. Provision the twin entities
 
-Launch the CARLA 0.9.16 server (for example `CarlaUE4.exe` from your CARLA install folder) and wait for its window to open.
+```powershell
+python scripts/setup_entities.py
+```
 
-### 4. Run the agent
+**You should see:** each policy, Thing and connection reported with a 2xx status, then `Done`. Re-running this resets the Things to their initial state.
+
+### 4. Start the onboard vehicle listener
+
+On the vehicle's computer (Raspberry Pi or Jetson), which only needs `pip install paho-mqtt`:
+
+```bash
+python scripts/physical_ml_subscriber.py --broker <central machine IP>
+```
+
+Use `--driver sim` to try it without motors, on any machine.
+
+**You should see:** `MOTORS CUT: waiting for first SafetyGate state`, then `Hold released`.
+
+> The gate holds the motors off until it hears an explicit release, and again whenever it loses the broker. If the Rosmaster's ROS2 driver owns the serial port, this script cannot open it; the stop needs to go through that driver instead.
+
+### 5. Launch the central GPU processor
+
+Start the CARLA server (for example `CarlaUE4.exe` from your CARLA install folder), then:
+
+```powershell
+python scripts/central_gpu_processor.py
+```
+
+**You should see:** `Master tick running at 10 Hz`, and the CARLA window looking straight down at the intersection. Use `--no-carla` to run the safety engine on Ditto telemetry alone. A cold map load can take several minutes.
+
+This process owns the simulation: it loads `Town01`, enables synchronous mode (`fixed_delta_seconds=0.1`) and drives `world.tick()` in real time. **Start it before the scripts below**, which attach to its world without changing the map or settings. Exit with Ctrl+C so it can restore asynchronous mode and remove its sensors. If it dies uncleanly, the next processor takes over and warns that it did.
+
+Then, each in its own terminal:
 
 ```powershell
 python scripts/ditto_carla_agent.py
+python scripts/ditto_carla_agent.py --thing human_vehicle
+python scripts/waymo_predictor_node.py
 ```
 
-**You should see:** the agent connect, load the `Town02` map, spawn a vehicle, and print a list of **spawn points**. Keep this running and note one of the spawn points.
+The agents mirror each Thing into a CARLA vehicle named after it, spawned near the intersection. That name is how the processor recognises them, so the brake logic works with no external telemetry at all. The predictor draws each vehicle's next 3 s as red lines, and the processor draws yellow boxes (green when they come from a model).
 
-### 5. Send synthetic vehicle data
+> `scripts/test_traffic.py` ticks the world itself unless you pass `--asynch`, and `scripts/test_carla_connection.py` always does. Two tickers will fight, so stop the processor first, or use `test_traffic.py --asynch` alongside it.
 
-In a **second terminal** (activate `.venv` again), start the feeder. It creates the Ditto policy and thing if they don't exist, then streams position updates at about 20 Hz. Use a spawn point from step 4 so the vehicle starts on a road (the values below are an example):
+### 6. Run the scenario
+
+Publish telemetry from each vehicle with `hardware/kuksa_to_ditto.py`, then drive the human RC car around the blind corner toward the ML car's path.
+
+**You should see:** `[ALERT] EMERGENCY BRAKE sent` from the processor and `MOTORS CUT` on the vehicle, before impact.
+
+The `vehicle_ml` twin also stops on screen and its window shows `EMERGENCY BRAKE - HOLDING`. `human_vehicle` has no safety gate, so it keeps moving.
+
+The brake **latches**. Once the area is clear, release it (a twin following live poses then jumps back to the feed; one dead reckoning resumes from where it stopped):
 
 ```powershell
-python tests/test_feeder.py --x -7.5 --y 142.2 --yaw 90
+python scripts/setup_entities.py --clear-brake
 ```
 
-**You should see:** `SYNCED` in the agent window, and the vehicle moving in CARLA. The feeder drives in a straight line and then turns, so it does not follow the road network.
+<details>
+<summary><b>Telemetry format</b></summary>
 
-That is the full pipeline working: **feeder → Ditto → bridge → CARLA**.
+Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.html) JSON to `telemetry/<thing name>`. The engine reads `location` + `velocity` (m/s), or `kinematics` as written by `hardware/kuksa_to_ditto.py` (`x`, `y`, `heading` in degrees, `speed` in km/h).
+
+```json
+{
+  "topic": "org.example/human_vehicle/things/twin/commands/merge",
+  "headers": { "content-type": "application/merge-patch+json", "response-required": false },
+  "path": "/features",
+  "value": {
+    "location": { "properties": { "x": 12.0, "y": 4.5, "z": 0.0 } },
+    "velocity": { "properties": { "vx": 1.5, "vy": 0.0 } }
+  }
+}
+```
+
+Poses must already be in the CARLA frame. Lab-to-CARLA mapping is still on the roadmap; `TELEMETRY_SCALE` in `central_gpu_processor.py` covers scale only.
+
+</details>
+
+<details>
+<summary><b>Known limitations</b></summary>
+
+- **No model weights are in the repo.** Without them, the processor uses CARLA ground truth instead of LiDAR detections, and the predictor uses constant velocity. Both say so at startup. See [models/README.md](models/README.md), including why a stock CenterPoint is unlikely to work from an overhead sensor.
+- **The vehicle can't tell if the processor has died.** The gate fails safe when the broker link drops, but a crashed processor just stops sending hazards. The processor does warn when `vehicle_ml` telemetry goes stale, since it can't protect a vehicle it can't see.
+- **PET is predicted**, from current velocities at the path crossing point, because true PET is only known after both actors have passed.
+- **TTC assumes constant velocity**, so it won't anticipate a turn or a sudden stop.
+
+</details>
 
 ### Shutting down
 
 ```powershell
-docker compose down
+docker compose -f docker/docker-compose.yml down
 ```
 
-This keeps your Ditto data. Use `docker compose down -v` only if you want to wipe it.
+This keeps your Ditto data. Add `-v` only if you want to wipe it.
 
 ---
 
@@ -199,7 +281,7 @@ This keeps your Ditto data. Use `docker compose down -v` only if you want to wip
 pytest
 ```
 
-Tests that talk to CARLA or Ditto need those services running first. CI cannot run the CARLA simulator, so those tests are not expected to pass on a standard runner.
+`tests/test_safety_logic.py` needs nothing running. `tests/test_mqtt_pipeline.py` runs the full telemetry-to-motor-cut path and the latency benchmark against the Docker stack (no CARLA needed). It skips itself when the stack is down, as on CI, and it resets Thing state. Add `-s` to see the timings.
 
 ---
 
@@ -222,21 +304,21 @@ Ditto only accepts `Content-Type: application/merge-patch+json` for PATCH. Plain
 <details>
 <summary><b>The vehicle appears under the map</b></summary>
 
-The vehicle's height comes from the road surface at the received x/y, not from the published `z`. Check that the published coordinates are on a Town02 road (use the spawn points the agent prints).
+The vehicle's height comes from the road surface at the received x/y, not from the published `z`. Check that the published coordinates are on a road in the loaded map (use the spawn points the agent prints).
 
 </details>
 
 <details>
 <summary><b>Empty replies or resets after changing the compose file</b></summary>
 
-Run `docker compose down`, then `docker compose up -d`, and wait a minute. Make sure no two services publish the same host port.
+Run `docker compose -f docker/docker-compose.yml down`, then `up -d`, and wait a minute. Make sure no two services publish the same host port.
 
 </details>
 
 <details>
 <summary><b>Ditto data disappeared</b></summary>
 
-`docker compose down -v` deletes the `mongo-data` volume. Plain `down` keeps it.
+`down -v` deletes the `mongo-data` volume. Plain `down` keeps it.
 
 </details>
 
@@ -273,7 +355,9 @@ Targets from the project report. They are subject to validation.
 - [ ] Coordinate-frame mapping from the lab room to CARLA world space
 - [ ] Multi-vehicle support and scripted scenarios (straight, turn, stop, speed change, set routes)
 - [ ] SkyEye bird's-eye view
-- [ ] Safety metrics (TTC, headway) and an AI-assisted recommendation component (warnings, slow down, stop, re-plan)
+- [x] Safety metrics (TTC, PET, DRAC) and an emergency brake trigger
+- [ ] Trained detection and trajectory models in `models/`
+- [ ] AI-assisted recommendation component (warnings, slow down, re-plan)
 - [ ] Kafka streaming and a local database for logging
 - [ ] Extend CI/CD beyond the current pipeline
 

@@ -1,0 +1,2 @@
+# These are mounted into Linux containers, so keep LF even on a Windows checkout.
+docker/*.conf text eol=lf

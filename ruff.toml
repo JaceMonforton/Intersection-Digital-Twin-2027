@@ -1,0 +1,3 @@
+# CI runs `ruff check --fix`, so without this ruff can rewrite code to syntax newer than the
+# project's Python (for example datetime.UTC, which needs 3.11).
+target-version = "py310"

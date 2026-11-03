@@ -1,1 +1,24 @@
-{"entries":{"DEFAULT":{"subjects":{"nginx:ditto":{"type":"pre-authenticated"}},"resources":{"thing:/":{"grant":["READ","WRITE"],"revoke":[]},"policy:/":{"grant":["READ","WRITE"],"revoke":[]}}}}}
+{
+  "org.example:policy": {
+    "entries": {
+      "DEFAULT": {
+        "subjects": {
+          "nginx:ditto": { "type": "pre-authenticated" }
+        },
+        "resources": {
+          "thing:/": { "grant": ["READ", "WRITE"], "revoke": [] },
+          "policy:/": { "grant": ["READ", "WRITE"], "revoke": [] },
+          "message:/": { "grant": ["READ", "WRITE"], "revoke": [] }
+        }
+      },
+      "MQTT_BRIDGE": {
+        "subjects": {
+          "ditto:mqtt-bridge": { "type": "connection" }
+        },
+        "resources": {
+          "thing:/": { "grant": ["READ", "WRITE"], "revoke": [] }
+        }
+      }
+    }
+  }
+}
