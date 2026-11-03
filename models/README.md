@@ -5,7 +5,7 @@ so at startup. GitHub rejects files over 100 MB, so use Git LFS for larger weigh
 
 | File | Used by | Without it |
 | ---- | ------- | ---------- |
-| `waymo_trajectory.onnx` | `scripts/waymo_predictor_node.py` | Constant-velocity extrapolation |
+| `waymo_trajectory.onnx` | `scripts/waymo_predictor_node.py` | Follows the road at the current speed |
 | `centerpoint_3d.onnx` | `scripts/central_gpu_processor.py` | CARLA ground-truth actor positions and boxes |
 
 ## `waymo_trajectory.onnx`

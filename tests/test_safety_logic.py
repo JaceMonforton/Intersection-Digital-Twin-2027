@@ -15,6 +15,7 @@ from central_gpu_processor import (
     lidar_to_model_frame,
     model_box_to_world,
     parse_lidar,
+    path_time_to_collision,
     post_encroachment_time,
     thing_to_track,
     time_to_collision,
@@ -22,12 +23,19 @@ from central_gpu_processor import (
 from physical_ml_subscriber import SafetyGateSubscriber, SimMotors, parse_gate_event
 from waymo_predictor_node import (
     HISTORY_FRAMES,
+    LEFT,
+    RIGHT,
+    STRAIGHT,
     HistoryBuffer,
-    constant_velocity,
+    along_polyline,
+    curve_path,
     ego_to_world,
     history_to_ego,
     measured_velocity,
+    pick_branch,
     predict_world_paths,
+    turn_intent,
+    turn_rate,
     world_to_ego,
 )
 
@@ -70,6 +78,29 @@ def test_pet_is_infinite_without_a_crossing(a, b):
     assert post_encroachment_time(a, b) == math.inf
 
 
+def straight_path(x, y, vx, vy, steps=30):
+    times = 0.1 * np.arange(1, steps + 1)
+    return np.stack((x + vx * times, y + vy * times), axis=-1)
+
+
+def test_path_ttc_finds_the_first_moment_the_paths_meet():
+    a = Track("a", 0, 0, path=straight_path(0, 0, 5, 0))
+    b = Track("b", 20, 0, path=straight_path(20, 0, -5, 0))
+    # Closing at 10 m/s from 20 m apart, within 2.5 m at 1.75 s; paths are sampled every 0.1 s
+    assert path_time_to_collision(a, b, radius=2.5) == pytest.approx(1.8)
+
+
+def test_path_ttc_ignores_paths_that_cross_at_different_times():
+    a = Track("a", 0, 0, path=straight_path(0, 0, 5, 0))
+    b = Track("b", 5, -100, path=straight_path(5, -100, 0, 5))
+    assert path_time_to_collision(a, b) == math.inf
+
+
+def test_path_ttc_needs_both_paths():
+    a = Track("a", 0, 0, path=straight_path(0, 0, 5, 0))
+    assert path_time_to_collision(a, Track("b", 1, 0)) == math.inf
+
+
 def test_drac():
     a, b = Track("a", 0, 0, 10, 0), Track("b", 12.5, 0)
     assert deceleration_to_avoid_crash(a, b, radius=2.5) == pytest.approx(5.0)
@@ -98,6 +129,12 @@ def test_fuse_matches_a_named_actor_by_id_beyond_the_gate():
 def test_fuse_takes_detected_velocity_when_telemetry_reports_none():
     fused = fuse([Track("vehicle_ml", 0, 0)], [Track("vehicle_ml", 1, 0, 4, 2)])
     assert (fused[0].vx, fused[0].vy) == (4, 2)
+
+
+def test_fuse_keeps_the_detections_predicted_path():
+    path = straight_path(0, 0, 5, 0)
+    fused = fuse([Track("vehicle_ml", 0, 0, 5, 0)], [Track("vehicle_ml", 0, 0, path=path)])
+    assert fused[0].path is path
 
 
 def test_fuse_uses_each_detection_once():
@@ -205,6 +242,29 @@ def test_brakes_below_threshold():
     SafetyEngine(ditto).step(100.0)
     assert len(ditto.brakes) == 1
     assert ditto.brakes[0][0] == pytest.approx(1.4)
+
+
+def turning_across(path_ttc_steps=None):
+    """Straight-line TTC sees nothing (parallel lanes), but the predicted paths meet."""
+    ml_path = straight_path(0, 0, 5, 0)
+    other_path = ml_path.copy() if path_ttc_steps is None else straight_path(0, 500, 5, 0)
+    return [Track("vehicle_ml", 0, 0, 5, 0, ml_path), Track("human_vehicle", 40, 10, -5, 0, other_path)]
+
+
+def test_brakes_on_a_path_conflict_that_straight_line_ttc_misses():
+    ditto = FakeDitto(turning_across())
+    SafetyEngine(ditto).step(100.0)
+    assert len(ditto.brakes) == 1
+    ttc, reason = ditto.brakes[0]
+    assert math.isfinite(ttc)  # an infinite TTC would be invalid JSON, and Ditto would reject the brake
+    json.dumps(ttc, allow_nan=False)
+    assert "predicted path" in reason
+
+
+def test_no_brake_when_predicted_paths_stay_apart():
+    ditto = FakeDitto(turning_across(path_ttc_steps=0))
+    SafetyEngine(ditto).step(100.0)
+    assert ditto.brakes == []
 
 
 def test_no_brake_above_threshold():
@@ -358,10 +418,61 @@ def test_history_to_ego_has_the_current_pose_at_the_origin():
     assert ego[0, 0] == pytest.approx(-(HISTORY_FRAMES - 1))
 
 
-def test_constant_velocity_prediction_in_world_frame():
+def test_turn_rate_wraps_across_180():
+    assert turn_rate([170.0, 175.0, -180.0, -175.0]) == pytest.approx(50.0)
+    assert turn_rate([10.0]) == 0.0
+
+
+@pytest.mark.parametrize("signal,rate,expected", [
+    (LEFT, 0.0, LEFT),
+    (RIGHT, -30.0, RIGHT),      # the signal wins
+    (STRAIGHT, -30.0, LEFT),    # yaw falling is a left turn in CARLA's frame
+    (STRAIGHT, 30.0, RIGHT),
+    (STRAIGHT, 2.0, STRAIGHT),  # lane-keeping wobble isn't a turn
+])
+def test_turn_intent(signal, rate, expected):
+    assert turn_intent(signal, rate) == expected
+
+
+@pytest.mark.parametrize("changes,intent,expected", [
+    ([0.0, -90.0], LEFT, 1),
+    ([0.0, -90.0], STRAIGHT, 0),
+    ([0.0, 90.0], LEFT, 0),      # no left available: go straight
+    ([-90.0, 90.0], RIGHT, 1),
+    ([-90.0, 90.0], STRAIGHT, 0),  # T-junction, no straight: least bad
+])
+def test_pick_branch(changes, intent, expected):
+    assert pick_branch(changes, intent) == expected
+
+
+def test_curve_path_is_straight_with_no_turn_rate():
+    path = curve_path(0.0, 0.0, 0.0, 10.0, 0.0)
+    assert path.shape == (30, 2)
+    assert path[-1] == pytest.approx(np.array([30.0, 0.0]))
+
+
+def test_curve_path_turns_left_on_a_negative_rate():
+    path = curve_path(0.0, 0.0, 0.0, 10.0, -30.0)
+    assert path[-1, 1] < -5.0  # CARLA's y points right, so left is negative
+
+
+def test_along_polyline_follows_a_corner_and_stops_at_the_end():
+    corner = [(0.0, 0.0), (10.0, 0.0), (10.0, -10.0)]
+    path = along_polyline(corner, 5.0, steps=30)
+    assert path[19] == pytest.approx(np.array([10.0, 0.0]))    # 2 s: at the corner
+    assert path[23] == pytest.approx(np.array([10.0, -2.0]))   # 2.4 s: round it
+    assert path[-1] == pytest.approx(np.array([10.0, -5.0]))   # 3 s: 15 m along
+    assert along_polyline(corner, 50.0)[-1] == pytest.approx(np.array([10.0, -10.0]))  # out of road
+
+
+def test_model_output_is_converted_to_the_world_frame():
+    def straight_ahead(histories):
+        times = 0.1 * np.arange(1, 31, dtype=np.float32)
+        return histories[:, -1, 2:4][:, None, :] * times[None, :, None]
+
     # Heading along world +y at 10 m/s: 3 s ahead is 30 m further along +y
     ready = {7: [(5.0, float(i), 0.0, 10.0) for i in range(HISTORY_FRAMES)]}
-    path = predict_world_paths(ready, {7: 90.0}, constant_velocity)[7]
+    path = predict_world_paths(ready, {7: 90.0}, straight_ahead)[7]
     assert path.shape == (30, 2)
     assert path[0] == pytest.approx(np.array([5.0, HISTORY_FRAMES - 1 + 1.0]))
     assert path[-1] == pytest.approx(np.array([5.0, HISTORY_FRAMES - 1 + 30.0]), abs=1e-4)

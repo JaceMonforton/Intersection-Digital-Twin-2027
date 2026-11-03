@@ -320,7 +320,9 @@ class DigitalTwinAgent:
         vehicle_bp = bp_lib.find("vehicle.tesla.model3")
         vehicle_bp.set_attribute("role_name", self.thing_name)  # how the processor identifies the twin
 
-        # Nearest to where the processor aimed the spectator, so the twin starts on-screen
+        # Nearest to where the processor aimed the spectator, so the twin starts on-screen.
+        # Until the first tick, a new client reads the spectator as (0, 0).
+        self.wait_for_tick()
         view = self.world.get_spectator().get_transform().location
         spawn_points = sorted(self.carla_map.get_spawn_points(), key=lambda sp: sp.location.distance(view))
         candidates = spawn_points if spawn_points else [carla.Transform()]

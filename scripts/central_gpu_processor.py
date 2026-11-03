@@ -4,8 +4,8 @@ Central perception and safety engine. Runs on the GPU machine alongside CARLA.
 Pipeline: overhead LiDAR -> 3D detections + Ditto telemetry -> fused tracks -> TTC / PET / DRAC.
 This is the master process for CARLA: it enables synchronous mode and drives world.tick(), so
 start it BEFORE ditto_carla_agent.py and waymo_predictor_node.py, which attach to its world.
-When TTC to the ML vehicle drops below 1.5 s it sets emergency_brake = true on the vehicle's
-SafetyGate in Ditto, which reaches the car over MQTT. The brake latches: release it with
+When TTC to the ML vehicle drops below 1.5 s, or the vehicles' predicted paths meet within 3 s, it
+sets emergency_brake = true on the vehicle's SafetyGate in Ditto, which reaches the car over MQTT. The brake latches: release it with
     python scripts/setup_entities.py --clear-brake
 
 Usage:
@@ -20,6 +20,7 @@ import queue
 import signal
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +29,15 @@ from pathlib import Path
 import numpy as np
 import requests
 import websocket
+from waymo_predictor_node import (
+    STEP_SECONDS,
+    YAW_HISTORY,
+    LaneFollower,
+    curve_path,
+    signalled_turn,
+    turn_intent,
+    turn_rate,
+)
 
 # --- Configuration ---
 CARLA_HOST = "localhost"
@@ -52,6 +62,9 @@ LIDAR_TIMEOUT = 1.0     # seconds to wait for the sweep belonging to a tick
 MODEL_GROUND_Z = -1.8   # z of the road in the model's frame, as if the LiDAR were on a car roof
 BOX_LIFE_TIME = 0.11    # must outlive one tick: at exactly FIXED_DELTA a shape expires before it renders
 BOX_THICKNESS = 0.1
+# Debug shapes are unlit, so full brightness blooms at high render quality
+BOX_COLOR_MODEL = (0, 50, 0)
+BOX_COLOR_GROUND_TRUTH = (50, 50, 0)
 
 DITTO_API = "http://localhost:8080/api/2"
 DITTO_WS = "ws://localhost:8080/ws/2"
@@ -64,6 +77,9 @@ DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "centerpoint
 DETECTION_THRESHOLD = 0.5
 
 TTC_BRAKE = 1.5             # seconds; REQ-SYS-011
+# Straight-line TTC can't see a turn coming, and by the time it fires the car is across the lane.
+# Paths are compared further out, which leaves room to stop before reaching the conflict.
+PATH_BRAKE_HORIZON = 3.0    # seconds
 COLLISION_RADIUS = 2.5      # metres between centres that counts as contact (two car half-lengths)
 TELEMETRY_STALE_AFTER = 1.0 # seconds without an update before a vehicle leaves the evaluation
 FUSION_GATE = 3.0           # metres; max distance to associate a detection with telemetry
@@ -78,13 +94,14 @@ HEADLESS_RATE = 20          # Hz, used with --no-carla
 # ---------------------------------------------------------------------------
 # Surrogate safety metrics (no CARLA needed)
 # ---------------------------------------------------------------------------
-@dataclass
+@dataclass(eq=False)  # compared by identity: path is an array, which has no single truth value
 class Track:
     id: str
     x: float
     y: float
     vx: float = 0.0
     vy: float = 0.0
+    path: np.ndarray = None  # predicted (x, y) at each STEP_SECONDS, where one is known
 
 
 def time_to_collision(a, b, radius=COLLISION_RADIUS):
@@ -102,6 +119,17 @@ def time_to_collision(a, b, radius=COLLISION_RADIUS):
         return math.inf
     t = (-qb - math.sqrt(disc)) / (2 * qa)
     return t if t >= 0 else math.inf
+
+
+def path_time_to_collision(a, b, radius=COLLISION_RADIUS, step_seconds=STEP_SECONDS):
+    """Seconds until two predicted paths bring the vehicles within radius at the same moment;
+    inf if they don't, or if either has no path."""
+    if a.path is None or b.path is None:
+        return math.inf
+    steps = min(len(a.path), len(b.path))
+    apart = a.path[:steps] - b.path[:steps]
+    close = np.flatnonzero(np.hypot(apart[:, 0], apart[:, 1]) < radius)
+    return float((close[0] + 1) * step_seconds) if close.size else math.inf
 
 
 def post_encroachment_time(a, b):
@@ -188,7 +216,7 @@ def fuse(telemetry, detections, gate=FUSION_GATE):
         unmatched.remove(best)
         w = TELEMETRY_WEIGHT
         vx, vy = (t.vx, t.vy) if (t.vx or t.vy) else (best.vx, best.vy)
-        fused.append(Track(t.id, w * t.x + (1 - w) * best.x, w * t.y + (1 - w) * best.y, vx, vy))
+        fused.append(Track(t.id, w * t.x + (1 - w) * best.x, w * t.y + (1 - w) * best.y, vx, vy, best.path))
     return fused + unmatched
 
 
@@ -435,6 +463,7 @@ class SafetyEngine:
             rows.append({
                 "pair": [a.id, b.id],
                 "ttc": time_to_collision(a, b),
+                "path_ttc": path_time_to_collision(a, b),
                 "pet": post_encroachment_time(a, b),
                 "drac": deceleration_to_avoid_crash(a, b),
             })
@@ -447,14 +476,17 @@ class SafetyEngine:
         self._warn_if_ml_vehicle_blind(tracks)
         rows = self.evaluate(tracks)
 
-        hazard = next((r for r in rows
-                       if CONTROLLED_VEHICLE in r["pair"] and r["ttc"] < TTC_BRAKE), None)
+        hazard = next((r for r in rows if CONTROLLED_VEHICLE in r["pair"]
+                       and (r["ttc"] < TTC_BRAKE or r["path_ttc"] < PATH_BRAKE_HORIZON)), None)
         if (hazard is not None and not self.ditto.brake_engaged()
                 and now - self.last_brake_sent >= BRAKE_RETRY_AFTER):
             self.last_brake_sent = now
             other = next(i for i in hazard["pair"] if i != CONTROLLED_VEHICLE)
-            reason = f"TTC {hazard['ttc']:.2f} s with {other}"
-            if self.ditto.send_brake(hazard["ttc"], reason):
+            # The sooner of the two; a path conflict alone leaves straight-line TTC infinite
+            ttc = min(hazard["ttc"], hazard["path_ttc"])
+            source = "TTC" if hazard["ttc"] < TTC_BRAKE else "predicted path conflict in"
+            reason = f"{source} {ttc:.2f} s with {other}"
+            if self.ditto.send_brake(ttc, reason):
                 print(f"[ALERT] EMERGENCY BRAKE sent: {reason}")
 
         if rows and now - self.last_report >= METRICS_INTERVAL:
@@ -533,14 +565,16 @@ class CarlaPerception:
 
         self.detector = None
         self.tracker = CentroidTracker()
+        self.lanes = LaneFollower(carla, self.world.get_map())
+        self._recent_yaws = {}  # actor id -> recent yaws, for the turn rate
         self.boxes = []
         self._previous = {}  # actor id -> (x, y, time), for actors CARLA reports no velocity for
         if detector_mode == "onnx" or (detector_mode == "auto" and Path(model_path).exists()):
             self.detector = CenterPointDetector(model_path)
-            self.box_color = carla.Color(0, 255, 0)
+            self.box_color = carla.Color(*BOX_COLOR_MODEL)
             print(f"[LIDAR] Using model {model_path}")
         else:
-            self.box_color = carla.Color(255, 255, 0)
+            self.box_color = carla.Color(*BOX_COLOR_GROUND_TRUTH)
             print("[LIDAR] No detection model: using CARLA GROUND-TRUTH actor positions, not LiDAR.")
 
         self.sweeps = queue.Queue(maxsize=1)
@@ -652,13 +686,25 @@ class CarlaPerception:
             previous[actor.id] = (x, y, now)
 
             role = actor.attributes.get("role_name")
-            tracks.append(Track(role if role in VEHICLES else f"carla:{actor.id}", x, y, vx, vy))
+            track_id = role if role in VEHICLES else f"carla:{actor.id}"
+            tracks.append(Track(track_id, x, y, vx, vy, self._predict_path(actor, tf, x, y, vx, vy)))
             bb = actor.bounding_box
             c = tf.transform(bb.location)
             boxes.append(Box(c.x, c.y, c.z, 2 * bb.extent.x, 2 * bb.extent.y, 2 * bb.extent.z, tf.rotation.yaw))
         self._previous = previous
+        self._recent_yaws = {k: v for k, v in self._recent_yaws.items() if k in previous}
         self.boxes = boxes
         return tracks
+
+    def _predict_path(self, actor, tf, x, y, vx, vy):
+        """Where this vehicle is expected to go: the same road baseline the predictor node draws."""
+        yaws = self._recent_yaws.setdefault(actor.id, deque(maxlen=YAW_HISTORY))
+        yaws.append(tf.rotation.yaw)
+        speed = math.hypot(vx, vy)
+        rate = turn_rate(list(yaws))
+        intent = turn_intent(signalled_turn(self.carla, actor), rate)
+        path = self.lanes.path(x, y, tf.rotation.yaw, speed, intent)
+        return path if path is not None else curve_path(x, y, tf.rotation.yaw, speed, rate)
 
     def render(self):
         for b in self.boxes:
