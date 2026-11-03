@@ -16,7 +16,8 @@ from left_turn_scenario import (
     departure_time,
     measured_pet,
     outline,
-    outlines_overlap,
+    outline_gap,
+    rectangles_gap,
     rectangles_overlap,
     replay_without_brake,
     time_to_cover,
@@ -95,7 +96,17 @@ def test_rectangles_overlap(b, expected):
 def test_circle_contact_distance_is_not_real_contact():
     # Parallel in adjacent lanes, centres 2.4 m apart: inside the 2.5 m TTC circle, but not touching
     apart = Sample(0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 2.4, -5.0, 0.0, False, 0.0, 180.0)
-    assert not outlines_overlap(apart)
+    assert outline_gap(apart) == pytest.approx(0.3)
+
+
+def test_rectangles_gap():
+    assert rectangles_gap(outline(0, 0, 0), outline(0, 0, 0)) == 0.0
+    # Nose to tail: 4.8 m long, centres 5.8 m apart
+    assert rectangles_gap(outline(0, 0, 0), outline(5.8, 0, 0)) == pytest.approx(1.0)
+    # Side by side: 2.1 m wide, centres 2.6 m apart
+    assert rectangles_gap(outline(0, 0, 0), outline(0, 2.6, 0)) == pytest.approx(0.5)
+    # At right angles: a's side at x=1.05, b's tail at x=1.6
+    assert rectangles_gap(outline(0, 0, 90), outline(4.0, 0, 0)) == pytest.approx(0.55)
 
 
 def test_measured_pet():
@@ -128,6 +139,7 @@ def test_analyse_records_the_brake_moment():
     ({"contact": True, "min_separation": 1.0}, "contact"),
     ({"min_ttc": 1.0}, "TTC"),
     ({"pet": 0.5}, "PET"),
+    ({"min_gap": 0.4}, "near miss"),
     ({"max_drac": 5.0}, "DRAC"),
     ({"brake_fired_at": 3.0}, "brake"),
 ])
@@ -135,6 +147,10 @@ def test_each_threshold_alone_makes_a_run_unsafe(change, reason):
     verdict, reasons = classify(Result("x", **change))
     assert verdict == "UNSAFE"
     assert any(reason in r for r in reasons)
+
+
+def test_a_clear_pass_is_not_a_near_miss():
+    assert classify(Result("x", pet=3.0, min_gap=1.5))[0] == "SAFE"
 
 
 def test_a_clean_run_is_safe():
