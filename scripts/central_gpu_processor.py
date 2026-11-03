@@ -30,10 +30,16 @@ import numpy as np
 import requests
 import websocket
 from waymo_predictor_node import (
+    DEFAULT_MODEL as TRAJECTORY_MODEL,
+)
+from waymo_predictor_node import (
     STEP_SECONDS,
     YAW_HISTORY,
+    HistoryBuffer,
     LaneFollower,
+    OnnxPredictor,
     curve_path,
+    predict_world_paths,
     signalled_turn,
     turn_intent,
     turn_rate,
@@ -42,7 +48,10 @@ from waymo_predictor_node import (
 # --- Configuration ---
 CARLA_HOST = "localhost"
 CARLA_PORT = 2000
-CARLA_MAP = "Town01"
+CARLA_MAP = "Town10HD_Opt"
+INTERSECTION_NAME = "Town10_Intersection_01"
+# A signalized four-way with left turns across oncoming traffic and a clear view from above
+INTERSECTION_JUNCTION = 189
 FIXED_DELTA = 0.1       # seconds of simulation per world.tick()
 TRAFFIC_MANAGER_PORT = 8000
 MAP_LOAD_TIMEOUT = 300.0 # seconds; a cold load of a map can take minutes
@@ -60,11 +69,19 @@ LIDAR_UPPER_FOV = -45.0
 LIDAR_LOWER_FOV = -90.0
 LIDAR_TIMEOUT = 1.0     # seconds to wait for the sweep belonging to a tick
 MODEL_GROUND_Z = -1.8   # z of the road in the model's frame, as if the LiDAR were on a car roof
+LABEL_LIFE_TIME = 0.1  # text, unlike lines, renders at one tick's life, and longer leaves a ghost behind it
 BOX_LIFE_TIME = 0.11    # must outlive one tick: at exactly FIXED_DELTA a shape expires before it renders
 BOX_THICKNESS = 0.1
 # Debug shapes are unlit, so full brightness blooms at high render quality
 BOX_COLOR_MODEL = (0, 50, 0)
 BOX_COLOR_GROUND_TRUTH = (50, 50, 0)
+BOX_COLOR_ML = (90, 0, 90)  # magenta, so the ML car stands out from everything else
+ML_PAINT = "255,0,255"      # its body colour, which no other car uses
+# CARLA draws debug shapes into every camera, and the ML car's own cameras shouldn't show its box or
+# label. So they're drawn this far above the car, out of those cameras' view, and scaled to compensate
+# so that they still line up with the car from directly overhead.
+ML_MARKER_HEIGHT = 7.0      # metres above the car
+MAX_PLAUSIBLE_SPEED = 40.0  # m/s; a faster measured speed is a car being moved, not driving
 
 DITTO_API = "http://localhost:8080/api/2"
 DITTO_WS = "ws://localhost:8080/ws/2"
@@ -80,6 +97,11 @@ TTC_BRAKE = 1.5             # seconds; REQ-SYS-011
 # Straight-line TTC can't see a turn coming, and by the time it fires the car is across the lane.
 # Paths are compared further out, which leaves room to stop before reaching the conflict.
 PATH_BRAKE_HORIZON = 3.0    # seconds
+REAR_HEADING_TOLERANCE = 45.0  # degrees either way that still counts as travelling the same way
+STOPPED_SPEED = 0.5         # m/s; a car going slower than this can't be helped by braking
+PATH_MOVING_SPEED = 1.0     # m/s; the path check is for crossing traffic, so slower cars are left to TTC
+IN_LINE_HEADING = 30.0      # degrees between two cars that counts as following the same way
+TURNING_RATE = 15.0         # degrees per second; turning faster than this, straight-line TTC means little
 COLLISION_RADIUS = 2.5      # metres between centres that counts as contact (two car half-lengths)
 TELEMETRY_STALE_AFTER = 1.0 # seconds without an update before a vehicle leaves the evaluation
 FUSION_GATE = 3.0           # metres; max distance to associate a detection with telemetry
@@ -102,6 +124,8 @@ class Track:
     vx: float = 0.0
     vy: float = 0.0
     path: np.ndarray = None  # predicted (x, y) at each STEP_SECONDS, where one is known
+    yaw: float = None        # degrees, where known
+    yaw_rate: float = 0.0    # degrees per second
 
 
 def time_to_collision(a, b, radius=COLLISION_RADIUS):
@@ -119,6 +143,36 @@ def time_to_collision(a, b, radius=COLLISION_RADIUS):
         return math.inf
     t = (-qb - math.sqrt(disc)) / (2 * qa)
     return t if t >= 0 else math.inf
+
+
+def approaching_from_behind(me, other):
+    """True if other is behind me and travelling my way. Braking can't avoid that, and can make it
+    worse, so it must not trigger the brake. Without headings for both, assume it might matter."""
+    if me.yaw is None or other.yaw is None:
+        return False
+    yaw = math.radians(me.yaw)
+    ahead = math.cos(yaw) * (other.x - me.x) + math.sin(yaw) * (other.y - me.y)
+    heading = abs((other.yaw - me.yaw + 180.0) % 360.0 - 180.0)
+    return ahead < 0.0 and heading < REAR_HEADING_TOLERANCE
+
+
+def is_following(me, other):
+    """True if other is simply ahead of me going the same way: ordinary traffic that I slow for."""
+    if me.yaw is None or other.yaw is None:
+        return False
+    return abs((other.yaw - me.yaw + 180.0) % 360.0 - 180.0) < IN_LINE_HEADING
+
+
+def path_check_applies(me, other):
+    """The path check looks 3 s ahead, which suits a car crossing my path. Applied to a stopped car or
+    one I'm following, it brakes on ordinary traffic, so those are left to the 1.5 s TTC rule."""
+    return math.hypot(other.vx, other.vy) >= PATH_MOVING_SPEED and not is_following(me, other)
+
+
+def ttc_check_applies(me, other):
+    """Mid-turn, straight-line TTC points at whatever is in front at that instant, such as cars waiting
+    at a red light, and braking for those would strand the car in the junction."""
+    return abs(me.yaw_rate) <= TURNING_RATE or math.hypot(other.vx, other.vy) >= PATH_MOVING_SPEED
 
 
 def path_time_to_collision(a, b, radius=COLLISION_RADIUS, step_seconds=STEP_SECONDS):
@@ -216,7 +270,7 @@ def fuse(telemetry, detections, gate=FUSION_GATE):
         unmatched.remove(best)
         w = TELEMETRY_WEIGHT
         vx, vy = (t.vx, t.vy) if (t.vx or t.vy) else (best.vx, best.vy)
-        fused.append(Track(t.id, w * t.x + (1 - w) * best.x, w * t.y + (1 - w) * best.y, vx, vy, best.path))
+        fused.append(Track(t.id, w * t.x + (1 - w) * best.x, w * t.y + (1 - w) * best.y, vx, vy, best.path, best.yaw, best.yaw_rate))
     return fused + unmatched
 
 
@@ -257,6 +311,17 @@ class Box:
     width: float
     height: float
     yaw: float  # degrees
+    is_ml: bool = False
+
+
+def overhead_marker(box, gantry_x, gantry_y, gantry_z, marker_height=ML_MARKER_HEIGHT):
+    """A flat copy of a box, raised by marker_height, that looks the same from the gantry. Anything
+    nearer a camera looks bigger and further from the centre of its view, so both are scaled down by
+    how much closer it is."""
+    base_z = box.z - box.height / 2
+    scale = (gantry_z - base_z - marker_height) / (gantry_z - base_z)
+    return Box(gantry_x + (box.x - gantry_x) * scale, gantry_y + (box.y - gantry_y) * scale, base_z + marker_height,
+               box.length * scale, box.width * scale, 0.02, box.yaw, box.is_ml)
 
 
 def parse_lidar(raw_data):
@@ -462,6 +527,7 @@ class SafetyEngine:
         for a, b in itertools.combinations(tracks, 2):
             rows.append({
                 "pair": [a.id, b.id],
+                "tracks": (a, b),
                 "ttc": time_to_collision(a, b),
                 "path_ttc": path_time_to_collision(a, b),
                 "pet": post_encroachment_time(a, b),
@@ -476,15 +542,16 @@ class SafetyEngine:
         self._warn_if_ml_vehicle_blind(tracks)
         rows = self.evaluate(tracks)
 
-        hazard = next((r for r in rows if CONTROLLED_VEHICLE in r["pair"]
-                       and (r["ttc"] < TTC_BRAKE or r["path_ttc"] < PATH_BRAKE_HORIZON)), None)
+        hazard = next((r for r in rows if self._brake_can_help(r)
+                       and (self._ttc_triggers(r) or (r["path_ttc"] < PATH_BRAKE_HORIZON and self._path_applies(r)))), None)
         if (hazard is not None and not self.ditto.brake_engaged()
                 and now - self.last_brake_sent >= BRAKE_RETRY_AFTER):
             self.last_brake_sent = now
             other = next(i for i in hazard["pair"] if i != CONTROLLED_VEHICLE)
             # The sooner of the two; a path conflict alone leaves straight-line TTC infinite
-            ttc = min(hazard["ttc"], hazard["path_ttc"])
-            source = "TTC" if hazard["ttc"] < TTC_BRAKE else "predicted path conflict in"
+            from_ttc = self._ttc_triggers(hazard)
+            ttc = hazard["ttc"] if from_ttc else hazard["path_ttc"]
+            source = "TTC" if from_ttc else "predicted path conflict in"
             reason = f"{source} {ttc:.2f} s with {other}"
             if self.ditto.send_brake(ttc, reason):
                 print(f"[ALERT] EMERGENCY BRAKE sent: {reason}")
@@ -502,6 +569,28 @@ class SafetyEngine:
             print(f"[METRICS] {'/'.join(worst['pair'])} TTC={worst['ttc']:.2f}s "
                   f"PET={worst['pet']:.2f}s DRAC={worst['drac']:.2f}m/s2")
         return rows
+
+    @staticmethod
+    def _ttc_triggers(row):
+        a, b = row["tracks"]
+        me, other = (a, b) if a.id == CONTROLLED_VEHICLE else (b, a)
+        return row["ttc"] < TTC_BRAKE and ttc_check_applies(me, other)
+
+    @staticmethod
+    def _path_applies(row):
+        a, b = row["tracks"]
+        me, other = (a, b) if a.id == CONTROLLED_VEHICLE else (b, a)
+        return path_check_applies(me, other)
+
+    @staticmethod
+    def _brake_can_help(row):
+        if CONTROLLED_VEHICLE not in row["pair"]:
+            return False
+        a, b = row["tracks"]
+        me, other = (a, b) if a.id == CONTROLLED_VEHICLE else (b, a)
+        if math.hypot(me.vx, me.vy) < STOPPED_SPEED:
+            return False
+        return not approaching_from_behind(me, other)
 
     def _warn_if_ml_vehicle_blind(self, tracks):
         """A vehicle with no track can't have a hazard computed, which must not pass silently."""
@@ -541,7 +630,7 @@ class CenterPointDetector:
 class CarlaPerception:
     """Owns the simulation clock and the overhead gantry at the intersection."""
 
-    def __init__(self, junction_index, detector_mode, model_path):
+    def __init__(self, junction_id, detector_mode, model_path):
         import carla
 
         self.carla = carla
@@ -552,14 +641,15 @@ class CarlaPerception:
             print("[CARLA] Server was already synchronous, taking over as master. "
                   "If another processor is running, stop it.")
         self._leave_synchronous_mode()  # a master that died uncleanly leaves these settings behind
+        self._clear_leftovers()
         if CARLA_MAP not in self.world.get_map().name:
             print(f"[CARLA] Loading map {CARLA_MAP}...")
             self.client.set_timeout(MAP_LOAD_TIMEOUT)
             self.world = self.client.load_world(CARLA_MAP)
             self.client.set_timeout(60.0)
 
-        self.center = self._find_intersection(junction_index)
-        print(f"[CARLA] Town01_Intersection_01 is junction #{junction_index} "
+        self.center = self._find_intersection(junction_id)
+        print(f"[CARLA] {INTERSECTION_NAME} is junction {junction_id} "
               f"at x={self.center.x:.1f} y={self.center.y:.1f}")
         self.gantry = carla.Location(x=self.center.x, y=self.center.y, z=self.center.z + GANTRY_HEIGHT)
 
@@ -567,6 +657,13 @@ class CarlaPerception:
         self.tracker = CentroidTracker()
         self.lanes = LaneFollower(carla, self.world.get_map())
         self._recent_yaws = {}  # actor id -> recent yaws, for the turn rate
+        self._ml_history = HistoryBuffer()
+        self.ml_model = None
+        if Path(TRAJECTORY_MODEL).exists():
+            self.ml_model = OnnxPredictor(TRAJECTORY_MODEL)
+            print(f"[PREDICT] {CONTROLLED_VEHICLE} is predicted by the trained model only: {TRAJECTORY_MODEL}")
+        else:
+            print(f"[PREDICT] {TRAJECTORY_MODEL} not found: {CONTROLLED_VEHICLE} falls back to ROAD-FOLLOWING prediction.")
         self.boxes = []
         self._previous = {}  # actor id -> (x, y, time), for actors CARLA reports no velocity for
         if detector_mode == "onnx" or (detector_mode == "auto" and Path(model_path).exists()):
@@ -578,8 +675,7 @@ class CarlaPerception:
             print("[LIDAR] No detection model: using CARLA GROUND-TRUTH actor positions, not LiDAR.")
 
         self.sweeps = queue.Queue(maxsize=1)
-        self.frame_count = 0
-        self.sensors = [self._spawn_camera(), self._spawn_lidar()]
+        self.sensors = [self._spawn_lidar()]
         self.world.get_spectator().set_transform(
             carla.Transform(self.gantry, carla.Rotation(pitch=-90.0, yaw=0.0)))
 
@@ -594,32 +690,30 @@ class CarlaPerception:
         settings.fixed_delta_seconds = FIXED_DELTA
         self.world.apply_settings(settings)
 
+    def _clear_leftovers(self):
+        """A crashed run leaves its cars and sensors behind, and they'd slow and interfere with this one."""
+        actors = self.world.get_actors()
+        leftovers = [a for pattern in ("sensor.*", "vehicle.*", "controller.*", "walker.*")
+                     for a in actors.filter(pattern)]
+        if leftovers:
+            print(f"[CARLA] Removing {len(leftovers)} actors left over from an earlier run.")
+            self.client.apply_batch_sync([self.carla.command.DestroyActor(a) for a in leftovers])
+
     def _leave_synchronous_mode(self):
         settings = self.world.get_settings()
         settings.synchronous_mode = False
         settings.fixed_delta_seconds = None
         self.world.apply_settings(settings)
 
-    def _find_intersection(self, index):
+    def _find_intersection(self, junction_id):
         junctions = {}
         for wp, _ in self.world.get_map().get_topology():
             if wp.is_junction:
                 junction = wp.get_junction()
                 junctions[junction.id] = junction
-        if not junctions:
-            raise RuntimeError(f"{CARLA_MAP} has no junctions.")
-        ordered = [junctions[k] for k in sorted(junctions)]
-        return ordered[index % len(ordered)].bounding_box.location
-
-    def _spawn_camera(self):
-        bp = self.world.get_blueprint_library().find("sensor.camera.rgb")
-        bp.set_attribute("image_size_x", str(CAMERA_WIDTH))
-        bp.set_attribute("image_size_y", str(CAMERA_HEIGHT_PX))
-        bp.set_attribute("fov", str(CAMERA_FOV))
-        transform = self.carla.Transform(self.gantry, self.carla.Rotation(pitch=-90.0))
-        camera = self.world.spawn_actor(bp, transform)
-        camera.listen(self._on_frame)
-        return camera
+        if junction_id not in junctions:
+            raise RuntimeError(f"{CARLA_MAP} has no junction {junction_id}. It has: {sorted(junctions)}")
+        return junctions[junction_id].bounding_box.location
 
     def _spawn_lidar(self):
         bp = self.world.get_blueprint_library().find("sensor.lidar.ray_cast")
@@ -633,9 +727,6 @@ class CarlaPerception:
         lidar = self.world.spawn_actor(bp, self.carla.Transform(self.gantry))
         lidar.listen(self._on_sweep)
         return lidar
-
-    def _on_frame(self, image):
-        self.frame_count += 1
 
     def _on_sweep(self, measurement):
         try:
@@ -683,23 +774,37 @@ class CarlaPerception:
             # A twin moved with set_transform reports zero velocity, so measure it instead
             if math.hypot(vx, vy) < 0.01 and seen is not None and now > seen[2]:
                 vx, vy = (x - seen[0]) / (now - seen[2]), (y - seen[1]) / (now - seen[2])
+                if math.hypot(vx, vy) > MAX_PLAUSIBLE_SPEED:  # it was moved, so this history is meaningless
+                    vx, vy = 0.0, 0.0
+                    self._ml_history.retain([])
             previous[actor.id] = (x, y, now)
 
             role = actor.attributes.get("role_name")
             track_id = role if role in VEHICLES else f"carla:{actor.id}"
-            tracks.append(Track(track_id, x, y, vx, vy, self._predict_path(actor, tf, x, y, vx, vy)))
+            path = self._predict_path(actor, tf, x, y, vx, vy)
+            tracks.append(Track(track_id, x, y, vx, vy, path, tf.rotation.yaw, turn_rate(list(self._recent_yaws[actor.id]))))
             bb = actor.bounding_box
             c = tf.transform(bb.location)
-            boxes.append(Box(c.x, c.y, c.z, 2 * bb.extent.x, 2 * bb.extent.y, 2 * bb.extent.z, tf.rotation.yaw))
+            boxes.append(Box(c.x, c.y, c.z, 2 * bb.extent.x, 2 * bb.extent.y, 2 * bb.extent.z, tf.rotation.yaw,
+                             role == CONTROLLED_VEHICLE))
         self._previous = previous
         self._recent_yaws = {k: v for k, v in self._recent_yaws.items() if k in previous}
+        self._ml_history.retain(previous)
         self.boxes = boxes
         return tracks
 
     def _predict_path(self, actor, tf, x, y, vx, vy):
-        """Where this vehicle is expected to go: the same road baseline the predictor node draws."""
+        """Where this vehicle is expected to go. The ML car uses only the trained model, so until it
+        has 1 s of history it has no path; the straight-line TTC check still covers it. Other cars
+        use the road baseline."""
         yaws = self._recent_yaws.setdefault(actor.id, deque(maxlen=YAW_HISTORY))
         yaws.append(tf.rotation.yaw)
+        if self.ml_model is not None and actor.attributes.get("role_name") == CONTROLLED_VEHICLE:
+            self._ml_history.add(actor.id, x, y, vx, vy)
+            ready = self._ml_history.ready()
+            if actor.id not in ready:
+                return None
+            return predict_world_paths({actor.id: ready[actor.id]}, {actor.id: tf.rotation.yaw}, self.ml_model)[actor.id]
         speed = math.hypot(vx, vy)
         rate = turn_rate(list(yaws))
         intent = turn_intent(signalled_turn(self.carla, actor), rate)
@@ -707,13 +812,18 @@ class CarlaPerception:
         return path if path is not None else curve_path(x, y, tf.rotation.yaw, speed, rate)
 
     def render(self):
+        ml_color = self.carla.Color(*BOX_COLOR_ML)
         for b in self.boxes:
+            if b.is_ml:
+                b = overhead_marker(b, self.gantry.x, self.gantry.y, self.gantry.z)
+                self.world.debug.draw_string(self.carla.Location(x=b.x, y=b.y, z=b.z), "ML CAR",
+                                             color=self.carla.Color(255, 0, 255), life_time=LABEL_LIFE_TIME)
             self.world.debug.draw_box(
                 self.carla.BoundingBox(
                     self.carla.Location(x=b.x, y=b.y, z=b.z),
                     self.carla.Vector3D(x=b.length / 2, y=b.width / 2, z=b.height / 2)),
                 self.carla.Rotation(yaw=b.yaw),
-                thickness=BOX_THICKNESS, color=self.box_color, life_time=BOX_LIFE_TIME)
+                thickness=BOX_THICKNESS, color=ml_color if b.is_ml else self.box_color, life_time=BOX_LIFE_TIME)
 
     def cleanup(self):
         for sensor in self.sensors:
@@ -730,7 +840,7 @@ def _raise_keyboard_interrupt(signum, frame):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-carla", action="store_true", help="evaluate Ditto telemetry only")
-    parser.add_argument("--junction", type=int, default=0, help="which map junction to watch, by id order")
+    parser.add_argument("--junction", type=int, default=INTERSECTION_JUNCTION, help="id of the map junction to watch")
     parser.add_argument("--detector", choices=("auto", "onnx", "groundtruth"), default="auto")
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     args = parser.parse_args()

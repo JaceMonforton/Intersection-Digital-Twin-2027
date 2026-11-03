@@ -1,0 +1,6 @@
+# Only for training the trajectory model. Install PyTorch separately, for your GPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+tensorflow-cpu>=2.16
+onnx
+onnxruntime
+numpy

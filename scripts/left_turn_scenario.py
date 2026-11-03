@@ -3,7 +3,7 @@ Safe vs unsafe unprotected left turn, driven purely inside CARLA.
 
 vehicle_ml waits at the stop line to turn left across human_vehicle, which comes straight through
 without slowing. Both runs use the same paths and speeds and differ only in when the turner goes:
-    unsafe: it pulls out too soon, into the oncoming car's path, and needs the brake to avoid contact
+    unsafe: it pulls out too soon, and needs the brake to avoid contact
     safe:   it waits for the oncoming car to clear, then goes
 
 The running central_gpu_processor.py decides whether to brake, from straight-line TTC and from the
@@ -32,6 +32,8 @@ from central_gpu_processor import (
     COLLISION_RADIUS,
     DITTO_API,
     FIXED_DELTA,
+    LABEL_LIFE_TIME,
+    ML_PAINT,
     TTC_BRAKE,
     Track,
     deceleration_to_avoid_crash,
@@ -50,7 +52,7 @@ TURN_SPEED = 6.0          # m/s, the turner's speed once rolling
 TURN_ACCEL = 2.5          # m/s^2, pulling away from the stop line
 BRAKE_DECEL = 6.0         # m/s^2, firm braking on dry road
 ONCOMING_ARRIVAL = 7.0    # s after the run starts that the oncoming car reaches the conflict point
-UNSAFE_GAP = 1.0          # s the unsafe turner would arrive after the oncoming car, too close to clear it
+UNSAFE_GAP = 1.5          # s the unsafe turner would arrive after the oncoming car, too soon to clear it
 SAFE_GAP = 3.0            # s the safe turner arrives after the oncoming car
 STOP_LINE_SETBACK = 3.0   # m before the junction entry
 UPSTREAM = 80.0           # m of road modelled before the junction entry
@@ -389,8 +391,14 @@ def extended_path(carla, entry, exit_wp):
 
 
 def find_left_turn(carla, world):
-    """The left-turn lane and the opposing straight lane that crosses it, at the junction the
+    """The left-turn lane and the first opposing straight lane it crosses, at the junction the
     processor has aimed the spectator at."""
+    turner_path, turner_entry_s, oncoming_paths = find_left_turn_lanes(carla, world)
+    return turner_path, turner_entry_s, oncoming_paths[0]
+
+
+def find_left_turn_lanes(carla, world):
+    """The same, with every opposing straight lane it crosses, nearest first."""
     view = world.get_spectator().get_transform().location
     junctions = {}
     for wp, _ in world.get_map().get_topology():
@@ -409,14 +417,18 @@ def find_left_turn(carla, world):
             straight.append((entry, exit_wp))
 
     for entry, exit_wp in turning:
+        turner_path, turner_entry_s = extended_path(carla, entry, exit_wp)
+        crossed = []
         for other_entry, other_exit in straight:
-            opposing = abs(yaw_difference(entry.transform.rotation.yaw, other_entry.transform.rotation.yaw)) > 150
-            if not opposing:
+            if abs(yaw_difference(entry.transform.rotation.yaw, other_entry.transform.rotation.yaw)) <= 150:
                 continue
-            turner_path, turner_entry_s = extended_path(carla, entry, exit_wp)
             oncoming_path, _ = extended_path(carla, other_entry, other_exit)
-            if conflict_point(turner_path, oncoming_path)[4] < 2.0:
-                return turner_path, turner_entry_s, oncoming_path
+            conflict = conflict_point(turner_path, oncoming_path)
+            if conflict[4] < 2.0:
+                crossed.append((conflict[2], oncoming_path))
+        if crossed:
+            crossed.sort(key=lambda c: c[0])
+            return turner_path, turner_entry_s, [path for _, path in crossed]
     raise RuntimeError("No left turn across an opposing lane at this junction.")
 
 
@@ -465,7 +477,7 @@ def run_case(carla, world, session, case, turner_path, oncoming_path, turner_sta
 
     turner = Turner(departure_time(case, turner_conflict_s - turner_start), turner_start)
     oncoming_start = oncoming_conflict_s - ONCOMING_SPEED * ONCOMING_ARRIVAL
-    ml = spawn_twin(carla, world, "vehicle_ml", "255,120,0", turner_path, turner.s)
+    ml = spawn_twin(carla, world, "vehicle_ml", ML_PAINT, turner_path, turner.s)
     human = spawn_twin(carla, world, "human_vehicle", "0,120,255", oncoming_path, oncoming_start)
     ml.set_light_state(carla.VehicleLightState.LeftBlinker)  # tells the predictor where it's headed
     signalling = True
@@ -502,7 +514,7 @@ def run_case(carla, world, session, case, turner_path, oncoming_path, turner_sta
             signalling = False
 
         color = carla.Color(*(UNSAFE_COLOR if case == "unsafe" else SAFE_COLOR))
-        world.debug.draw_string(label_at, f"{case.upper()} LEFT TURN  t={t:.1f}s", color=color, life_time=0.11)
+        world.debug.draw_string(label_at, f"{case.upper()} LEFT TURN  t={t:.1f}s", color=color, life_time=LABEL_LIFE_TIME)
         world.debug.draw_point(carla.Location(x=cx, y=cy, z=0.5), size=0.2, color=color, life_time=0.11)
 
         turner_done = s >= turner_path.length

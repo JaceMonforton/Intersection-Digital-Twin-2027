@@ -2,8 +2,8 @@
   "org.example:intersection_01": {
     "policyId": "org.example:policy",
     "attributes": {
-      "name": "Town01_Intersection_01",
-      "carla_map": "Town01"
+      "name": "Town10_Intersection_01",
+      "carla_map": "Town10HD_Opt"
     },
     "features": {
       "SafetyMetrics": {

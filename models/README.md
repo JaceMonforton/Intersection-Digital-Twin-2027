@@ -1,7 +1,11 @@
 # Models
 
-Neither model is in the repository yet. Without them the scripts run on labelled stand-ins and say
-so at startup. GitHub rejects files over 100 MB, so use Git LFS for larger weights.
+Neither model is in the repository. Weights are ignored by git, because this repo is public and
+the Waymo Open Dataset licence should be checked before sharing anything trained on it. Without them
+the scripts run on labelled stand-ins and say so at startup.
+
+Train `waymo_trajectory.onnx` yourself with `training/`; see "Train the trajectory model" in the main
+README. It predicts the ML car's path, for both its line and the brake. Other cars use road-following.
 
 | File | Used by | Without it |
 | ---- | ------- | ---------- |

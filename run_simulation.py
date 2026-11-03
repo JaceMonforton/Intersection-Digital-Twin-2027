@@ -1,9 +1,12 @@
 """
-Starts the whole simulation with one command, runs the left-turn analysis, then shuts down
-whatever it started:
+Starts the whole simulation with one command, runs it, then shuts down whatever it started. By
+default that means traffic, the unsafe and safe left turn across it, then the ML car driving freely:
 
-    python run_simulation.py                  # safe and unsafe left turn
-    python run_simulation.py --case unsafe    # just one
+    python run_simulation.py                  # everything
+    python run_simulation.py --case unsafe    # just one turn, with no free driving after
+    python run_simulation.py --traffic 30     # more cars
+    python run_simulation.py --live-seconds 0 # skip the free driving
+    python run_simulation.py --clean          # the repeatable left turn, with no other traffic
     python run_simulation.py --leave-running  # keep CARLA and Docker up, for faster repeat runs
 
 Anything already running (Docker, the Ditto stack, CARLA) is reused and left alone. If CARLA isn't
@@ -32,7 +35,8 @@ CARLA_PORT = 2000
 PACKAGED_CARLA = [Path(r"C:\carla\Unreal\CarlaUE4\Saved\StagedBuilds\WindowsNoEditor\CarlaUE4.exe")]
 SOURCE_EDITOR = Path(r"C:\CarlaUnreal\Engine\Binaries\Win64\UE4Editor.exe")
 SOURCE_PROJECT = Path(r"C:\carla\Unreal\CarlaUE4\CarlaUE4.uproject")
-CARLA_FLAGS = ["-windowed", "-ResX=1280", "-ResY=720", f"-carla-rpc-port={CARLA_PORT}", "-quality-level=Low", "-nosound"]
+# Full render quality, which the overlay colours are tuned for: at low quality they wash out
+CARLA_FLAGS = ["-windowed", "-ResX=1280", "-ResY=720", f"-carla-rpc-port={CARLA_PORT}", "-nosound"]
 
 DOCKER_TIMEOUT = 180.0
 DITTO_TIMEOUT = 240.0
@@ -172,15 +176,41 @@ class Launcher:
         for name, process in self.processes:
             if process.poll() is not None:
                 raise RuntimeError(f"{name} exited early:\n{tail(LOG_DIR / f'{name}.log')}")
+        if not self.args.no_view:
+            self.spawn("view", "scripts/ml_car_view.py")  # only a display, so it may fail without stopping the run
 
-        self.log("Running the left-turn analysis. Watch the CARLA window.")
-        scenario = subprocess.run([sys.executable, "-u", "scripts/left_turn_scenario.py", "--case", self.args.case],
-                                  cwd=ROOT, check=False)
+        code = self.run_left_turn() if self.args.clean else self.run_with_traffic()
         for name, process in self.processes:
             if process.poll() is not None:
                 self.log(f"WARNING: {name} died during the run, so overlays or braking may be missing:\n"
                          f"{tail(LOG_DIR / f'{name}.log')}")
-        return scenario.returncode
+        return code
+
+    def run_left_turn(self):
+        self.log("Running the left-turn analysis. Watch the CARLA window.")
+        return self.run_stage("scripts/left_turn_scenario.py", "--case", self.args.case)
+
+    def run_stage(self, *command):
+        return subprocess.run([sys.executable, "-u", *command], cwd=ROOT, check=False).returncode
+
+    def run_with_traffic(self):
+        args = self.args
+        self.log(f"Spawning {args.traffic} vehicles and {args.walkers} pedestrians...")
+        command = ["scripts/test_traffic.py", "--asynch", "--near-view", "--safe", "-n", str(args.traffic),
+                   "-w", str(args.walkers), "--tm-port", "8000", "--car-lights-on"]
+        if args.seed is not None:
+            command += ["--seed", str(args.seed)]
+        process, path = self.spawn("traffic", *command)
+        wait_for(lambda: "spawned" in path.read_text(encoding="utf-8", errors="replace") or process.poll() is not None,
+                 120.0, "traffic to spawn")
+        if process.poll() is not None:
+            raise RuntimeError(f"test_traffic.py exited early:\n{tail(path)}")
+        self.log("Running the left turn across traffic. Watch for the magenta ML car. Ctrl+C to stop early.")
+        code = self.run_stage("scripts/traffic_left_turn.py", "--case", args.case)
+        if args.case == "both" and args.live_seconds > 0:
+            self.log(f"The ML car now drives freely in traffic for {args.live_seconds:.0f} s.")
+            code = self.run_stage("scripts/traffic_monitor.py", "--duration", str(args.live_seconds)) or code
+        return code
 
     def shutdown(self):
         # Reverse order: the processor owns the clock, so it goes last
@@ -225,6 +255,12 @@ def tail(path, lines=15):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--case", choices=("safe", "unsafe", "both"), default="both")
+    parser.add_argument("--no-view", action="store_true", help="don't open the ML car's split-screen window")
+    parser.add_argument("--clean", action="store_true", help="run the repeatable left turn with no other traffic")
+    parser.add_argument("--traffic", type=int, default=15, metavar="N", help="how many other vehicles")
+    parser.add_argument("--walkers", type=int, default=8, help="how many pedestrians")
+    parser.add_argument("--live-seconds", type=float, default=60.0, help="seconds of free driving afterwards; 0 skips it")
+    parser.add_argument("--seed", type=int, help="makes traffic spawn the same way each run")
     parser.add_argument("--carla-exe", help="path to CarlaUE4.exe, if it isn't found automatically")
     parser.add_argument("--leave-running", action="store_true", help="keep CARLA and Docker up afterwards")
     args = parser.parse_args()
