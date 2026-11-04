@@ -1,5 +1,6 @@
 """
-A window following the ML car: first person on the left, third person on the right.
+A window following the ML car: first person on the left, third person on the right, and below them
+what the driving model is seeing and deciding, from its real inputs and outputs (see model_panel.py).
 
 It attaches to the running simulation and waits for vehicle_ml to appear, and it picks the car up
 again whenever a new stage respawns it. Closing the window only closes the view. run_simulation.py
@@ -16,6 +17,17 @@ import carla
 import numpy as np
 import pygame
 import requests
+from driving_features import decode_inputs
+from model_panel import (
+    PANEL_HEIGHT,
+    SAFETY_ADDRESSES,
+    SUITE_ADDRESS,
+    ModelPanel,
+    TelemetryReceiver,
+    control_status,
+    gauge_text,
+    lane_to_pixels,
+)
 
 # --- Configuration ---
 CARLA_HOST = "localhost"
@@ -27,6 +39,9 @@ VIEW_WIDTH = 800
 VIEW_HEIGHT = 450
 DIVIDER = 4           # pixels between the two views
 BANNER_HEIGHT = 44    # pixels of status along the bottom
+TOP_HEIGHT = 70       # pixels of test title and gauges along the top
+LOG_HEIGHT = 96       # pixels of event log at the very bottom
+LOG_LINES = 4
 CAMERA_FOV = "90"
 FPS = 30
 
@@ -39,6 +54,7 @@ TEXT_COLOR = (255, 255, 255)
 ML_COLOR = (255, 0, 255)
 BRAKE_COLOR = (255, 60, 60)
 OK_COLOR = (0, 220, 120)
+LANE_COLOR = (0, 220, 120)
 BANNER_COLOR = (20, 20, 20)
 BACKGROUND = (0, 0, 0)
 
@@ -53,7 +69,7 @@ def bgra_to_rgb(raw_data, width, height):
 
 
 def window_size():
-    return 2 * VIEW_WIDTH + DIVIDER, VIEW_HEIGHT + BANNER_HEIGHT
+    return 2 * VIEW_WIDTH + DIVIDER, TOP_HEIGHT + VIEW_HEIGHT + PANEL_HEIGHT + BANNER_HEIGHT + LOG_HEIGHT
 
 
 def speed_from_positions(previous, current, seconds):
@@ -82,6 +98,7 @@ class ChaseCamera:
         transform = carla.Transform(carla.Location(**spec["location"]), carla.Rotation(pitch=spec["pitch"]))
         self.actor = world.spawn_actor(bp, transform, attach_to=vehicle)
         self.label = spec["label"]
+        self.spec = spec
         self.frame = None
         self.actor.listen(self._on_image)
 
@@ -114,6 +131,13 @@ class MlCarView:
         self.speed = 0.0
         self.braking = False
         self.last_gate_poll = 0.0
+        self.panel = ModelPanel(window_size()[0])
+        self.receiver = TelemetryReceiver()
+        self.telemetry = None
+        self.safety_receiver = TelemetryReceiver(SAFETY_ADDRESSES[1])
+        self.suite_receiver = TelemetryReceiver(SUITE_ADDRESS)
+        self.safety = None
+        self.suite = None
 
     def _find_ml_car(self):
         for actor in self.world.get_actors().filter("vehicle.*"):
@@ -155,12 +179,20 @@ class MlCarView:
 
     def _draw_view(self, camera, left):
         if camera.frame is not None:
-            self.display.blit(pygame.surfarray.make_surface(camera.frame.swapaxes(0, 1)), (left, 0))
+            self.display.blit(pygame.surfarray.make_surface(camera.frame.swapaxes(0, 1)), (left, TOP_HEIGHT))
         label = self.font.render(camera.label, True, TEXT_COLOR)
         backing = pygame.Surface((label.get_width() + 16, label.get_height() + 8))
         backing.set_alpha(170)
-        self.display.blit(backing, (left + 10, 10))
-        self.display.blit(label, (left + 18, 14))
+        self.display.blit(backing, (left + 10, TOP_HEIGHT + 10))
+        self.display.blit(label, (left + 18, TOP_HEIGHT + 14))
+        if self.telemetry is not None:
+            # The route points the model is following this tick, on the camera image
+            lane = decode_inputs(np.asarray(self.telemetry["inputs"], dtype=np.float32))["lane"]
+            pixels = lane_to_pixels(lane, camera.spec, VIEW_WIDTH, VIEW_HEIGHT, float(CAMERA_FOV))
+            self.display.set_clip((left, TOP_HEIGHT, VIEW_WIDTH, VIEW_HEIGHT))
+            if len(pixels) >= 2:
+                pygame.draw.lines(self.display, LANE_COLOR, False, [(left + x, TOP_HEIGHT + y) for x, y in pixels], 3)
+            self.display.set_clip(None)
 
     def _draw(self):
         self.display.fill(BACKGROUND)
@@ -171,12 +203,35 @@ class MlCarView:
         else:
             self._draw_view(self.cameras[0], 0)
             self._draw_view(self.cameras[1], VIEW_WIDTH + DIVIDER)
-            pygame.draw.rect(self.display, BANNER_COLOR, (0, VIEW_HEIGHT, width, BANNER_HEIGHT))
-            self.display.blit(self.big_font.render("ML CAR", True, ML_COLOR), (16, VIEW_HEIGHT + 8))
+            self._draw_top(width)
+            self.panel.draw(self.display, TOP_HEIGHT + VIEW_HEIGHT, self.telemetry)
+            banner = TOP_HEIGHT + VIEW_HEIGHT + PANEL_HEIGHT
+            self._draw_log(width, banner + BANNER_HEIGHT)
+            pygame.draw.rect(self.display, BANNER_COLOR, (0, banner, width, BANNER_HEIGHT))
+            self.display.blit(self.big_font.render("ML CAR", True, ML_COLOR), (16, banner + 8))
             color = BRAKE_COLOR if self.braking else OK_COLOR
             self.display.blit(self.big_font.render(status_text(self.speed, self.braking), True, color),
-                              (160, VIEW_HEIGHT + 8))
+                              (160, banner + 8))
+            text, in_control = control_status(self.telemetry)
+            status = self.big_font.render(text, True, OK_COLOR if in_control else BRAKE_COLOR)
+            self.display.blit(status, (width - status.get_width() - 16, banner + 8))
         pygame.display.flip()
+
+    def _draw_top(self, width):
+        pygame.draw.rect(self.display, BANNER_COLOR, (0, 0, width, TOP_HEIGHT))
+        title = self.suite["title"] if self.suite else "NORMAL DRIVING"
+        mode = self.suite["mode"] if self.suite else "AI TARGET SPEED MODEL + PID"
+        self.display.blit(self.font.render(title, True, ML_COLOR), (12, 8))
+        control = self.font.render(mode, True, TEXT_COLOR)
+        self.display.blit(control, (width - control.get_width() - 12, 8))
+        self.display.blit(self.font.render(gauge_text(self.telemetry, self.safety), True, TEXT_COLOR), (12, 38))
+
+    def _draw_log(self, width, top):
+        pygame.draw.rect(self.display, BACKGROUND, (0, top, width, LOG_HEIGHT))
+        events = self.suite["events"] if self.suite else []
+        for i, line in enumerate(events[-LOG_LINES:]):
+            color = BRAKE_COLOR if "SAFETY GATE" in line or "COLLISION" in line or "FAIL" in line else TEXT_COLOR
+            self.display.blit(self.font.render(line, True, color), (12, top + 4 + i * 23))
 
     def run(self):
         print("[VIEW] Waiting for the ML car. Close the window to exit.", flush=True)
@@ -185,6 +240,9 @@ class MlCarView:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
                     running = False
+            self.telemetry = self.receiver.poll()
+            self.safety = self.safety_receiver.poll()
+            self.suite = self.suite_receiver.poll() or self.suite
             try:
                 snapshot = self.world.wait_for_tick(0.2)
             except RuntimeError:
@@ -200,6 +258,9 @@ class MlCarView:
 
     def cleanup(self):
         self._drop_cameras()
+        self.receiver.close()
+        self.safety_receiver.close()
+        self.suite_receiver.close()
         pygame.quit()
 
 

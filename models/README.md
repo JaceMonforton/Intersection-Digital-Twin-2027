@@ -1,6 +1,6 @@
 # Models
 
-Neither model is in the repository. Weights are ignored by git, because this repo is public and
+None of these models are in the repository. Weights are ignored by git, because this repo is public and
 the Waymo Open Dataset licence should be checked before sharing anything trained on it. Without them
 the scripts run on labelled stand-ins and say so at startup.
 
@@ -11,6 +11,24 @@ README. It predicts the ML car's path, for both its line and the brake. Other ca
 | ---- | ------- | ---------- |
 | `waymo_trajectory.onnx` | `scripts/waymo_predictor_node.py` | Follows the road at the current speed |
 | `centerpoint_3d.onnx` | `scripts/central_gpu_processor.py` | CARLA ground-truth actor positions and boxes |
+| `driving_policy.onnx` | The ML car's driver (being built) | Refuses to run: there is no stand-in, so nothing can be mistaken for model driving |
+
+## `driving_policy.onnx`
+
+`scripts/driving_features.py` builds the input and decodes the output, so that recording, training and driving all agree.
+
+- **Input:** `float32 [N, 76]`, in this order:
+  - speed in m/s (1)
+  - route one-hot: left, straight, right (3)
+  - stop line of a light that isn't green: present, then distance along the route in metres, capped at 35 m (2)
+  - route points `(x, y)`: the one nearest the car, then 10 more 2 m apart (22)
+  - the 6 nearest cars within 40 m, nearest first: `(present, x, y, vx, vy)` (30)
+  - the 3 nearest pedestrians within 20 m, nearest first: `(present, x, y, vx, vy)` (15)
+  - on a left turn: a car is due within 10 s (present), the time-to-collision (seconds until the first car reaches the route, keeping its speed and heading, ignoring cars with a light that isn't green before the route), and metres along the route to the start of the turn, negative once inside it (3)
+- **Output:** `float32 [N, 2]`: steering from -1 to 1, positive to the right as in CARLA, and the target speed 1 s from now, in m/s. A small fixed controller in `scripts/driving_features.py` turns the target speed into throttle and brake; it isn't part of the model.
+- **Frame:** the car's own: origin at the car, x forward, y **left**, in metres and m/s. Empty actor slots are all zeros. Scaling lives inside the model.
+- **Bad output:** a value that isn't finite makes the car brake fully.
+- **Two parts:** `training/train_left_turns.py` exports one model: the general driver from `driving_general.onnx`, frozen, plus a correction network that only acts on a left route. Off a left route the output is exactly the general driver's. The general driver doesn't use the three left-turn inputs.
 
 ## `waymo_trajectory.onnx`
 

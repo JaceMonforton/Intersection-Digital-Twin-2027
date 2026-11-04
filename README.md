@@ -25,13 +25,13 @@
 
 You can't stage near-collisions on a real road, so this project studies them in a digital twin of an intersection. It's a university capstone research project and a proof of concept, not for use on public roads.
 
-Running it builds a busy intersection in CARLA's Town10: autopilot cars and pedestrians obey the traffic lights, while the magenta **ML car** makes a left turn across them, once unsafely and once safely, then drives freely. While that happens, the system:
+Running it builds five test situations at an intersection in CARLA's Town10. The magenta **ML car** is driven by a trained model, which chooses its steering and target speed, with a fixed PID controller working the pedals. In normal driving the other cars are CARLA's autopilot; the hazard cars in the tests are scripted. The left-turn pictures below come from the earlier scripted version of the car. While that happens, the system:
 
 - **Tracks every vehicle** at `Town10_Intersection_01` from an overhead gantry, keeping the ML car's state in an Eclipse Ditto digital twin.
 - **Predicts each vehicle's next 3 seconds.** The ML car uses a [model trained on Waymo data](#train-the-trajectory-model) (the magenta line) and the other cars follow the road (the red lines).
 - **Scores the risk** with surrogate safety metrics: time-to-collision (TTC), post-encroachment time (PET) and deceleration rate to avoid a crash (DRAC).
 - **Brakes the ML car** when a collision is predicted, sending the command through Ditto and MQTT to a safety gate that cuts the motors. In the simulation those motors are simulated.
-- **Follows the ML car** in a split-screen window, in first and third person.
+- **Follows the ML car** in a split-screen window, in first and third person, showing what the model sees and decides, and who's in control.
 - **Reports the result:** verdicts, close calls, brake events and red lights run.
 
 | It pulls out too soon | The brake stops it | It finishes the turn | The safe turn, on green, in traffic |
@@ -67,14 +67,24 @@ pip install config\carla-0.9.16-cp310-cp310-win_amd64.whl
 python run_simulation.py
 ```
 
-This starts whatever isn't already running (Docker, the Ditto stack, CARLA), spawns the traffic, opens the ML car's window, runs the unsafe and safe left turns, lets the ML car drive freely for a minute, prints the reports, then shuts down only what it started. A first CARLA launch can take several minutes.
+This starts whatever isn't already running (Docker, the Ditto stack, CARLA), opens the ML car's window, runs the five tests in `scripts/run_professor_test_suite.py`, writes the results, then shuts down only what it started. A first CARLA launch can take several minutes. It needs `models/driving_policy.onnx`, which isn't in the repository: train it with `training/train_driving.py --output models/driving_general.onnx`, then add left turns with `training/train_left_turns.py`.
+
+| Test | What must happen |
+| ---- | ---------------- |
+| 1. Traffic light | Stops before a red line, waits, pulls away on green and gets back up to speed |
+| 2. Left turn across traffic | Pulls into the junction, gives way to oncoming cars, and finishes the turn in a gap with no collision, at least 1.5 m from other cars and without the safety gate firing |
+| 3. Blind corner | A speeding car from behind a truck runs its red light; the safety gate fires, reaches MQTT, and the car stops with no collision |
+| 4. Cut-in | A car moves into the ML car's lane and slows; no collision and no leaving the lane |
+| 5. Light change during a left turn | While the car waits inside the junction the light goes yellow; it finishes the turn once no oncoming car is still coming |
+
+Results go to `output/PROFESSOR_DEMO_SUMMARY.md`, `output/PROFESSOR_TEST_SUITE_RESULTS.json` and `output/live_telemetry.csv`.
 
 | Option | What it does |
 | ------ | ------------ |
-| `--case unsafe` or `--case safe` | Runs just one turn, with no free driving after |
-| `--traffic 30` and `--walkers 15` | Changes the traffic, which defaults to 15 cars and 8 pedestrians. More is less stable |
-| `--live-seconds 120` | Changes how long the free driving lasts; 0 skips it |
-| `--clean` | Runs the repeatable left turn with no other traffic |
+| `--free-drive` | Normal driving in traffic instead of the five tests |
+| `--seconds 120` | With `--free-drive`, how long to drive; 0 runs until Ctrl+C |
+| `--traffic 30` and `--walkers 15` | With `--free-drive`, changes the traffic, which defaults to 15 cars and 8 pedestrians |
+| `--quiet` | Leaves out the test suite's per-tick log lines |
 | `--no-view` | Doesn't open the ML car's window |
 | `--seed 1` | Spawns traffic the same way each run |
 | `--leave-running` | Keeps CARLA and Docker up, for faster repeat runs |
@@ -226,7 +236,7 @@ flowchart LR
 <summary><b>Repository layout</b></summary>
 
 ```
-run_simulation.py    Starts everything and runs the left-turn analysis
+run_simulation.py    Starts everything and runs the five tests, or normal driving
 docker/              Ditto stack: docker-compose.yml, mosquitto.conf, nginx.conf
 config/              Ditto policies, Things and connections, and the CARLA 0.9.16 client
 models/              Where trained models go, and the contract they must meet
@@ -288,7 +298,7 @@ Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.ht
 | Docker stack, Ditto twins, MQTT safety path | **Working**, tested live |
 | One-command launcher | **Working**, including starting CARLA and the Ditto stack. Starting Docker Desktop itself isn't tested |
 | Master tick, overhead view, on-screen overlays | **Working** in CARLA |
-| Left turn across traffic, free driving, reports | **Working**, at this one junction and light traffic |
+| Left turn across traffic, free driving, reports | **Working**. Tests 2 and 5 passed 20 of 20 each on one approach to one junction, with scripted oncoming cars at 12 m/s |
 | Split-screen ML car window | **Working** |
 | Path prediction | **Working.** The ML car uses a [model trained on Waymo data](#train-the-trajectory-model), falling back to road-following without it. Other cars follow the road |
 | Vehicle detection | **CARLA's true positions, as a stand-in.** The overhead LiDAR runs and its data is formatted for a model, but there's no model yet |

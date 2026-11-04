@@ -1,11 +1,10 @@
 """
-Puts vehicle_ml into live traffic and reports how the safety system copes.
+Puts vehicle_ml into live traffic, driven by the trained driving model, and reports how it copes.
 
-Its prediction comes from the trained model, in the processor. A simple lane driver here only moves
-it along the road, because the model predicts and can't steer, and because the Traffic Manager keeps
-overriding the brake once a car has been handed back to it. The car stops when the processor engages
-its SafetyGate. The brake latches, so after a short hold this script releases it, standing in for an
-operator, and the car drives on. If the hazard is still there, the processor brakes again.
+ml_driver.py turns the model's outputs into controls: real physics, with no scripted driving, and it
+refuses to run without the model file. The car brakes fully when the processor engages its SafetyGate.
+The brake latches, so after a short hold this script releases it, standing in for an operator, and the
+model drives on. If the hazard is still there, the processor brakes again.
 
 Normally started by run_simulation.py. Needs the processor and test_traffic.py running.
     python scripts/traffic_monitor.py --duration 60
@@ -25,7 +24,14 @@ from pathlib import Path
 import requests
 from central_gpu_processor import ML_PAINT
 from left_turn_scenario import outline, rectangles_gap
-from waymo_predictor_node import LEFT, RIGHT, STRAIGHT, turn_class, yaw_difference
+from waymo_predictor_node import (
+    LANE_MAX_HEADING,
+    LEFT,
+    RIGHT,
+    STRAIGHT,
+    turn_class,
+    yaw_difference,
+)
 
 # --- Configuration ---
 CARLA_HOST = "localhost"
@@ -55,7 +61,9 @@ BRAKE_DECEL = 6.0         # m/s^2, the emergency brake
 WAYPOINT_STEP = 1.0       # m
 LOOK_AHEAD = 45.0         # m of lane planned ahead
 BRANCH_LOOK = 15          # waypoints walked down a branch to see where it heads
+BRANCH_LOOK_MAX = 80      # and on to the end of the junction, since a turn takes about 35 m to finish
 SIGNAL_DISTANCE = 30.0    # m before a turn that the signal comes on
+ADVANCE_WINDOW = 20       # waypoints ahead searched for a car's place on its lane
 FOLLOW_GAP = 7.0          # m between centres to keep from the car ahead when stopped
 FOLLOW_OFFSET = 1.6       # m to the side that still counts as in the lane ahead
 Z_CLEARANCE = 0.3         # m above the road
@@ -241,6 +249,19 @@ class RedLightWatch:
                 print(f"[{label}] t={now:.1f} s: {who} RAN A RED LIGHT at {speed:.1f} m/s", flush=True)
 
 
+def release_gate(session):
+    """Releases a latched brake, standing in for an operator. Only for CARLA runs."""
+    body = {"emergency_brake": False, "reason": None, "ttc": None,
+            "updated_at": datetime.now().astimezone().isoformat()}
+    session.put(GATE_URL, json=body, timeout=2.0).raise_for_status()
+
+
+def on_lane(waypoint, yaw):
+    """Is this waypoint certainly the lane a car with this yaw is in? Lanes overlap inside a junction."""
+    return (waypoint is not None and not waypoint.is_junction
+            and abs(yaw_difference(waypoint.transform.rotation.yaw, yaw)) <= LANE_MAX_HEADING)
+
+
 class LaneDriver:
     """Moves a car along lanes from a starting waypoint, turning at random where the road branches.
     It predicts nothing: that's the trained model's job, in the processor."""
@@ -255,7 +276,9 @@ class LaneDriver:
 
     def _branch_heading(self, waypoint):
         end = waypoint
-        for _ in range(BRANCH_LOOK):
+        for step in range(BRANCH_LOOK_MAX):
+            if step >= BRANCH_LOOK and not end.is_junction:
+                break
             following = end.next(WAYPOINT_STEP)
             if not following:
                 break
@@ -289,6 +312,17 @@ class LaneDriver:
         yaw = a.rotation.yaw + yaw_difference(a.rotation.yaw, b.rotation.yaw) * f
         return x, y, z, yaw
 
+    def advance_to(self, x, y):
+        """For a car something else is driving: moves along the lane to the point nearest (x, y) and
+        returns how far off the lane the car is."""
+        start = int(self.s / WAYPOINT_STEP)
+        distances = [math.hypot(w.transform.location.x - x, w.transform.location.y - y)
+                     for w in self.points[start:start + ADVANCE_WINDOW]]
+        nearest = min(range(len(distances)), key=distances.__getitem__)
+        self.s = (start + nearest) * WAYPOINT_STEP
+        self._extend()
+        return distances[nearest]
+
     def path_ahead(self, metres):
         """(x, y) points a metre apart along the planned lane, starting here."""
         start = int(self.s / WAYPOINT_STEP)
@@ -299,6 +333,14 @@ class LaneDriver:
         here = self.s / WAYPOINT_STEP
         upcoming = [(i, turn) for i, turn in self.turns.items() if here - BRANCH_LOOK <= i <= here + SIGNAL_DISTANCE]
         return min(upcoming)[1] if upcoming else STRAIGHT
+
+    def turn_gap(self, turn):
+        """Metres along the route to where this signalled turn starts, negative once inside it; None without one."""
+        here = self.s / WAYPOINT_STEP
+        upcoming = [(i, t) for i, t in self.turns.items() if here - BRANCH_LOOK <= i <= here + SIGNAL_DISTANCE]
+        if not upcoming or min(upcoming)[1] != turn:
+            return None
+        return (min(upcoming)[0] - here) * WAYPOINT_STEP
 
     def step(self, dt, target, braked):
         self.speed = next_speed(self.speed, target, dt, braked)
@@ -325,6 +367,9 @@ class Report:
     red_light_runs: list = field(default_factory=list)
     ml_red_stops: int = 0
     ml_distance: float = 0.0
+    ml_times_lost: int = 0
+    ml_moved_back: int = 0
+    ml_stuck: int = 0
 
 
 def print_report(r):
@@ -341,7 +386,8 @@ def print_report(r):
     print(f"Close calls          {r.close_calls} (closing fast within {CLOSE_CALL_GAP} m), of which {r.contacts} "
           f"overlapped; closest moving gap {gap}")
     print(f"Cars moved back      {r.cars_recycled}, off-screen, to keep the intersection busy")
-    print(f"vehicle_ml           drove {r.ml_distance:.0f} m; touched another car {len(r.ml_contacts)} times")
+    print(f"vehicle_ml           driven by the model for {r.ml_distance:.0f} m; touched another car {len(r.ml_contacts)} times; "
+          f"lost its lane {r.ml_times_lost} times; stuck {r.ml_stuck} times; moved back near the intersection {r.ml_moved_back} times")
     ml_runs = sum(run["ml"] for run in r.red_light_runs)
     print(f"Red lights           run {len(r.red_light_runs) - ml_runs} times by traffic, {ml_runs} by vehicle_ml; "
           f"vehicle_ml stopped for {r.ml_red_stops}")
@@ -356,8 +402,11 @@ def print_report(r):
 # CARLA
 # ---------------------------------------------------------------------------
 class Monitor:
-    def __init__(self, carla, client):
+    def __init__(self, carla, client, policy):
+        from ml_driver import StopWatch  # ml_driver imports this module for LaneDriver
+
         self.carla = carla
+        self.policy = policy
         self.world = client.get_world()
         self.session = requests.Session()
         self.world.wait_for_tick(10.0)  # until the first tick, a new client reads the spectator as (0, 0)
@@ -377,9 +426,10 @@ class Monitor:
         points = self.world.get_map().get_spawn_points()
         self.recycle_points = [p for p in points if RECYCLE_NEAR[0] <= math.hypot(
             p.location.x - self.center[0], p.location.y - self.center[1]) <= RECYCLE_NEAR[1]]
-        self.ml, self.driver = self._spawn_ml(view, points)
         self.lights = RedLightWatch(carla, self.world)
         self.recycle_points = clear_of_stop_lines(self.recycle_points, self.lights.stop_line_positions())
+        self.stops = StopWatch()
+        self.ml, self.driver = self._spawn_ml(view, clear_of_stop_lines(points, self.lights.stop_line_positions()))
         self.waiting_at_red = False
 
     def _spawn_ml(self, view, points):
@@ -392,12 +442,19 @@ class Monitor:
                 continue
             ml = self.world.try_spawn_actor(bp, point)
             if ml is not None:
-                ml.set_simulate_physics(False)  # LaneDriver owns the pose
+                from ml_driver import ModelDriver
+                from model_panel import TelemetrySender
+
                 waypoint = self.world.get_map().get_waypoint(point.location)
-                print(f"[TRAFFIC] vehicle_ml joined traffic at x={point.location.x:.0f} y={point.location.y:.0f}.",
-                      flush=True)
-                return ml, LaneDriver(waypoint, self.rng)
+                print(f"[TRAFFIC] vehicle_ml joined traffic at x={point.location.x:.0f} y={point.location.y:.0f}, "
+                      "driven by the driving model.", flush=True)
+                return ml, ModelDriver(self.policy, LaneDriver(waypoint, self.rng), self._find_waypoint, self.rng, TelemetrySender())
         raise RuntimeError("No free spawn point for vehicle_ml.")
+
+    def _find_waypoint(self, x, y):
+        carla = self.carla
+        return self.world.get_map().get_waypoint(carla.Location(x=float(x), y=float(y), z=0.0), project_to_road=True,
+                                                 lane_type=carla.LaneType.Driving)
 
     def _gate(self):
         try:
@@ -406,9 +463,7 @@ class Monitor:
             return {}
 
     def _release_gate(self):
-        body = {"emergency_brake": False, "reason": None, "ttc": None,
-                "updated_at": datetime.now().astimezone().isoformat()}
-        self.session.put(GATE_URL, json=body, timeout=2.0).raise_for_status()
+        release_gate(self.session)
 
     def _brake_context(self, reason, me):
         """Where the other vehicle was, which shows whether this was a crossing or just a car ahead."""
@@ -419,7 +474,7 @@ class Monitor:
         ahead, left = relative_position(me, other)
         heading = abs((other[4] - me[4] + 180.0) % 360.0 - 180.0)
         return (f"other {ahead:.1f} m ahead, {left:.1f} m left, heading {heading:.0f} deg off, "
-                f"at {math.hypot(other[2], other[3]):.1f} m/s; me at {self.driver.speed:.1f} m/s")
+                f"at {math.hypot(other[2], other[3]):.1f} m/s; me at {math.hypot(me[2], me[3]):.1f} m/s")
 
     def _recycle(self):
         if self.now - self.last_recycle < RECYCLE_INTERVAL or not self.recycle_points:
@@ -436,52 +491,77 @@ class Monitor:
         self.actors[self.rng.choice(far)].set_transform(point)
         self.report.cars_recycled += 1
 
-    def _bring_ml_back_if_far(self, x, y):
-        """The ML car wanders too. Bring it back while it's out of sight, so it stays in the action."""
-        if math.hypot(x - self.center[0], y - self.center[1]) <= RECYCLE_DISTANCE or not self.recycle_points:
+    def _bring_ml_back(self, x, y, stuck):
+        """The ML car wanders too. Bring it back while it's out of sight, so it stays in the action. If it
+        has got stuck for good, bring it back anyway, and count it, since that's the model's failure."""
+        far = math.hypot(x - self.center[0], y - self.center[1]) > RECYCLE_DISTANCE
+        if not (far or stuck) or not self.recycle_points:
             return
         point = self.rng.choice(self.recycle_points)
         if any(math.hypot(s[0] - point.location.x, s[1] - point.location.y) < RECYCLE_CLEARANCE
                for i, s in self.states.items() if i != self.ml.id):
             return
-        self.driver = LaneDriver(self.world.get_map().get_waypoint(point.location), self.rng)
+        self.ml.set_transform(point)
+        self.ml.set_target_velocity(self.carla.Vector3D(0.0, 0.0, 0.0))
+        self.driver.lane = LaneDriver(self.world.get_map().get_waypoint(point.location), self.rng)
+        self.stops.since = None
+        self.report.ml_moved_back += 1
+        if stuck:
+            self.report.ml_stuck += 1
+            print(f"[TRAFFIC] t={self.now:.1f} s: vehicle_ml was stuck at x={x:.0f} y={y:.0f}; moved it back.", flush=True)
 
-    def _drive_ml(self, dt):
-        x, y, z, yaw = self.driver.pose()
-        me = (x, y, 0.0, 0.0, yaw)
-        others = [s for i, s in self.states.items() if i != self.ml.id]
+    def _apply_gate(self, gate, me):
+        """Notes a new brake, and releases one that's been held long enough. Does the gate let the model drive?"""
+        from ml_driver import brake_is_off
 
-        if self.braked_at is None:
-            gate = self._gate()
-            if gate.get("emergency_brake") is True:
+        if gate.get("emergency_brake") is True:
+            if self.braked_at is None:
                 self.braked_at = self.now
                 context = self._brake_context(gate.get("reason") or "", me)
                 self.report.brakes.append({"t": round(self.now, 1), "reason": gate.get("reason"), "context": context})
                 print(f"[TRAFFIC] t={self.now:.1f} s: BRAKE: {gate.get('reason')} [{context}]", flush=True)
-        elif self.now - self.braked_at >= BRAKE_HOLD:
-            self._release_gate()
+            elif self.now - self.braked_at >= BRAKE_HOLD:
+                try:
+                    self._release_gate()
+                    self.braked_at = None
+                except requests.RequestException:
+                    pass  # still braked, so try again next tick
+        elif gate:
             self.braked_at = None
+        return brake_is_off(gate)
 
-        target = min(CRUISE_SPEED, speed_for_gap(lead_gap(me, others) - FOLLOW_GAP))
-        gap = red_light_gap(self.driver.path_ahead(RED_LOOK), self.lights.not_green())
-        if gap < RED_LOOK:
-            target = min(target, speed_for_gap(gap - STOP_SHORT))
-            if target < 0.5 and not self.waiting_at_red:
+    def _drive_ml(self):
+        from ml_driver import STUCK_SECONDS
+
+        me = self.states[self.ml.id]
+        x, y, vx, vy, yaw = me
+        others = [s for i, s in self.states.items() if i != self.ml.id]
+        walkers = [(w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
+                   for w in self.world.get_actors().filter("walker.pedestrian.*")]
+        not_green = self.lights.not_green()
+        released = self._apply_gate(self._gate(), me)
+
+        steer, throttle, brake = self.driver.controls(me, not_green, others, walkers, released)
+        self.ml.apply_control(self.carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
+        self.report.ml_times_lost = self.driver.times_lost
+
+        speed = math.hypot(vx, vy)
+        at_red = red_light_gap(self.driver.lane.path_ahead(RED_LOOK), not_green) < RED_LOOK
+        if at_red and speed < 0.5:
+            if not self.waiting_at_red:
                 self.waiting_at_red = True
                 self.report.ml_red_stops += 1
-                print(f"[TRAFFIC] t={self.now:.1f} s: vehicle_ml stopping for a red light.", flush=True)
-        else:
+                print(f"[TRAFFIC] t={self.now:.1f} s: vehicle_ml stopped for a red light.", flush=True)
+        elif not at_red:
             self.waiting_at_red = False
-        self.driver.step(dt, target, self.braked_at is not None)
-        x, y, z, yaw = self.driver.pose()
-        self.ml.set_transform(self.carla.Transform(self.carla.Location(x=x, y=y, z=z + Z_CLEARANCE),
-                                                   self.carla.Rotation(yaw=yaw)))
+        stopped_for = self.stops.update(self.now, speed, at_red or not released)
+
         self._show_signal()
         self._note_ml_contact(x, y, yaw)
-        self._bring_ml_back_if_far(x, y)
+        self._bring_ml_back(x, y, stopped_for >= STUCK_SECONDS)
 
     def _show_signal(self):
-        wanted = self.driver.signal()
+        wanted = self.driver.lane.signal()
         if wanted == self.shown_signal:
             return
         self.shown_signal = wanted
@@ -557,10 +637,10 @@ class Monitor:
             self.states, self.actors = states, actors
             self.lights.update(states, self.now, self.ml.id, "TRAFFIC")
             self._measure({i: s for i, s in states.items() if i != self.ml.id})
-            self._drive_ml(snapshot.timestamp.delta_seconds)
+            self._drive_ml()
             self._recycle()
 
-            x, y, _, _ = self.driver.pose()
+            x, y = states[self.ml.id][:2]
             if last_ml is not None and math.hypot(x - last_ml[0], y - last_ml[1]) < 5.0:
                 self.report.ml_distance += math.hypot(x - last_ml[0], y - last_ml[1])
             last_ml = (x, y)
@@ -612,11 +692,19 @@ def main():
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
 
+    from ml_driver import DrivingPolicy
+
+    try:
+        policy = DrivingPolicy()
+    except FileNotFoundError as error:
+        print(f"[TRAFFIC] Refusing to run: {error}", flush=True)
+        return 1
+
     import carla
 
     client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(30.0)
-    monitor = Monitor(carla, client)
+    monitor = Monitor(carla, client, policy)
     try:
         monitor.run(args.duration)
     except KeyboardInterrupt:
