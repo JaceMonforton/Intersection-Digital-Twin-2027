@@ -295,7 +295,7 @@ def test_quiet_leaves_out_the_live_table():
 
 
 def test_the_live_table_is_cut_to_fit_since_a_wrapped_line_breaks_the_redraw(monkeypatch):
-    monkeypatch.setattr("shutil.get_terminal_size", lambda: os.terminal_size((11, 24)))
+    monkeypatch.setattr("shutil.get_terminal_size", lambda fallback=None: os.terminal_size((11, 24)))
     out = _Terminal()
     Console(stream=out).status(["x" * 50])
     assert out.getvalue() == "x" * 10 + "\n"
@@ -323,7 +323,7 @@ def test_the_set_off_note_says_when_no_car_was_due():
 
 
 def test_a_terminal_too_short_for_the_live_table_goes_without(monkeypatch):
-    monkeypatch.setattr("shutil.get_terminal_size", lambda: os.terminal_size((80, 3)))
+    monkeypatch.setattr("shutil.get_terminal_size", lambda fallback=None: os.terminal_size((80, 3)))
     out = _Terminal()
     Console(stream=out).status(["1", "2", "3"])
     assert out.getvalue() == ""
