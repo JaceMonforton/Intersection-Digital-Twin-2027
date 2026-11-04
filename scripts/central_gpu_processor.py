@@ -76,8 +76,8 @@ BOX_THICKNESS = 0.1
 # Debug shapes are unlit, so full brightness blooms at high render quality
 BOX_COLOR_MODEL = (0, 50, 0)
 BOX_COLOR_GROUND_TRUTH = (50, 50, 0)
-BOX_COLOR_ML = (90, 0, 90)  # magenta, so the ML car stands out from everything else
-ML_PAINT = "255,0,255"      # its body colour, which no other car uses
+BOX_COLOR_ML = (55, 0, 55)  # magenta, so the ML car stands out from everything else
+ML_PAINT = "170,50,170"      # its body colour, which no other car uses
 # CARLA draws debug shapes into every camera, and the ML car's own cameras shouldn't show its box or
 # label. So they're drawn this far above the car, out of those cameras' view, and scaled to compensate
 # so that they still line up with the car from directly overhead.
@@ -831,7 +831,7 @@ class CarlaPerception:
             if b.is_ml:
                 b = overhead_marker(b, self.gantry.x, self.gantry.y, self.gantry.z)
                 self.world.debug.draw_string(self.carla.Location(x=b.x, y=b.y, z=b.z), "ML CAR",
-                                             color=self.carla.Color(255, 0, 255), life_time=LABEL_LIFE_TIME)
+                                             color=self.carla.Color(170, 50, 170), life_time=LABEL_LIFE_TIME)
             self.world.debug.draw_box(
                 self.carla.BoundingBox(
                     self.carla.Location(x=b.x, y=b.y, z=b.z),

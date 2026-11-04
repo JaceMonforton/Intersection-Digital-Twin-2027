@@ -11,8 +11,11 @@ from model_panel import (
     TelemetryReceiver,
     TelemetrySender,
     control_status,
+    is_alert,
     lane_to_pixels,
+    safety_lines,
     seen_lines,
+    wrap_text,
 )
 from waymo_predictor_node import LEFT
 
@@ -123,4 +126,22 @@ def test_the_panel_draws_every_state(model_driving):
     panel.draw(surface, 0, message)
     panel.draw(surface, 0, None)
     panel.draw(surface, 0, {**message, "output": [float("nan"), 0.0]})
+    panel.draw(surface, 0, message, {"ttc": 1.2, "engaged": True}, ["12:00:00 SAFETY GATE: a long reason " * 5] * 4)
     assert np.any(pygame.surfarray.array3d(surface))
+
+
+def test_safety_lines_only_show_real_values():
+    assert safety_lines(None) == [("Min TTC", "n/a"), ("Safety brake", "off")]
+    assert safety_lines({"ttc": 1.234, "engaged": True}) == [("Min TTC", "1.23 s"), ("Safety brake", "ON")]
+    assert safety_lines({"ttc": float("inf"), "engaged": False})[0] == ("Min TTC", "n/a")
+
+
+def test_long_events_wrap_between_words():
+    assert wrap_text("one two three four", len, 8) == ["one two", "three", "four"]
+    assert wrap_text("averyveryverylongword x", len, 5) == ["averyveryverylongword", "x"]
+    assert wrap_text("", len, 5) == []
+
+
+@pytest.mark.parametrize("event, alert", (("SAFETY GATE: x", True), ("COLLISION with a car", True), ("TEST 2: FAIL", True), ("TEST 2: PASS", False)))
+def test_only_trouble_is_an_alert(event, alert):
+    assert is_alert(event) is alert

@@ -1,4 +1,7 @@
-"""Scoring and reporting of the four-test suite. No CARLA needed."""
+"""Scoring and reporting of the five-test suite. No CARLA needed."""
+import io
+import math
+import os
 import random
 
 import numpy as np
@@ -11,6 +14,7 @@ from run_professor_test_suite import (
     T2_GAP,
     T2_HEADWAY,
     T2_SAFE_GAP,
+    Console,
     StageResult,
     TurnChooser,
     alert_banner,
@@ -23,9 +27,13 @@ from run_professor_test_suite import (
     grade_lights,
     latency_ms,
     launch_now,
+    live_table,
     matrix_rows,
+    next_car_text,
     paths_cross,
+    results_table,
     round_rows,
+    shown,
     stopping_distance,
     straight_back,
     traffic_schedule,
@@ -152,7 +160,7 @@ def test_directions(yaw, kind):
 
 
 def _record(passed=True):
-    return {"test": 1, "name": "A test", "passed": passed, "collisions": [], "red_light_violations": 0, "stopping_margin": 2.5,
+    return {"test": 1, "name": "A test", "passed": passed, "duration": 12.0, "collisions": [], "red_light_violations": 0, "stopping_margin": 2.5,
             "min_gap": None, "mqtt_latency_ms": None, "gate_poll_ms": 12.0, "checks": {"no_collision": passed}, "notes": []}
 
 
@@ -246,3 +254,76 @@ def test_the_chooser_takes_the_turn_once_then_goes_straight():
     assert chooser.choice([straight_on, left]) is left
     assert chooser.turn == STRAIGHT
     assert chooser.choice([straight_on, left]) is straight_on
+
+
+class _Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_the_live_table_redraws_in_place_in_a_terminal():
+    out = _Terminal()
+    console = Console(stream=out)
+    console.status(["one", "two"])
+    console.last_draw = 0.0
+    console.status(["three", "four"])
+    assert out.getvalue() == "one\ntwo\n\033[2F\033[Jthree\nfour\n"
+
+
+def test_events_print_above_the_live_table():
+    out = _Terminal()
+    console = Console(stream=out)
+    console.status(["row"])
+    console.plain("event")
+    assert out.getvalue() == "row\n\033[1F\033[Jevent\nrow\n"
+    console.end_status()
+    assert out.getvalue().endswith("\033[1F\033[J")
+
+
+def test_redirected_output_gets_no_live_table():
+    out = io.StringIO()
+    console = Console(stream=out)
+    console.status(["row"])
+    console.plain("event")
+    assert out.getvalue() == "event\n"
+
+
+def test_quiet_leaves_out_the_live_table():
+    out = _Terminal()
+    Console(quiet=True, stream=out).status(["row"])
+    assert out.getvalue() == ""
+
+
+def test_the_live_table_is_cut_to_fit_since_a_wrapped_line_breaks_the_redraw(monkeypatch):
+    monkeypatch.setattr("shutil.get_terminal_size", lambda: os.terminal_size((11, 24)))
+    out = _Terminal()
+    Console(stream=out).status(["x" * 50])
+    assert out.getvalue() == "x" * 10 + "\n"
+
+
+def test_the_live_table_lines_up_and_shows_missing_values():
+    pairs = (("Target speed", f"{shown(math.nan, 1)} km/h"), ("Steering", "+0.02"), ("Min TTC", "1.20 s"), ("MQTT", "NOT CONNECTED"))
+    rows = live_table("[TEST 1/5] A VERY LONG TITLE " * 5, 12.3, pairs)
+    assert len({len(row) for row in rows}) == 1
+    assert "t=12.3 s" in rows[1]
+    assert "n/a km/h" in rows[3]
+
+
+def test_the_results_table_has_one_row_per_test():
+    rows = results_table([_record(True), {**_record(False), "test": 2, "name": "A longer name"}])
+    assert len({len(row) for row in rows}) == 1
+    assert len(rows) == 6
+    assert "PASS" in rows[3] and "FAIL" in rows[4]
+
+
+def test_the_set_off_note_says_when_no_car_was_due():
+    assert next_car_text(math.inf) == "no car due"
+    assert next_car_text(None) == "no car due"
+    assert next_car_text(7.25) == "the next car 7.2 s away"
+
+
+def test_a_terminal_too_short_for_the_live_table_goes_without(monkeypatch):
+    monkeypatch.setattr("shutil.get_terminal_size", lambda: os.terminal_size((80, 3)))
+    out = _Terminal()
+    Console(stream=out).status(["1", "2", "3"])
+    assert out.getvalue() == ""

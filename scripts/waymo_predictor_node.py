@@ -31,7 +31,7 @@ STEP_SECONDS = 0.1
 DRAW_HEIGHT = 0.5     # metres above the actor, so lines don't z-fight with the road
 DRAW_THICKNESS = 0.1
 DRAW_COLOR = (70, 0, 0)  # debug lines are unlit, so full brightness blooms at high render quality
-DRAW_COLOR_ML = (90, 0, 90)  # the ML car's line matches its magenta paint and box
+DRAW_COLOR_ML = (55, 0, 55)  # the ML car's line matches its magenta paint and box
 DRAW_EVERY = 3         # draw every Nth step of other cars' lines; each one is a call to the server
 DRAW_LIFE_TIME = 0.11  # must outlive one 0.1 s tick: at exactly 0.1 a line expires before it renders
 
