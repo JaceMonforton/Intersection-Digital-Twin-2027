@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import requests
 import websocket
+from model_panel import SafetySender
 from waymo_predictor_node import (
     DEFAULT_MODEL as TRAJECTORY_MODEL,
 )
@@ -520,6 +521,17 @@ class SafetyEngine:
         self.last_brake_sent = 0.0
         self.last_report = 0.0
         self.warned_blind = False
+        self.safety_out = SafetySender()
+
+    def _report_ml_safety(self, rows):
+        """What the checks say about the ML car this tick, for the display and the test suite."""
+        mine = [r for r in rows if CONTROLLED_VEHICLE in r["pair"]]
+        if not mine:
+            return
+        nearest = min(mine, key=lambda r: min(r["ttc"], r["path_ttc"]))
+        other = next(i for i in nearest["pair"] if i != CONTROLLED_VEHICLE)
+        self.safety_out.send(_finite(min(r["ttc"] for r in mine)), _finite(min(r["path_ttc"] for r in mine)),
+                             _finite(min(r["pet"] for r in mine)), other, self.ditto.brake_engaged())
 
     def evaluate(self, tracks):
         """Metrics for every pair, most urgent first."""
@@ -541,6 +553,7 @@ class SafetyEngine:
         tracks = fuse(telemetry, list(detections))
         self._warn_if_ml_vehicle_blind(tracks)
         rows = self.evaluate(tracks)
+        self._report_ml_safety(rows)
 
         hazard = next((r for r in rows if self._brake_can_help(r)
                        and (self._ttc_triggers(r) or (r["path_ttc"] < PATH_BRAKE_HORIZON and self._path_applies(r)))), None)
@@ -785,7 +798,8 @@ class CarlaPerception:
             tracks.append(Track(track_id, x, y, vx, vy, path, tf.rotation.yaw, turn_rate(list(self._recent_yaws[actor.id]))))
             bb = actor.bounding_box
             c = tf.transform(bb.location)
-            boxes.append(Box(c.x, c.y, c.z, 2 * bb.extent.x, 2 * bb.extent.y, 2 * bb.extent.z, tf.rotation.yaw,
+            # Drawn now but shown on the next tick, so where the car will be then, or the box trails it
+            boxes.append(Box(c.x + vx * FIXED_DELTA, c.y + vy * FIXED_DELTA, c.z, 2 * bb.extent.x, 2 * bb.extent.y, 2 * bb.extent.z, tf.rotation.yaw,
                              role == CONTROLLED_VEHICLE))
         self._previous = previous
         self._recent_yaws = {k: v for k, v in self._recent_yaws.items() if k in previous}
