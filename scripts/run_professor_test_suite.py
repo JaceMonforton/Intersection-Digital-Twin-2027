@@ -22,10 +22,12 @@ import json
 import math
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -120,7 +122,8 @@ T4_MERGE = 8.0                # m further on that its path joins the ML car's la
 T4_RUN = 25.0                 # s after the cut-in before scoring
 OFF_LANE_LIMIT = 1.0          # m; normal driving stays within about 0.6 m
 
-TAGS = {"SCENARIO": "96", "MODEL": "92", "SAFETY GATE": "93", "MQTT / DITTO": "94", "ALERT": "91"}
+TAGS = {"SCENARIO": "96", "MQTT / DITTO": "94", "ALERT": "91"}
+STATUS_INTERVAL = 0.2  # seconds between redraws of the live table
 CSV_COLUMNS = ("wall_time", "test", "sim_t", "x", "y", "yaw", "speed", "target_speed", "steer", "throttle", "brake",
                "speed_error", "model_driving", "gate_engaged", "min_ttc", "path_ttc", "pet", "stop_gap", "min_gap", "off_lane")
 
@@ -287,6 +290,35 @@ def shown(value, digits=2):
     return "n/a" if value is None or (isinstance(value, float) and not math.isfinite(value)) else f"{value:.{digits}f}"
 
 
+def next_car_text(ttc):
+    """How far the next car was when the ML car set off."""
+    return "no car due" if ttc is None or not math.isfinite(ttc) else f"the next car {ttc:.1f} s away"
+
+
+def live_table(title, t, pairs):
+    """Lines of a two-column table of (name, value) pairs, with the title and time on top."""
+    half = (len(pairs) + 1) // 2
+    body = [f"| {a[0]:<15}{a[1]:>13} | {b[0]:<15}{b[1]:>13} |" for a, b in zip(pairs[:half], pairs[half:])]
+    rule = "+" + "-" * (len(body[0]) - 2) + "+"
+    clock = f"t={t:.1f} s"
+    room = len(body[0]) - 4 - len(clock) - 1
+    return [rule, f"| {title[:room]:<{room}} {clock} |", rule, *body, rule]
+
+
+def results_table(results):
+    """Lines of a table with one row per test."""
+    header = ("Test", "Result", "Time", "Collisions", "Red lights", "Stop margin", "Closest gap", "MQTT")
+    rows = [(f"{r['test']}. {r['name']}", "PASS" if r["passed"] else "FAIL", f"{shown(r['duration'], 1)} s", str(len(r["collisions"])), str(r["red_light_violations"]),
+             f"{shown(r['stopping_margin'])} m", f"{shown(r['min_gap'])} m", f"{shown(r['mqtt_latency_ms'], 0)} ms") for r in results]
+    widths = [max(len(row[i]) for row in (header, *rows)) for i in range(len(header))]
+
+    def row_text(row):
+        return "| " + " | ".join(f"{cell:<{width}}" if i < 2 else f"{cell:>{width}}" for i, (cell, width) in enumerate(zip(row, widths))) + " |"
+
+    rule = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    return [rule, row_text(header), rule, *map(row_text, rows), rule]
+
+
 def matrix_rows(results):
     rows = []
     for r in results:
@@ -376,18 +408,50 @@ def _yaw_past_junction(waypoint, longest=80):
 
 
 class Console:
-    """Tagged, coloured lines on stdout. --quiet leaves out the per-tick lines."""
+    """Events scroll past as tagged lines, above one table of live values that redraws in place.
 
-    def __init__(self, quiet=False):
-        self.quiet = quiet
-        os.system("")  # turns on ANSI colours in a Windows console
+    The table only shows in a real terminal, and not with --quiet, so redirected output stays plain lines.
+    Every tick's values are saved to output/live_telemetry.csv either way.
+    """
+
+    def __init__(self, quiet=False, stream=None):
+        self.stream = stream or sys.stdout
+        self.live = not quiet and self.stream.isatty()
+        self.rows = []
+        self.drawn = 0
+        self.last_draw = 0.0
+        self.lock = threading.Lock()  # MQTT events arrive on another thread
+        os.system("")  # turns on ANSI escapes in a Windows console
+
+    def _write(self, event=""):
+        """Replaces the table in one write, so it doesn't flicker. Lines are cut to fit, since a wrapped line would break the redraw."""
+        size = shutil.get_terminal_size()
+        rows = self.rows if len(self.rows) < size.lines else []  # too short a terminal can't redraw it either
+        erase = f"\033[{self.drawn}F\033[J" if self.drawn else ""
+        self.stream.write(erase + event + "".join(row[:size.columns - 1] + "\n" for row in rows))
+        self.stream.flush()
+        self.drawn = len(rows)
+
+    def plain(self, text):
+        with self.lock:
+            self._write(text + "\n")
 
     def line(self, tag, text):
-        print(f"\033[{TAGS.get(tag, '0')}m[{tag}]\033[0m {text}", flush=True)
+        self.plain(f"\033[{TAGS.get(tag, '0')}m[{tag}]\033[0m {text}")
 
-    def tick(self, tag, text):
-        if not self.quiet:
-            self.line(tag, text)
+    def status(self, rows):
+        """Shows these lines as the live table, at most five times a second."""
+        if not self.live or time.monotonic() - self.last_draw < STATUS_INTERVAL:
+            return
+        with self.lock:
+            self.last_draw = time.monotonic()
+            self.rows = rows
+            self._write()
+
+    def end_status(self):
+        with self.lock:
+            self.rows = []
+            self._write()
 
 
 class MqttWatch:
@@ -693,8 +757,7 @@ class Suite:
                     if result.brake_at is None:
                         result.brake_at, result.brake_ttc = round(t, 2), gate.get("ttc")
                     banner = alert_banner(name, gate.get("ttc"), speed)
-                    self.console.line("ALERT", banner.replace("[ALERT - SAFETY GATE TRIGGERED] ", "SAFETY GATE TRIGGERED: ") + f" | {reason}")
-                    print(f"\033[1;91m{banner}\033[0m", flush=True)
+                    self.console.plain(f"\033[1;91m{banner} | {reason}\033[0m")
                     self.hud.event(f"SAFETY GATE: {reason}")
                 elif was_braking and not engaged:
                     self.hud.event("Safety brake released")
@@ -703,15 +766,11 @@ class Suite:
 
                 state = telemetry.last or {"target": math.nan, "model_driving": False}
                 error = state["target"] - speed
-                self.console.tick("MODEL", f"Target {state['target'] * 3.6:5.1f} km/h | Actual {speed * 3.6:5.1f} km/h | "
-                                           f"Throttle {throttle * 100:3.0f}% | Brake {brake * 100:3.0f}% | "
-                                           f"Steering {steer:+.3f} | Dv {error:+.2f} m/s")
-                self.console.tick("SAFETY GATE", f"Min TTC {shown(ttc)} s | Path TTC {shown(safety.get('path_ttc'))} s | PET {shown(safety.get('pet'))} s | "
-                                                 f"Trajectory Intersects {safety.get('intersects', False)} | "
-                                                 f"Heartbeat {shown(polls[-1] if polls else None, 0)} ms | Brake {'ON' if engaged else 'off'}")
-                if int(t * 10) % 10 == 0:
-                    self.console.tick("MQTT / DITTO", f"Broker {'connected' if self.mqtt.connected else 'NOT CONNECTED'} | "
-                                                      f"Topic {COMMAND_TOPIC} | Last brake latency {shown(self.mqtt.latency, 0)} ms")
+                self.console.status(live_table(title, t, (
+                    ("Target speed", f"{shown(state['target'] * 3.6, 1)} km/h"), ("Actual speed", f"{speed * 3.6:.1f} km/h"), ("Steering", f"{steer:+.2f}"),
+                    ("Throttle", f"{throttle * 100:.0f} %"), ("Brake pedal", f"{brake * 100:.0f} %"), ("Off lane", f"{driver.off_lane:.2f} m"),
+                    ("Min TTC", f"{shown(ttc)} s"), ("Path TTC", f"{shown(safety.get('path_ttc'))} s"), ("PET", f"{shown(safety.get('pet'))} s"),
+                    ("Safety brake", "ON" if engaged else "off"), ("Closest car", f"{shown(gap, 1)} m"), ("MQTT", "connected" if self.mqtt.connected else "NOT CONNECTED"))))
                 self.csv.writerow((f"{time.time():.3f}", test, f"{t:.2f}", f"{ego[0]:.2f}", f"{ego[1]:.2f}", f"{ego[4]:.1f}", f"{speed:.3f}",
                                    f"{state['target']:.3f}", f"{steer:.4f}", f"{throttle:.3f}", f"{brake:.3f}", f"{error:.3f}",
                                    int(state["model_driving"]), int(engaged), shown(ttc, 3), shown(safety.get("path_ttc"), 3),
@@ -870,8 +929,8 @@ class Suite:
             elif state["stopped"]:
                 state["stopped"] = False
                 state["go_ttc"] = ttc
-                self.console.line("SCENARIO", f"Set off with the next car {shown(ttc, 1)} s from the crossing, t={tick.t:.1f} s")
-                self.hud.event(f"Set off: next car {shown(ttc, 1)} s away")
+                if past > -5.0:  # not when it first pulls away, far from the turn
+                    self.hud.event(f"Set off with {next_car_text(ttc)}")
             clear = all(math.hypot(o[0] - tick.ego[0], o[1] - tick.ego[1]) > T2_CLEAR for o in tick.others.values())
             if tick.gate_on and tick.held_for >= BRAKE_HOLD and clear:
                 release_gate(self.session)
@@ -889,7 +948,7 @@ class Suite:
                                else (2, "Unprotected left turn and gap acceptance", "[TEST 2/5] UNPROTECTED LEFT TURN & GAP ACCEPTANCE"))
         result = self.run_stage(number, name, title, stop, LEFT, T2_LIMIT, on_tick,
                                 build, start=stop.previous(T2_START_BACK)[0])
-        result.notes.append(f"seed {self.seed}; waited {state['waited']:.1f} s with a car due; set off with {'no car due' if state['go_ttc'] is None or not math.isfinite(state['go_ttc']) else 'the next car ' + shown(state['go_ttc'], 1) + ' s away'}; "
+        result.notes.append(f"seed {self.seed}; waited {state['waited']:.1f} s with a car due; set off with {next_car_text(state['go_ttc'])}; "
                             f"closest oncoming car {shown(state['closest'], 1)} m; {result.brake_events} safety brakes")
         gave_way = state["waited"] >= T2_WAITED
         if light_change:
@@ -960,10 +1019,6 @@ class Suite:
                     self.hud.event("Speeding car launched through its red light")
             elif runner.id in tick.others:
                 other = tick.others[runner.id]
-                if int(tick.t * 10) % 10 == 0:
-                    self.console.line("SCENARIO", f"Speeding car at {math.hypot(other[2], other[3]):.1f} m/s, "
-                                                  f"{math.hypot(other[0] - my_path[my_index][0], other[1] - my_path[my_index][1]):.0f} m from the crossing; "
-                                                  f"ML car {my_index - nearest} m from it at {tick.speed:.1f} m/s, t={tick.t:.1f} s")
                 state["closest_runner"] = min(state["closest_runner"], rectangles_gap(outline(tick.ego[0], tick.ego[1], tick.ego[4]), outline(other[0], other[1], other[4])))
             if self.mqtt.heard_at is not None:
                 state["heard"] = True
@@ -1085,7 +1140,10 @@ def run_tests(carla, client, chosen, console, seed=0, repeat=1):
                 result.notes.append(f"couldn't run: {error}")
                 console.line("ALERT", f"Test {number} couldn't run: {error}")
             results.append(asdict(result))
-            console.line("SCENARIO", f"TEST {number}: {'PASS' if result.passed else 'FAIL'} {result.checks} {result.notes}")
+            console.end_status()
+            failed = [name.replace("_", " ") for name, ok in result.checks.items() if not ok]
+            console.line("ALERT" if not result.passed else "SCENARIO", f"TEST {number}: {'PASS' if result.passed else 'FAIL'}"
+                         + (f", failed: {', '.join(failed)}" if failed else "") + "".join(f" | {note}" for note in result.notes))
             suite.hud.event(f"TEST {number}: {'PASS' if result.passed else 'FAIL'}")
             for _ in range(20):
                 suite.world.wait_for_tick(TICK_TIMEOUT)
@@ -1097,7 +1155,7 @@ def run_tests(carla, client, chosen, console, seed=0, repeat=1):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--only", type=int, nargs="*", choices=(1, 2, 3, 4, 5), help="which tests to run; all five if left out")
-    parser.add_argument("--quiet", action="store_true", help="leave out the per-tick log lines")
+    parser.add_argument("--quiet", action="store_true", help="leave out the live table of values")
     parser.add_argument("--seed", type=int, help="picks test 2's traffic; different each time if left out")
     parser.add_argument("--repeat", type=int, default=1, help="run the tests this many times, saving only to output/repeat_results.json")
     parser.add_argument("--attached", action="store_true", help=argparse.SUPPRESS)
@@ -1132,6 +1190,7 @@ def main():
                   "Stops end with a short snap in the last moment, from CARLA's low-speed wheel physics rather than the model.",
                   json.loads(smooth_path.read_text(encoding="utf-8")) if smooth_path.exists() else None)
     passed = sum(r["passed"] for r in results)
+    console.plain("\n" + "\n".join(results_table(results)) + "\n")
     console.line("SCENARIO", f"Finished: {passed} of {len(results)} tests passed. See {OUTPUT_DIR / 'PROFESSOR_DEMO_SUMMARY.md'}")
     return 0 if passed == len(results) else 2
 

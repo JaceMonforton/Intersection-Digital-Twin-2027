@@ -12,6 +12,7 @@ Usage:
 import math
 import signal
 import sys
+import time
 
 import carla
 import numpy as np
@@ -19,13 +20,21 @@ import pygame
 import requests
 from driving_features import decode_inputs
 from model_panel import (
+    ALERT,
+    BACKGROUND,
+    DIM,
+    FONT,
+    LANE,
+    MARGIN,
+    ML,
+    OK,
     PANEL_HEIGHT,
     SAFETY_ADDRESSES,
     SUITE_ADDRESS,
+    TEXT,
     ModelPanel,
     TelemetryReceiver,
     control_status,
-    gauge_text,
     lane_to_pixels,
 )
 
@@ -38,25 +47,16 @@ ML_ROLE = "vehicle_ml"
 VIEW_WIDTH = 800
 VIEW_HEIGHT = 450
 DIVIDER = 4           # pixels between the two views
-BANNER_HEIGHT = 44    # pixels of status along the bottom
-TOP_HEIGHT = 70       # pixels of test title and gauges along the top
-LOG_HEIGHT = 96       # pixels of event log at the very bottom
-LOG_LINES = 4
+TOP_HEIGHT = 60       # pixels of title and status along the top
 CAMERA_FOV = "90"
 FPS = 30
+VALUE_REFRESH = 0.2   # seconds between updates of the panel's values, so that the numbers can be read
 
 # Where each camera sits, relative to the car: x forward, y right, z up (metres)
 FIRST_PERSON = {"location": {"x": 0.15, "y": -0.35, "z": 1.25}, "pitch": -3.0, "label": "1ST PERSON"}
 THIRD_PERSON = {"location": {"x": -6.5, "y": 0.0, "z": 2.8}, "pitch": -12.0, "label": "3RD PERSON"}
 
 GATE_POLL_SECONDS = 0.5
-TEXT_COLOR = (255, 255, 255)
-ML_COLOR = (255, 0, 255)
-BRAKE_COLOR = (255, 60, 60)
-OK_COLOR = (0, 220, 120)
-LANE_COLOR = (0, 220, 120)
-BANNER_COLOR = (20, 20, 20)
-BACKGROUND = (0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ def bgra_to_rgb(raw_data, width, height):
 
 
 def window_size():
-    return 2 * VIEW_WIDTH + DIVIDER, TOP_HEIGHT + VIEW_HEIGHT + PANEL_HEIGHT + BANNER_HEIGHT + LOG_HEIGHT
+    return 2 * VIEW_WIDTH + DIVIDER, TOP_HEIGHT + VIEW_HEIGHT + MARGIN + PANEL_HEIGHT
 
 
 def speed_from_positions(previous, current, seconds):
@@ -81,7 +81,7 @@ def speed_from_positions(previous, current, seconds):
 
 def status_text(speed, braking):
     state = "EMERGENCY BRAKE" if braking else "driving" if speed >= 0.5 else "stopped"
-    return f"{speed * 3.6:5.1f} km/h   {state}"
+    return f"{speed * 3.6:.1f} km/h   {state}"
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +117,9 @@ class MlCarView:
         self.display = pygame.display.set_mode(window_size())
         pygame.display.set_caption("ML Car View")
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Consolas", 20)
-        self.big_font = pygame.font.SysFont("Consolas", 26, bold=True)
+        self.label_font = pygame.font.SysFont(FONT, 13)
+        self.font = pygame.font.SysFont(FONT, 15)
+        self.big_font = pygame.font.SysFont(FONT, 19, bold=True)
 
         client = carla.Client(CARLA_HOST, CARLA_PORT)
         client.set_timeout(30.0)
@@ -134,6 +135,8 @@ class MlCarView:
         self.panel = ModelPanel(window_size()[0])
         self.receiver = TelemetryReceiver()
         self.telemetry = None
+        self.panel_telemetry = None
+        self.panel_refreshed = 0.0
         self.safety_receiver = TelemetryReceiver(SAFETY_ADDRESSES[1])
         self.suite_receiver = TelemetryReceiver(SUITE_ADDRESS)
         self.safety = None
@@ -180,58 +183,51 @@ class MlCarView:
     def _draw_view(self, camera, left):
         if camera.frame is not None:
             self.display.blit(pygame.surfarray.make_surface(camera.frame.swapaxes(0, 1)), (left, TOP_HEIGHT))
-        label = self.font.render(camera.label, True, TEXT_COLOR)
-        backing = pygame.Surface((label.get_width() + 16, label.get_height() + 8))
-        backing.set_alpha(170)
-        self.display.blit(backing, (left + 10, TOP_HEIGHT + 10))
-        self.display.blit(label, (left + 18, TOP_HEIGHT + 14))
         if self.telemetry is not None:
             # The route points the model is following this tick, on the camera image
             lane = decode_inputs(np.asarray(self.telemetry["inputs"], dtype=np.float32))["lane"]
             pixels = lane_to_pixels(lane, camera.spec, VIEW_WIDTH, VIEW_HEIGHT, float(CAMERA_FOV))
             self.display.set_clip((left, TOP_HEIGHT, VIEW_WIDTH, VIEW_HEIGHT))
             if len(pixels) >= 2:
-                pygame.draw.lines(self.display, LANE_COLOR, False, [(left + x, TOP_HEIGHT + y) for x, y in pixels], 3)
+                pygame.draw.lines(self.display, LANE, False, [(left + x, TOP_HEIGHT + y) for x, y in pixels], 2)
             self.display.set_clip(None)
+        label = self.label_font.render(camera.label, True, TEXT)
+        backing = pygame.Surface((label.get_width() + 14, label.get_height() + 6))
+        backing.set_alpha(120)
+        self.display.blit(backing, (left + 10, TOP_HEIGHT + 10))
+        self.display.blit(label, (left + 17, TOP_HEIGHT + 13))
 
     def _draw(self):
         self.display.fill(BACKGROUND)
         width, height = window_size()
         if not self.cameras:
-            message = self.big_font.render("Waiting for the ML car...", True, ML_COLOR)
+            message = self.big_font.render("Waiting for the ML car...", True, DIM)
             self.display.blit(message, message.get_rect(center=(width // 2, height // 2)))
         else:
             self._draw_view(self.cameras[0], 0)
             self._draw_view(self.cameras[1], VIEW_WIDTH + DIVIDER)
             self._draw_top(width)
-            self.panel.draw(self.display, TOP_HEIGHT + VIEW_HEIGHT, self.telemetry)
-            banner = TOP_HEIGHT + VIEW_HEIGHT + PANEL_HEIGHT
-            self._draw_log(width, banner + BANNER_HEIGHT)
-            pygame.draw.rect(self.display, BANNER_COLOR, (0, banner, width, BANNER_HEIGHT))
-            self.display.blit(self.big_font.render("ML CAR", True, ML_COLOR), (16, banner + 8))
-            color = BRAKE_COLOR if self.braking else OK_COLOR
-            self.display.blit(self.big_font.render(status_text(self.speed, self.braking), True, color),
-                              (160, banner + 8))
-            text, in_control = control_status(self.telemetry)
-            status = self.big_font.render(text, True, OK_COLOR if in_control else BRAKE_COLOR)
-            self.display.blit(status, (width - status.get_width() - 16, banner + 8))
+            self.panel.draw(self.display, TOP_HEIGHT + VIEW_HEIGHT + MARGIN, self.panel_telemetry, self.safety, self.suite["events"] if self.suite else ())
         pygame.display.flip()
 
     def _draw_top(self, width):
-        pygame.draw.rect(self.display, BANNER_COLOR, (0, 0, width, TOP_HEIGHT))
         title = self.suite["title"] if self.suite else "NORMAL DRIVING"
         mode = self.suite["mode"] if self.suite else "AI TARGET SPEED MODEL + PID"
-        self.display.blit(self.font.render(title, True, ML_COLOR), (12, 8))
-        control = self.font.render(mode, True, TEXT_COLOR)
-        self.display.blit(control, (width - control.get_width() - 12, 8))
-        self.display.blit(self.font.render(gauge_text(self.telemetry, self.safety), True, TEXT_COLOR), (12, 38))
+        self.display.blit(self.big_font.render(title, True, TEXT), (MARGIN, 7))
+        name = self.font.render("ML CAR", True, ML)
+        self.display.blit(name, (MARGIN, 34))
+        status = self.font.render(status_text(self.speed, self.braking), True, ALERT if self.braking else DIM)
+        self.display.blit(status, (MARGIN + name.get_width() + 14, 34))
+        text, in_control = control_status(self.telemetry)
+        control = self.big_font.render(text, True, OK if in_control else DIM if self.telemetry is None else ALERT)  # between tests isn't an alarm
+        self.display.blit(control, (width - control.get_width() - MARGIN, 7))
+        rendered_mode = self.font.render(mode, True, DIM)
+        self.display.blit(rendered_mode, (width - rendered_mode.get_width() - MARGIN, 34))
 
-    def _draw_log(self, width, top):
-        pygame.draw.rect(self.display, BACKGROUND, (0, top, width, LOG_HEIGHT))
-        events = self.suite["events"] if self.suite else []
-        for i, line in enumerate(events[-LOG_LINES:]):
-            color = BRAKE_COLOR if "SAFETY GATE" in line or "COLLISION" in line or "FAIL" in line else TEXT_COLOR
-            self.display.blit(self.font.render(line, True, color), (12, top + 4 + i * 23))
+    def _refresh_panel(self, now):
+        """Only ever real values: the newest is taken five times a second, and losing it shows straight away."""
+        if self.telemetry is None or now - self.panel_refreshed >= VALUE_REFRESH:
+            self.panel_telemetry, self.panel_refreshed = self.telemetry, now
 
     def run(self):
         print("[VIEW] Waiting for the ML car. Close the window to exit.", flush=True)
@@ -243,6 +239,7 @@ class MlCarView:
             self.telemetry = self.receiver.poll()
             self.safety = self.safety_receiver.poll()
             self.suite = self.suite_receiver.poll() or self.suite
+            self._refresh_panel(time.monotonic())
             try:
                 snapshot = self.world.wait_for_tick(0.2)
             except RuntimeError:

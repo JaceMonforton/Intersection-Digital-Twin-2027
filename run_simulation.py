@@ -256,7 +256,7 @@ def tail(path, lines=15):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--free-drive", action="store_true", help="normal driving in traffic instead of the five tests")
-    parser.add_argument("--quiet", action="store_true", help="leave out the test suite's per-tick log lines")
+    parser.add_argument("--quiet", action="store_true", help="leave out the test suite's live table of values")
     parser.add_argument("--no-view", action="store_true", help="don't open the ML car's split-screen window")
     parser.add_argument("--traffic", type=int, default=15, metavar="N", help="how many other vehicles")
     parser.add_argument("--walkers", type=int, default=8, help="how many pedestrians")

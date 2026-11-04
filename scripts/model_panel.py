@@ -21,27 +21,33 @@ SAFETY_ADDRESSES = (("127.0.0.1", 47802), ("127.0.0.1", 47803))  # the test suit
 SUITE_ADDRESS = ("127.0.0.1", 47804)  # the test suite to the window: the title and the event log
 STALE_SECONDS = 1.0      # with nothing newer than this, the panel says it has no data
 
-PANEL_HEIGHT = 240
-MARGIN = 16
+PANEL_HEIGHT = 284
+MARGIN = 12              # around and between the cards
+PADDING = 16             # inside a card
+CARD_SHARES = (0.25, 0.19, 0.27, 0.29)  # of the width: sees, road, decides, safety
 MAP_SCALE = 4.0          # pixels per metre
 MAP_BEHIND = 8.0         # metres of road shown behind the car
-BAR_WIDTH = 380
-BAR_HEIGHT = 22
+BAR_HEIGHT = 8
 TARGET_BAR_FULL = 10.0   # m/s at the end of the target speed bar
+FONT = "segoeui,arial"
+ROW_HEIGHT = 36
+EVENT_LINE_HEIGHT = 19
 
-TEXT = (235, 235, 235)
-DIM = (140, 140, 140)
-PANEL = (24, 24, 28)
-MAP_BACK = (12, 12, 14)
-ML = (255, 0, 255)
-LANE = (0, 220, 120)
-CAR = (120, 170, 255)
-WALKER = (255, 170, 40)
-THROTTLE = (0, 220, 120)
-BRAKE = (255, 60, 60)
-STEER = (120, 170, 255)
-TARGET = (255, 220, 90)
-BAR_BACK = (55, 55, 60)
+# Quiet by default: one accent colour, and red only when something is wrong
+TEXT = (222, 224, 228)
+DIM = (136, 140, 148)
+BACKGROUND = (16, 17, 20)
+PANEL = (26, 27, 32)
+MAP_BACK = (17, 18, 21)
+ACCENT = (108, 150, 196)
+OK = (98, 176, 136)
+ALERT = (222, 92, 88)
+ML = (186, 96, 186)
+LANE = (98, 176, 136)
+CAR = ACCENT
+WALKER = (204, 158, 88)
+BAR_BACK = (46, 48, 54)
+
 ROUTE_NAMES = {LEFT: "LEFT", RIGHT: "RIGHT"}
 
 
@@ -146,19 +152,29 @@ def seen_lines(seen):
     ]
 
 
-def gauge_text(telemetry, safety):
-    """The top banner's gauges, from real values, with n/a where there's nothing to show."""
-    actual = target = steer = None
-    if telemetry is not None:
-        actual, target, steer = float(telemetry["inputs"][0]), float(telemetry["output"][1]), float(telemetry["applied"][0])
+def safety_lines(safety):
+    """What the safety checks say, from real values, with n/a where there's nothing to show."""
     ttc = safety.get("ttc") if safety else None
-    engaged = bool(safety and safety.get("engaged"))
+    return [("Min TTC", f"{ttc:.2f} s" if ttc is not None and math.isfinite(ttc) else "n/a"),
+            ("Safety brake", "ON" if safety and safety.get("engaged") else "off")]
 
-    def kmh(value):
-        return "n/a" if value is None or not math.isfinite(value) else f"{value * 3.6:.0f}"
 
-    return (f"Target {kmh(target)} / Actual {kmh(actual)} km/h   Steer {'n/a' if steer is None else f'{steer:+.2f}'}   "
-            f"Min TTC {'n/a' if ttc is None else f'{ttc:.2f} s'}   Brake {'ON' if engaged else 'off'}")
+def is_alert(event):
+    return "SAFETY GATE" in event or "COLLISION" in event or "FAIL" in event
+
+
+def wrap_text(text, measure, width):
+    """Text split into lines no wider than width, breaking between words. measure gives a string's width."""
+    lines = []
+    line = ""
+    for word in text.split():
+        joined = f"{line} {word}" if line else word
+        if line and measure(joined) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = joined
+    return [*lines, line] if line else lines
 
 
 def control_status(telemetry):
@@ -177,38 +193,49 @@ class ModelPanel:
 
         self.pygame = pygame
         self.width = width
-        self.title = pygame.font.SysFont("Consolas", 20, bold=True)
-        self.font = pygame.font.SysFont("Consolas", 19)
-        self.small = pygame.font.SysFont("Consolas", 15)
+        self.title = pygame.font.SysFont(FONT, 15, bold=True)
+        self.font = pygame.font.SysFont(FONT, 16)
+        self.small = pygame.font.SysFont(FONT, 13)
 
-    def draw(self, surface, top, telemetry):
+    def draw(self, surface, top, telemetry, safety=None, events=()):
         pygame = self.pygame
-        column = self.width // 3
-        pygame.draw.rect(surface, PANEL, (0, top, self.width, PANEL_HEIGHT))
-        self._text(surface, "WHAT THE MODEL SEES", MARGIN, top + 10, self.title, TEXT)
-        self._text(surface, "ITS VIEW OF THE ROAD", column + MARGIN, top + 10, self.title, TEXT)
-        self._text(surface, "WHAT THE MODEL DECIDES", 2 * column + MARGIN, top + 10, self.title, TEXT)
+        pygame.draw.rect(surface, BACKGROUND, (0, top, self.width, PANEL_HEIGHT))
+        room = self.width - MARGIN * (len(CARD_SHARES) + 1)
+        x = MARGIN
+        cards = []
+        for share, title in zip(CARD_SHARES, ("What the model sees", "Its view of the road", "What the model decides", "Safety and events")):
+            card = pygame.Rect(x, top, int(share * room), PANEL_HEIGHT - MARGIN)
+            pygame.draw.rect(surface, PANEL, card, border_radius=8)
+            self._text(surface, title, card.x + PADDING, card.y + 12, self.title, DIM)
+            cards.append(card)
+            x = card.right + MARGIN
+        self._draw_safety(surface, cards[3], safety, events)
         if telemetry is None:
-            self._text(surface, "Waiting for live values from the driver...", MARGIN, top + 50, self.font, DIM)
+            self._text(surface, "Waiting for live values from the driver...", cards[0].x + PADDING, cards[0].y + 46, self.font, DIM)
             return
         seen = decode_inputs(np.asarray(telemetry["inputs"], dtype=np.float32))
-        self._draw_seen(surface, MARGIN, top + 44, seen)
-        self._draw_map(surface, column + MARGIN, top + 38, column - 2 * MARGIN, PANEL_HEIGHT - 48, seen)
-        self._draw_decision(surface, 2 * column + MARGIN, top + 44, telemetry)
+        self._draw_seen(surface, cards[0], seen)
+        self._draw_map(surface, cards[1], seen)
+        self._draw_decision(surface, cards[2], telemetry)
 
     def _text(self, surface, text, x, y, font, color):
         surface.blit(font.render(text, True, color), (x, y))
 
-    def _draw_seen(self, surface, x, y, seen):
-        for i, (name, value) in enumerate(seen_lines(seen)):
-            self._text(surface, name, x, y + i * 34, self.font, DIM)
-            self._text(surface, value, x + 250, y + i * 34, self.font, TEXT)
+    def _row(self, surface, card, y, name, value, color=TEXT):
+        """A name on the left and its value lined up on the right of the card."""
+        self._text(surface, name, card.x + PADDING, y, self.font, DIM)
+        rendered = self.font.render(value, True, color)
+        surface.blit(rendered, (card.right - PADDING - rendered.get_width(), y))
 
-    def _draw_map(self, surface, x, y, width, height, seen):
+    def _draw_seen(self, surface, card, seen):
+        for i, (name, value) in enumerate(seen_lines(seen)):
+            self._row(surface, card, card.y + 44 + i * ROW_HEIGHT, name, value)
+
+    def _draw_map(self, surface, card, seen):
         """The model's inputs from above, always facing up: x forward, y left."""
         pygame = self.pygame
-        area = pygame.Rect(x, y, width, height)
-        pygame.draw.rect(surface, MAP_BACK, area)
+        area = pygame.Rect(card.x + PADDING, card.y + 40, card.width - 2 * PADDING, card.height - 76)
+        pygame.draw.rect(surface, MAP_BACK, area, border_radius=4)
         previous_clip = surface.get_clip()
         surface.set_clip(area)
         centre_x, ego_y = area.centerx, area.bottom - MAP_BEHIND * MAP_SCALE
@@ -216,53 +243,74 @@ class ModelPanel:
         def at(forward, left):
             return centre_x - left * MAP_SCALE, ego_y - forward * MAP_SCALE
 
-        pygame.draw.lines(surface, LANE, False, [at(*point) for point in seen["lane"]], 3)
+        pygame.draw.lines(surface, LANE, False, [at(*point) for point in seen["lane"]], 2)
         if seen["stop_gap"] is not None:
             # Along the route, so its place on the lane is found by walking the points
             line = _point_along(seen["lane"], seen["stop_gap"])
-            pygame.draw.line(surface, BRAKE, at(line[0], line[1] + 2.0), at(line[0], line[1] - 2.0), 3)
+            pygame.draw.line(surface, ALERT, at(line[0], line[1] + 2.0), at(line[0], line[1] - 2.0), 2)
         for car in seen["cars"]:
             left_edge, top_edge = at(car[0] + 2.25, car[1] + 1.0)
-            pygame.draw.rect(surface, CAR, (left_edge, top_edge, 2.0 * MAP_SCALE, 4.5 * MAP_SCALE), 2)
+            pygame.draw.rect(surface, CAR, (left_edge, top_edge, 2.0 * MAP_SCALE, 4.5 * MAP_SCALE), 1)
             pygame.draw.line(surface, CAR, at(car[0], car[1]), at(car[0] + car[2], car[1] + car[3]), 1)
         for walker in seen["walkers"]:
-            pygame.draw.circle(surface, WALKER, at(walker[0], walker[1]), 4)
+            pygame.draw.circle(surface, WALKER, at(walker[0], walker[1]), 3)
         left_edge, top_edge = at(2.25, 1.0)
         pygame.draw.rect(surface, ML, (left_edge, top_edge, 2.0 * MAP_SCALE, 4.5 * MAP_SCALE))
         surface.set_clip(previous_clip)
-        legend = [("route", LANE), ("cars", CAR), ("people", WALKER), ("red line", BRAKE)]
-        offset = 8
-        for name, color in legend:
-            self._text(surface, name, x + offset, y + 6, self.small, color)
+        offset = 0
+        for name, color in (("route", LANE), ("cars", CAR), ("people", WALKER), ("red line", ALERT)):
+            self._text(surface, name, area.x + offset, area.bottom + 7, self.small, color)
             offset += self.small.size(name)[0] + 14
 
-    def _draw_decision(self, surface, x, y, telemetry):
+    def _draw_decision(self, surface, card, telemetry):
         pygame = self.pygame
         steer, throttle, brake = telemetry["applied"]
         target = float(telemetry["output"][1])
         side = "right" if steer > 0.0 else "left" if steer < 0.0 else "centre"
-        self._text(surface, f"Steering  {abs(steer):.2f} {side}", x, y, self.font, TEXT)
-        bar = pygame.Rect(x, y + 26, BAR_WIDTH, BAR_HEIGHT)
-        pygame.draw.rect(surface, BAR_BACK, bar)
-        pygame.draw.line(surface, TEXT, (bar.centerx, bar.top - 3), (bar.centerx, bar.bottom + 2), 2)
-        extent = int(abs(steer) * BAR_WIDTH / 2)
-        pygame.draw.rect(surface, STEER, (bar.centerx if steer > 0.0 else bar.centerx - extent, bar.top, extent, BAR_HEIGHT))
+        x, y, width = card.x + PADDING, card.y + 44, card.width - 2 * PADDING
+
+        self._row(surface, card, y, "Steering", f"{abs(steer):.2f} {side}")
+        pygame.draw.rect(surface, BAR_BACK, (x, y + 26, width, BAR_HEIGHT), border_radius=4)
+        extent = int(abs(steer) * width / 2)
+        pygame.draw.rect(surface, ACCENT, (x + width // 2 if steer > 0.0 else x + width // 2 - extent, y + 26, extent, BAR_HEIGHT))
+        pygame.draw.line(surface, TEXT, (x + width // 2, y + 23), (x + width // 2, y + 26 + BAR_HEIGHT + 2), 1)
+
         shown = f"{target * 3.6:.1f} km/h" if math.isfinite(target) else "invalid"
-        self._text(surface, f"Target speed  {shown}", x, y + 56, self.font, TEXT)
-        pygame.draw.rect(surface, BAR_BACK, (x, y + 82, BAR_WIDTH, BAR_HEIGHT))
+        self._row(surface, card, y + 50, "Target speed", shown)
+        pygame.draw.rect(surface, BAR_BACK, (x, y + 76, width, BAR_HEIGHT), border_radius=4)
         filled = max(0.0, min(1.0, target / TARGET_BAR_FULL)) if math.isfinite(target) else 0.0
-        pygame.draw.rect(surface, TARGET, (x, y + 82, int(filled * BAR_WIDTH), BAR_HEIGHT))
-        half = BAR_WIDTH // 2 - 6
-        self._text(surface, f"Throttle {throttle:.2f}", x, y + 112, self.small, DIM)
-        pygame.draw.rect(surface, BAR_BACK, (x, y + 132, half, 12))
-        pygame.draw.rect(surface, THROTTLE, (x, y + 132, int(throttle * half), 12))
-        self._text(surface, f"Brake {brake:.2f}", x + half + 12, y + 112, self.small, DIM)
-        pygame.draw.rect(surface, BAR_BACK, (x + half + 12, y + 132, half, 12))
-        pygame.draw.rect(surface, BRAKE, (x + half + 12, y + 132, int(brake * half), 12))
+        pygame.draw.rect(surface, ACCENT, (x, y + 76, int(filled * width), BAR_HEIGHT), border_radius=4)
+
+        half = width // 2 - 8
+        self._text(surface, f"Throttle {throttle:.2f}", x, y + 100, self.small, DIM)
+        pygame.draw.rect(surface, BAR_BACK, (x, y + 122, half, BAR_HEIGHT), border_radius=4)
+        pygame.draw.rect(surface, ACCENT, (x, y + 122, int(throttle * half), BAR_HEIGHT), border_radius=4)
+        self._text(surface, f"Brake {brake:.2f}", x + half + 16, y + 100, self.small, DIM)
+        pygame.draw.rect(surface, BAR_BACK, (x + half + 16, y + 122, half, BAR_HEIGHT), border_radius=4)
+        pygame.draw.rect(surface, ALERT, (x + half + 16, y + 122, int(brake * half), BAR_HEIGHT), border_radius=4)
+
         if telemetry["model_driving"]:
-            self._text(surface, "A fixed controller sets these pedals to reach the target.", x, y + 154, self.small, DIM)
+            self._text(surface, "A fixed controller sets these pedals to reach the target.", x, y + 146, self.small, DIM)
         else:
-            self._text(surface, "What the model wants: the safety brake is overriding it.", x, y + 154, self.small, BRAKE)
+            self._text(surface, "What the model wants: the safety brake is overriding it.", x, y + 146, self.small, ALERT)
+
+    def _draw_safety(self, surface, card, safety, events):
+        x, width = card.x + PADDING, card.width - 2 * PADDING
+        y = card.y + 44
+        for name, value in safety_lines(safety):
+            self._row(surface, card, y, name, value, ALERT if value == "ON" else TEXT)
+            y += 28
+        self._text(surface, "Recent events", x, y + 6, self.title, DIM)
+        y += 30
+        room = (card.bottom - y - 8) // EVENT_LINE_HEIGHT
+        lines = []
+        for event in events:
+            lines += [(line, is_alert(event)) for line in wrap_text(event, lambda t: self.small.size(t)[0], width)]
+        if not lines:
+            self._text(surface, "None yet", x, y, self.small, DIM)
+        for i, (line, alert) in enumerate(lines[-room:]):  # the newest, when they don't all fit
+            self._text(surface, line, x, y + i * EVENT_LINE_HEIGHT, self.small, ALERT if alert else TEXT)
+
 
 def _point_along(lane, distance):
     """The (x, y) this far along a polyline, or its end."""
