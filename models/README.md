@@ -11,7 +11,7 @@ README. It predicts the ML car's path, for both its line and the brake. Other ca
 | ---- | ------- | ---------- |
 | `waymo_trajectory.onnx` | `scripts/waymo_predictor_node.py` | Follows the road at the current speed |
 | `rsu_detector.onnx` | `scripts/central_gpu_processor.py` | CARLA ground-truth actor positions and boxes |
-| `driving_policy.onnx` | The ML car's driver (being built) | Refuses to run: there is no stand-in, so nothing can be mistaken for model driving |
+| `driving_policy.onnx` | The ML car's driver, `scripts/ml_driver.py` | Refuses to run: there is no stand-in, so nothing can be mistaken for model driving |
 
 ## `driving_policy.onnx`
 

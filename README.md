@@ -15,7 +15,7 @@
 
 *An unsafe left turn, from the earlier scripted no-traffic run. The safety brake stops the magenta ML car 0.21 m from the oncoming car, which passes, and then it finishes the turn.*
 
-[What it does](#what-it-does) · [Run it](#run-it) · [Test results](#test-results) · [How it works](#how-it-works) · [Project status](#project-status) · [Limitations](#known-limitations) · [Training](#train-the-driving-model)
+[What it does](#what-it-does) · [Run it](#run-it) · [Test results](#test-results) · [Roadside detection](#roadside-detection) · [How it works](#how-it-works) · [Project status](#project-status) · [Limitations](#known-limitations) · [Training](#train-the-driving-model)
 
 </div>
 
@@ -28,7 +28,7 @@ You can't stage near-collisions on a real road, so this project studies them in 
 Running it builds five test situations at an intersection in CARLA's Town10. The magenta **ML car** is driven by a trained model, which chooses its steering and target speed, with a fixed PID controller working the pedals. In normal driving the other cars are CARLA's autopilot; the hazard cars in the tests are scripted. While that happens, the system:
 
 - **Tracks every vehicle** at `Town10_Intersection_01` from an overhead gantry, keeping the ML car's state in an Eclipse Ditto digital twin.
-- **Can use a roadside detector instead of CARLA's true positions.** [Two corner LiDARs and a trained model](#roadside-detection) tell the ML car about what it can't see for itself. This is opt-in.
+- **Can use a roadside detector instead of CARLA's true positions.** [Two corner LiDARs and a trained model](#roadside-detection) tell the ML car about what it can't see for itself. This is opt-in, and [a live window](#see-the-lidars-working) shows what the LiDARs see.
 - **Predicts each vehicle's next 3 seconds.** The ML car uses a [model trained on Waymo data](#train-the-trajectory-model) (the magenta line) and the other cars follow the road (the red lines).
 - **Scores the risk** with surrogate safety metrics: time-to-collision (TTC), post-encroachment time (PET) and deceleration rate to avoid a crash (DRAC).
 - **Brakes the ML car** when a collision is predicted, sending the command through Ditto and MQTT to a safety gate that cuts the motors. In the simulation those motors are simulated.
@@ -105,9 +105,10 @@ Results go to `output/PROFESSOR_DEMO_SUMMARY.md` and `output/PROFESSOR_TEST_SUIT
 | Option | What it does |
 | ------ | ------------ |
 | `--free-drive` | Normal driving in traffic instead of the five tests |
-| `--seconds 120` | With `--free-drive`, how long to drive; 0 runs until Ctrl+C |
+| `--seconds 120` | With `--free-drive`, how long to drive, which defaults to 300 simulated seconds; 0 runs until Ctrl+C |
 | `--traffic 30` and `--walkers 15` | With `--free-drive`, changes the traffic, which defaults to 15 cars and 8 pedestrians |
-| `--roadside` | Runs the five tests on the [roadside detector](#roadside-detection) and the car's own LiDAR, instead of CARLA's true positions |
+| `--roadside` | Runs the five tests on the [roadside detector](#roadside-detection) and the car's own LiDAR, instead of CARLA's true positions. It can't be combined with `--free-drive`; [these commands](#run-it-1) drive in traffic with it |
+| `--lidar-view` | With `--roadside`, opens a [window of what the two LiDARs see](#see-the-lidars-working) |
 | `--quiet` | Leaves out the test suite's live table of values |
 | `--no-view` | Doesn't open the ML car's window |
 | `--seed 1` | Spawns traffic the same way each run |
@@ -231,6 +232,7 @@ flowchart LR
     R["Car's own roof LiDAR"] --> C
     T --> S["SafetyEngine<br/>TTC and path checks"]
     S -->|"Ditto and MQTT"| B["Safety gate"]
+    M -.->|"shared memory, with --lidar-view"| V["LiDAR window<br/>display only"]
 ```
 
 | What a LiDAR sees from its pole | A sweep's true boxes (left) and detected boxes (right) |
@@ -396,6 +398,23 @@ python scripts/ml_driver.py --perception rsu
 
 If the gate fires, release it with `python scripts/setup_entities.py --clear-brake`.
 
+### See the LiDARs working
+
+```powershell
+python run_simulation.py --roadside --lidar-view
+```
+
+This runs the five tests and opens a top-down window of the sweeps the processor is really using. To use it while driving in traffic, add `--lidar-view` to the processor's command above and run `python scripts/lidar_view.py`. Esc closes the window and leaves the simulation running.
+
+<p align="center"><img src="docs/images/lidar_view.png" width="760" alt="The live LiDAR window. Blue and orange points from the two LiDARs spread out from their poles over the junction. Two cars have a white true box and a green detected box. A small pink detected-person box sits on the kerb by the blue pole, with no true box. The side panel gives each LiDAR's points, sweeps per second and last sweep, and the detected and true counts."></p>
+
+- **Colours:** each LiDAR's points keep their own colour, from the sensor that produced them. Dim points are the road, and bright ones are above it.
+- **Boxes:** white is CARLA's true box, and grey is a true box with under 3 LiDAR points on it. Green is a detected vehicle and pink a detected person. A white box with nothing inside is a miss, and a coloured box on its own is a false detection, like the pink one in this image.
+- **Health:** the panel measures each LiDAR's points and sweeps per second, and turns red if a sweep is late. It says `NO NEW SWEEPS` after 2 s without one, and `Waiting for the processor` until the feed exists.
+- **Keys:** 1 or 2 hides a LiDAR's points, which shows what the other one covers. That only changes the window, and the detector still gets both.
+
+It reads the sweeps through shared memory, so it can't hold up the clock, and the true boxes are only for comparing by eye. In 30 cars with no ML car window, the simulation ran at 9.95 ticks per second without the feed, 9.76 with it, and 9.71 with the window open too, as the mean of two 60 s runs each.
+
 ### Reproduce the measurements
 
 Each of these needs CARLA to itself. Results go under `output/`, and the copies behind this page are in [docs/results](docs/results), including each version's tick-by-tick telemetry as `rsu_telemetry_<version>.csv`.
@@ -534,9 +553,18 @@ training/
   record_left_turns.py        Records left-turn lessons from a time-to-collision rule
   train_left_turns.py         Adds them to the frozen general driver as a left-only correction
   pass_test.py                The 10-run pass test against autopilot
+  check_lidar_coverage.py     Measures what the corner LiDARs can see
+  record_detection.py         Records their sweeps with true boxes, for the roadside detector
+  train_detection.py          Trains the roadside detector
+  eval_detection.py           Scores it on recorded sweeps
+  eval_tracking.py            Scores its live tracks against the truth
+  make_charts.py              Draws this page's charts from docs/results
   convert_waymo.py, train_trajectory.py    Trains the trajectory model
 scripts/
   run_professor_test_suite.py The five tests and their reports
+  run_rsu_comparison.py       The three-way hidden hazard comparison
+  roadside_link.py            What the ML car is told: true positions, roadside tracks or own sight
+  detection_features.py       The roadside detector's inputs, outputs and labels
   ml_driver.py                Drives the ML car from the model, and its driving report
   driving_features.py         The model's inputs and outputs, and the PID controller
   model_panel.py              The window's cards, and the live values sent to it
@@ -546,6 +574,7 @@ scripts/
   traffic_left_turn.py        Earlier scripted safe vs unsafe left turn across real traffic
   traffic_monitor.py          The ML car in normal traffic, its lane and route logic, and the traffic report
   ml_car_view.py              Split-screen window following the ML car
+  lidar_view.py               Top-down window of what the two roadside LiDARs see
   left_turn_scenario.py       Earlier scripted left turn with no traffic, and its analysis
   setup_entities.py           Provisions Ditto from config/
   ditto_carla_agent.py        Mirrors one Thing into CARLA, with a chase camera
@@ -555,6 +584,7 @@ tests/               Unit tests and the end-to-end latency benchmark
 hardware/            KUKSA to Ditto publisher, for physical vehicles
 bridge/              Older standalone Ditto to CARLA sync
 docs/images/         The pictures on this page
+docs/results/        The measurements behind the roadside results
 ```
 
 </details>
@@ -602,6 +632,7 @@ Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.ht
 | Split-screen ML car window | **Working**, showing the model's real inputs and outputs |
 | Path prediction | **Working.** The ML car uses a [model trained on Waymo data](#train-the-trajectory-model), falling back to road-following without it. Other cars follow the road |
 | Roadside detection | **Working in simulation, opt-in with `--roadside`.** The default still uses CARLA's true positions, [for these reasons](#why-it-isnt-the-default). Trained and tested on this one junction |
+| LiDAR window | **Working** with `--roadside`. It's only a display, and costs about 2% of the tick rate |
 | Physical vehicles (Rosmaster R2, KUKSA) | **Written, not yet run on hardware.** The motor drivers and KUKSA publisher have never run |
 | Fully autonomous physical vehicle (Autoware) | **Not started.** Planned last |
 | Lab-to-CARLA coordinate mapping, SkyEye view, Kafka logging, AI recommendations | **Not started** |
@@ -613,11 +644,11 @@ These are the targets from the project report, against what has been measured so
 | Requirement | Target | Measured so far |
 | ----------- | ------ | --------------- |
 | End-to-end latency (REQ-SYS-002) | At most 100 ms, sensor to CARLA rendering | About 60 ms (p95) from Ditto write to simulated motor cut, on one machine. The sensor-to-rendering path isn't measured |
-| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) | 10.0 Hz simulation tick, at real-time speed with 15 cars |
+| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) | 10.0 Hz simulation tick, at real-time speed with 15 cars. It fell to about 2 Hz in a `--roadside --lidar-view` run of the five tests, with both windows open |
 | Safety metrics (REQ-SYS-011) | TTC and headway; flag TTC under 1.5 s | TTC, PET and DRAC done, and the 1.5 s flag works. Headway isn't implemented |
 | Telemetry payload (REQ-SYS-001) | Full state vector, JSON over MQTT/HTTP | Position and velocity only |
 | Position and heading accuracy (REQ-SYS-004, 005) | Within 5 cm and 2 degrees | Not measured; needs physical vehicles |
-| Bird's-eye rendering (REQ-SYS-006, 007) | At least 30 FPS, at most 100 ms delay | Not measured |
+| Bird's-eye rendering (REQ-SYS-006, 007) | At least 30 FPS, at most 100 ms delay | **Not met for FPS.** CARLA draws one frame per tick, so 10 FPS at most. The delay isn't measured |
 | Scalability (REQ-SYS-008, 009) | 10 vehicles within 150 ms | Not measured |
 | Logging (REQ-SYS-010) | 10 Hz, UTC timestamps at 1 ms precision | Scenario data only, in simulation time |
 
@@ -636,6 +667,9 @@ These are the targets from the project report, against what has been measured so
 - **Pedestrians where the sensors see little are at risk.** 2 m past the stop line, where a person gets 0 to 3 LiDAR points and none were recorded, the car using roadside tracks alone hit them in 4 of 5 runs. On the marked crossing it was none in 5. That spot hasn't been retested with the car's own LiDAR added.
 - **The comparison tells the car where its containers are.** A stopped car close to one is dropped from what the car is told, because the detector calls containers cars and the car would queue behind them forever. A real unit would have to learn its background. The safety gate still receives those tracks.
 - **The link from the roadside unit is local UDP,** with no loss handling or signing. A real one needs a V2X radio. If its tracks go stale the car brakes.
+- **The simulation is built around 10 Hz.** The models, the speed controller and the LiDAR sweeps all assume a 0.1 s tick, so a faster tick isn't a one-line change, and every result here would need measuring again.
+- **The five tests can run well below 10 Hz.** One `--roadside --lidar-view` run held about 2 ticks per second. The LiDAR feed costs about 2%, so it isn't the cause, and the ML car window's cameras are the main suspect, but that hasn't been measured. Other setups haven't been timed during the tests.
+- **The detector can see a person who isn't there.** The LiDAR window showed a stationary false person on the kerb by one pole. It doesn't move, so it shouldn't set off the safety gate. Whether it becomes a track that changes how the car drives hasn't been checked.
 - **The server crashed once** during the roadside work, with exit code 3 and no crash log. The cause wasn't found.
 - **More traffic is less stable.** At 40 cars, the brake's repeated stops could strand the ML car in the junction and cause contact. The default of 15 didn't.
 - **In the earlier scripted left turns the ML car isn't physics-driven.** They move it directly along its plan. When the model drives, it uses real physics.
@@ -746,11 +780,14 @@ The road-following figure is a best case, scored along the lane the car really t
 
 ```powershell
 pytest
+ruff check .
 ```
+
+CI runs both on every push and pull request to `main`, on Ubuntu with no CARLA or Docker stack.
 
 | Test file | Needs |
 | --------- | ----- |
-| `test_safety_logic.py`, `test_left_turn.py`, `test_ml_driving.py`, `test_traffic_monitor.py`, `test_driving_features.py`, `test_ml_driver.py`, `test_model_panel.py`, `test_pass_test.py`, `test_professor_suite.py`, `test_record_driving.py`, `test_record_corrections.py`, `test_record_left_turns.py`, `test_lidar_coverage.py`, `test_detection_features.py`, `test_roadside_link.py` | Nothing running. Some need `paho` or `pygame`, and skip themselves without them |
+| `test_safety_logic.py`, `test_left_turn.py`, `test_ml_driving.py`, `test_traffic_monitor.py`, `test_driving_features.py`, `test_ml_driver.py`, `test_model_panel.py`, `test_pass_test.py`, `test_professor_suite.py`, `test_record_driving.py`, `test_record_corrections.py`, `test_record_left_turns.py`, `test_lidar_coverage.py`, `test_detection_features.py`, `test_roadside_link.py`, `test_lidar_view.py` | Nothing running. Some need `paho` or `pygame`, and skip themselves without them |
 | `test_agent_brake.py`, `test_ml_car_view.py` | The `carla` and `pygame` packages; skip themselves without them |
 | `test_training_data.py`, `test_train_driving.py`, `test_detection_training.py` | Nothing running. Their model tests need PyTorch, and skip themselves without it |
 | `test_mqtt_pipeline.py` | The Docker stack, not CARLA. Skips itself when the stack is down, as on CI, and resets Thing state. Add `-s` to see the timings |
@@ -770,6 +807,13 @@ Check `output/logs/`, which has a log for each background script. A CARLA client
 <summary><b>A test fails or times out, or a port is already in use</b></summary>
 
 Check that only one copy is running. A second `run_simulation.py` on the same CARLA stops with `Only one usage of each socket address`, and on its way out it can make the first copy's test fail, as happened to a cut-in test that lost its lane. Run it again on its own.
+
+</details>
+
+<details>
+<summary><b>The LiDAR window says it's waiting, or won't start</b></summary>
+
+The window needs a processor running with a detector and `--lidar-view`. Through the launcher, `--lidar-view` needs `--roadside`, and `--roadside` can't be used with `--free-drive`. To drive in traffic with the window, [start the parts yourself](#see-the-lidars-working). AI-driven pedestrians appear only as grey true boxes, because a LiDAR passes through them.
 
 </details>
 

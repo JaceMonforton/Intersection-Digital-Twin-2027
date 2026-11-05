@@ -89,6 +89,28 @@ def load_sweep(path):
         return data["points"].astype(np.float32) / POINT_SCALE, data["labels"]
 
 
+def labels_for(actors, snapshot, center, points=None):
+    """A label for each actor in the grid, read from the snapshot so that it's the sweep's own frame. Without
+    points, each label's point count stays 0, as counting them takes too long for every tick."""
+    rows = []
+    for actor in actors:
+        state = snapshot.find(actor.id)
+        if state is None:
+            continue
+        tf, box = state.get_transform(), actor.bounding_box
+        c = tf.transform(box.location)
+        offset = (c.x - center.x, c.y - center.y, c.z - center.z)
+        if max(abs(offset[0]), abs(offset[1])) >= GRID_HALF:
+            continue
+        v = state.get_velocity()
+        kind = PEDESTRIAN if actor.type_id.startswith("walker.") else VEHICLE
+        row = label_row(offset, (box.extent.x, box.extent.y, box.extent.z), tf.rotation.yaw, (v.x, v.y), kind)
+        if points is not None:
+            row[8] = count_points(row, points)
+        rows.append(row)
+    return rows
+
+
 def _gaussian(row, column, sigma):
     """A patch of a Gaussian that peaks at 1 in the cell (row, column), as (rows, columns, values), cut to fit."""
     reach = math.ceil(3 * sigma)

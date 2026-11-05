@@ -34,6 +34,7 @@ from detection_features import (
     MODEL_GROUND_Z,
     PEDESTRIAN,
     decode,
+    labels_for,
     rasterize,
 )
 from model_panel import SafetySender
@@ -758,16 +759,22 @@ def _sweep_for(sweeps, frame, exact=False):
     return None
 
 
-def merged_sweep(lidars, frame, exact=False):
-    """Every LiDAR's sweep from this tick as one cloud in the model's frame. None if any is late, since
-    a partial cloud would quietly hide part of the junction."""
+def sweeps_by_lidar(lidars, frame, exact=False):
+    """Each LiDAR's sweep from this tick in the model's frame, or None for one that's late."""
     parts = []
     for lidar in lidars:
         points = _sweep_for(lidar.sweeps, frame, exact)
-        if points is None:
-            return None
-        parts.append(lidar_to_model_frame(points, lidar.mount, yaw=lidar.yaw))
-    return np.vstack(parts)
+        parts.append(None if points is None else lidar_to_model_frame(points, lidar.mount, yaw=lidar.yaw))
+    return parts
+
+
+def merged_cloud(parts):
+    """Sweeps from sweeps_by_lidar as one cloud. None if any is late, since a partial cloud would quietly hide part of the junction."""
+    return None if any(part is None for part in parts) else np.vstack(parts)
+
+
+def merged_sweep(lidars, frame, exact=False):
+    return merged_cloud(sweeps_by_lidar(lidars, frame, exact))
 
 
 class RoadsideDetector:
@@ -795,7 +802,7 @@ class RoadsideDetector:
 class CarlaPerception:
     """Owns the simulation clock, the overhead view and the LiDARs at the intersection."""
 
-    def __init__(self, junction_id, detector_mode, model_path):
+    def __init__(self, junction_id, detector_mode, model_path, lidar_view=False):
         import carla
 
         self.carla = carla
@@ -843,6 +850,14 @@ class CarlaPerception:
 
         # Only with a detector: ray tracing them slows every tick, and ground truth doesn't read them
         self.lidars = spawn_lidars(carla, self.world, self.center) if self.detector else []
+        self.lidar_feed = None
+        if lidar_view and self.detector:
+            from lidar_view import SweepFeed
+
+            self.lidar_feed = SweepFeed.create()
+            print("[LIDAR] Publishing sweeps for scripts/lidar_view.py, with CARLA's true boxes for it to compare against.")
+        elif lidar_view:
+            print("[LIDAR] --lidar-view does nothing here: no detector, so no LiDARs were spawned.")
         self.world.get_spectator().set_transform(
             carla.Transform(self.gantry, carla.Rotation(pitch=-90.0, yaw=0.0)))
 
@@ -879,12 +894,15 @@ class CarlaPerception:
         return self._detect(frame, now) if self.detector else self._ground_truth(now)
 
     def _detect(self, frame, now):
-        points = merged_sweep(self.lidars, frame)
+        parts = sweeps_by_lidar(self.lidars, frame)
+        points = merged_cloud(parts)
         if points is None:
             print("[LIDAR] No sweep arrived for this tick.")
+            self._publish_view(frame, now, parts, ())
             self.boxes = []
             return []
         rows = self.detector.detect(points)
+        self._publish_view(frame, now, parts, rows)
         found = [model_box_to_world(r, self.center.x, self.center.y, self.center.z) for r in rows]
         own, own_box = self._own_track(now)
         if own is not None:
@@ -901,6 +919,20 @@ class CarlaPerception:
                            [(w.x, w.y, w.vx, w.vy) for w in walkers])
         people = [person_track(w.id, w.x, w.y, w.vx, w.vy) for w in walkers]
         return [*cars, *(p for p in people if p), *([own] if own is not None else [])]
+
+    def _publish_view(self, frame, now, parts, rows):
+        """Only for the window, so nothing that goes wrong here may stop the clock or the safety gate."""
+        if self.lidar_feed is None:
+            return
+        try:
+            actors = [a for pattern in ("vehicle.*", "walker.pedestrian.*") for a in self.world.get_actors().filter(pattern)]
+            true_boxes = labels_for(actors, self.world.get_snapshot(), self.center)
+            mounts = [(lidar.mount[0], -lidar.mount[1]) for lidar in self.lidars]
+            self.lidar_feed.write(frame, now, mounts, parts, rows, true_boxes)
+        except (RuntimeError, ValueError, OSError) as error:
+            print(f"[LIDAR] Stopped publishing to the LiDAR window: {error}")
+            self.lidar_feed.close()
+            self.lidar_feed = None
 
     def _own_track(self, now):
         """The ML car's own state, which it knows from its own telemetry, and needn't be told by a detector."""
@@ -994,6 +1026,8 @@ class CarlaPerception:
                 thickness=BOX_THICKNESS, color=ml_color if b.is_ml else self.box_color, life_time=BOX_LIFE_TIME)
 
     def cleanup(self):
+        if self.lidar_feed is not None:
+            self.lidar_feed.destroy()
         for lidar in self.lidars:
             lidar.sensor.stop()
             lidar.sensor.destroy()
@@ -1011,6 +1045,7 @@ def main():
     parser.add_argument("--junction", type=int, default=INTERSECTION_JUNCTION, help="id of the map junction to watch")
     parser.add_argument("--detector", choices=("auto", "onnx", "groundtruth"), default="auto")
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
+    parser.add_argument("--lidar-view", action="store_true", help="publish the LiDARs' sweeps for scripts/lidar_view.py; needs a detector")
     args = parser.parse_args()
 
     # Without this, Ctrl+Break or a closed console skips the cleanup below, leaving the sensors
@@ -1033,7 +1068,7 @@ def main():
                 engine.step(time.time())
                 time.sleep(1.0 / HEADLESS_RATE)
         else:
-            perception = CarlaPerception(args.junction, args.detector, args.model)
+            perception = CarlaPerception(args.junction, args.detector, args.model, args.lidar_view)
             print(f"[CARLA] Master tick running at {1 / FIXED_DELTA:.0f} Hz.")
             next_tick = time.perf_counter()
             while True:

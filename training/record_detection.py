@@ -47,9 +47,8 @@ from detection_features import (
     PEDESTRIAN,
     POINT_SCALE,
     VEHICLE,
-    count_points,
     crop_to_grid,
-    label_row,
+    labels_for,
     load_sweep,
 )
 
@@ -94,26 +93,6 @@ def traffic_level(seed):
 def save_sweep(path, points, labels):
     np.savez_compressed(path, points=np.round(crop_to_grid(points)[:, :3] * POINT_SCALE).astype(np.int16),
                         labels=np.array(labels, np.float32).reshape(-1, 11))
-
-
-def labels_for(actors, snapshot, center, points):
-    """A label for each actor in the grid, read from the snapshot so that it's the sweep's own frame."""
-    rows = []
-    for actor in actors:
-        state = snapshot.find(actor.id)
-        if state is None:
-            continue
-        tf, box = state.get_transform(), actor.bounding_box
-        c = tf.transform(box.location)
-        offset = (c.x - center.x, c.y - center.y, c.z - center.z)
-        if max(abs(offset[0]), abs(offset[1])) >= GRID_HALF:
-            continue
-        v = state.get_velocity()
-        kind = PEDESTRIAN if actor.type_id.startswith("walker.") else VEHICLE
-        row = label_row(offset, (box.extent.x, box.extent.y, box.extent.z), tf.rotation.yaw, (v.x, v.y), kind)
-        row[8] = count_points(row, points)
-        rows.append(row)
-    return rows
 
 
 @dataclass
