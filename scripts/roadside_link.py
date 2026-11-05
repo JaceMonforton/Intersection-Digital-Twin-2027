@@ -2,7 +2,8 @@
 How the ML car learns about the actors around it, whichever way it's getting them.
 
     truth   CARLA's list of every actor, which a real car could never have
-    rsu     tracks from the roadside unit's detector, sent by the processor
+    rsu     tracks from the roadside unit's detector, sent by the processor, plus what the car's own roof LiDAR hits,
+            as the roadside unit only covers 60 m around the junction and a car alone past that is blind
     sight   only what a LiDAR on the car's own roof hits: the baseline the roadside unit has to beat
 
 Each view gives the driver cars as (x, y, vx, vy, yaw) and pedestrians as (x, y, vx, vy), in CARLA's frame, plus
@@ -25,6 +26,7 @@ SIGHT_LIDAR = {"channels": "32", "points_per_second": "300000", "range": "70", "
 SIGHT_HEIGHT = 1.9       # m above the car's origin
 SEMANTIC_POINT = struct.Struct("<ffffII")  # x, y, z, cos of the angle, id of the actor hit, semantic tag
 MODES = ("truth", "rsu", "sight")
+SAME_CAR, SAME_WALKER = 3.0, 1.5   # m between a roadside track and what the car sees for them to be the same actor
 
 
 class RoadsideSender:
@@ -130,10 +132,33 @@ class LineOfSightView:
         self.sensor.destroy()
 
 
+def add_unmatched(tracks, seen, reach):
+    """tracks, plus anything in seen that no track is within reach of."""
+    return tracks + [s for s in seen if all((s[0] - t[0]) ** 2 + (s[1] - t[1]) ** 2 > reach ** 2 for t in tracks)]
+
+
+class RoadsideAndSightView:
+    """The roadside unit adds to what the car sees for itself. Fresh only follows the roadside link, since that's the
+    one that can die unnoticed."""
+    name = "rsu"
+
+    def __init__(self, roadside, own):
+        self.roadside, self.own = roadside, own
+
+    def see(self, ego, cars, walkers, now):
+        road_cars, road_walkers, fresh = self.roadside.see(ego, cars, walkers, now)
+        own_cars, own_walkers, _ = self.own.see(ego, cars, walkers, now)
+        return add_unmatched(road_cars, own_cars, SAME_CAR), add_unmatched(road_walkers, own_walkers, SAME_WALKER), fresh
+
+    def close(self):
+        self.roadside.close()
+        self.own.close()
+
+
 def make_view(mode, carla, world, car, sweep_seconds, receiver=None):
     """The view for a car. Pass a receiver to reuse its socket from one car to the next."""
     if mode == "rsu":
-        return RoadsideView(receiver)
+        return RoadsideAndSightView(RoadsideView(receiver), LineOfSightView(carla, world, car, sweep_seconds))
     if mode == "sight":
         return LineOfSightView(carla, world, car, sweep_seconds)
     return TruthView()

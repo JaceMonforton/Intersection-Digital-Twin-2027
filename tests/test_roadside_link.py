@@ -8,6 +8,7 @@ from roadside_link import (
     SEMANTIC_POINT,
     STALE_AFTER,
     LineOfSightView,
+    RoadsideAndSightView,
     RoadsideReceiver,
     RoadsideSender,
     RoadsideView,
@@ -122,3 +123,31 @@ def test_a_view_leaves_a_shared_receiver_open_for_the_next_car():
         assert wait_for(receiver) is not None
     finally:
         receiver.close()
+
+
+class FixedView:
+    def __init__(self, cars, walkers, fresh=True):
+        self.result = (cars, walkers, fresh)
+        self.closed = False
+
+    def see(self, ego, cars, walkers, now):
+        return self.result
+
+    def close(self):
+        self.closed = True
+
+
+def test_the_car_keeps_what_it_sees_past_the_roadside_units_reach():
+    road = FixedView([(0.0, 0.0, 1.0, 0.0, 0.0)], [(5.0, 5.0, 0.0, 0.0)])
+    own = FixedView([(0.5, 0.0, 9.0, 0.0, 0.0), (100.0, 0.0, 3.0, 0.0, 0.0)], [(5.5, 5.0, 9.0, 0.0), (9.0, 5.0, 1.0, 0.0)])
+    cars, walkers, fresh = RoadsideAndSightView(road, own).see(None, {}, {}, 0.0)
+    assert cars == [(0.0, 0.0, 1.0, 0.0, 0.0), (100.0, 0.0, 3.0, 0.0, 0.0)]  # the same car isn't reported twice
+    assert walkers == [(5.0, 5.0, 0.0, 0.0), (9.0, 5.0, 1.0, 0.0)]
+    assert fresh
+
+
+def test_a_dead_roadside_link_still_counts_as_stale_when_the_car_can_see():
+    view = RoadsideAndSightView(FixedView([], [], fresh=False), FixedView([(1.0, 1.0, 0.0, 0.0, 0.0)], []))
+    assert view.see(None, {}, {}, 0.0) == ([(1.0, 1.0, 0.0, 0.0, 0.0)], [], False)
+    view.close()
+    assert view.roadside.closed and view.own.closed

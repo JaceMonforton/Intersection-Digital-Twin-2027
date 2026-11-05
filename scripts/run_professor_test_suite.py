@@ -1127,8 +1127,9 @@ class Suite:
 # Running the suite
 # ---------------------------------------------------------------------------
 def simulation_running():
-    probe = ("import carla; c = carla.Client('localhost', 2000); c.set_timeout(8.0); "
-             "c.get_world().wait_for_tick(TICK_TIMEOUT)")
+    # CARLA ticks by itself without the processor, so a tick alone doesn't show that the processor is up
+    probe = ("import carla, sys; c = carla.Client('localhost', 2000); c.set_timeout(8.0); w = c.get_world(); "
+             "w.wait_for_tick(8.0); sys.exit(not w.get_settings().synchronous_mode)")
     try:
         return subprocess.run([sys.executable, "-c", probe], capture_output=True, timeout=20, check=False).returncode == 0
     except subprocess.TimeoutExpired:
@@ -1184,6 +1185,8 @@ def main():
             signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
 
     if not args.attached and not simulation_running():
+        if args.perception != "truth":
+            sys.exit("[SCENARIO] Start the processor first: python scripts/central_gpu_processor.py --detector onnx --model models/rsu_detector.candidate.onnx")
         print("[SCENARIO] The simulation isn't running, so starting everything through run_simulation.py.", flush=True)
         return subprocess.run([sys.executable, str(ROOT / "run_simulation.py"), *(["--quiet"] if args.quiet else [])], cwd=ROOT, check=False).returncode
 

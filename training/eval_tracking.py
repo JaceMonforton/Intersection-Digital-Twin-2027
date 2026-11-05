@@ -5,6 +5,9 @@ covers the whole chain: the sensors, the detector, the tracker, and the message 
 Needs the processor running with --detector onnx. It starts its own traffic and pedestrians, and only reads the
 world otherwise.
     python training/eval_tracking.py --seconds 180 --seed 11 --output output/rsu_tracking.json
+
+--traffic-only starts the same traffic and scores nothing, which leaves the roadside port free for the ML car:
+    python training/eval_tracking.py --seconds 300 --seed 12 --traffic-only
 """
 import argparse
 import json
@@ -87,6 +90,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=180.0)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--output")
+    parser.add_argument("--traffic-only", action="store_true", help="don't listen or score, so scripts/ml_driver.py --perception rsu can listen")
     args = parser.parse_args()
     for name in ("SIGBREAK", "SIGTERM"):
         if hasattr(signal, name):
@@ -101,7 +105,7 @@ def main():
     vehicles, pedestrians = traffic_level(args.seed)
     log_path = ROOT / "output" / "eval_tracking_traffic.log"
     log_path.parent.mkdir(exist_ok=True)
-    receiver = RoadsideReceiver()
+    receiver = None if args.traffic_only else RoadsideReceiver()
     walkers = []
     results = {"cars": [], "walkers": []}
     near = {"cars": [], "walkers": []}
@@ -124,6 +128,8 @@ def main():
                 ticks += 1
                 if ticks % WALKER_STEER_TICKS == 0:
                     steer_walkers(carla, walkers, snapshot, spots, crossings, rng)
+                if receiver is None:
+                    continue
                 message = receiver.poll()
                 now = snapshot.timestamp.elapsed_seconds
                 if message is None or abs(now - message["t"]) > 0.5:
@@ -145,7 +151,10 @@ def main():
         finally:
             client.apply_batch_sync([carla.command.DestroyActor(w.actor.id) for w in walkers])
             stop_traffic(traffic)
-            receiver.close()
+            if receiver is not None:
+                receiver.close()
+    if args.traffic_only:
+        return
     report = {"seconds": ticks * 0.1, "seed": args.seed, "vehicles": vehicles, "pedestrians": pedestrians, "stale_ticks": stale,
               "cars": summarise(results["cars"], near["cars"], ghosts["cars"], ticks), "walkers": summarise(results["walkers"], near["walkers"], ghosts["walkers"], ticks)}
     text = json.dumps(report, indent=1)

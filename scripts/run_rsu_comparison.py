@@ -2,15 +2,15 @@
 Does the roadside unit help? Runs the same hidden hazards with three versions of the ML car, and compares them.
 
     truth   told about every actor by CARLA: the best the roadside unit could possibly do
-    rsu     told what the roadside unit's detector found, with the safety gate running on it too
+    rsu     told what the roadside unit's detector found and what its own roof LiDAR hits, with the safety gate on the detector
     sight   knows only what a LiDAR on its own roof hits, with no roadside unit and so no safety gate
 
-The hazards, each hidden from the car by a parked truck until late:
+The hazards, each hidden from the car by two stacked shipping containers until late (LiDAR sees legs under a lorry):
 
-    runner      a speeding car from behind a truck runs its red light (the suite's test 3)
-    pedestrian  a person steps out in front of a truck waiting beside the ML car at the line
-    turner      an oncoming car turns left across the ML car, hidden by a truck waiting beside it
-    clear       the same truck but no hazard, to catch stops for nothing
+    runner      a speeding car from behind the containers runs its red light (the suite's test 3)
+    pedestrian  a person steps out from behind the containers onto the marked crossing
+    turner      an oncoming car turns left across the ML car, hidden by the containers
+    clear       the same containers but no hazard, to catch stops for nothing
 
 Needs CARLA and the Docker stack running, with the entities provisioned. It starts and stops the processor itself,
 so nothing else may be using CARLA. Results go to output/rsu_comparison.json and .md, and each version's tick by tick
