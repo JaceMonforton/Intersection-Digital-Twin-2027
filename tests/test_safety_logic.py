@@ -163,10 +163,21 @@ def test_parse_lidar_reads_xyzi_rows():
 
 
 def test_lidar_frame_is_y_left_with_the_road_at_ground_z():
-    # A point on the road, 2 m to the right of a sensor 40 m up
-    points = np.array([[1.0, 2.0, -40.0, 0.5]], dtype=np.float32)
-    assert lidar_to_model_frame(points, 40.0, ground_z=-1.8).tolist()[0] == pytest.approx([1.0, -2.0, -1.8, 0.5])
+    # A point on the road, 2 m to the right of a sensor 7 m up over the junction centre
+    points = np.array([[1.0, 2.0, -7.0, 0.5]], dtype=np.float32)
+    assert lidar_to_model_frame(points, (0.0, 0.0, 7.0), ground_z=-1.8).tolist()[0] == pytest.approx([1.0, -2.0, -1.8, 0.5])
     assert points[0, 1] == 2.0  # input untouched
+
+
+def test_two_lidars_put_the_same_spot_at_the_same_place():
+    # A spot on the road at CARLA (3, 4) from the junction centre, seen from opposite corners
+    a = lidar_to_model_frame(np.array([[23.0, 24.0, -7.0, 0.5]], dtype=np.float32), (-20.0, -20.0, 7.0), ground_z=-1.8)
+    b = lidar_to_model_frame(np.array([[-17.0, -16.0, -7.0, 0.5]], dtype=np.float32), (20.0, 20.0, 7.0), ground_z=-1.8)
+    assert a.tolist()[0] == pytest.approx([3.0, -4.0, -1.8, 0.5])
+    assert b.tolist()[0] == pytest.approx([3.0, -4.0, -1.8, 0.5])
+    # And a box found there comes back at that spot in the world, with the junction at (100, 200)
+    box = model_box_to_world([*a[0, :3], 4.5, 2.0, 1.4, 0.0], 100.0, 200.0, 0.0, ground_z=-1.8)
+    assert (box.x, box.y, box.z) == pytest.approx((103.0, 204.0, 0.0), abs=1e-5)
 
 
 def test_model_box_round_trips_with_the_lidar_frame():

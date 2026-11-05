@@ -379,7 +379,7 @@ Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.ht
 | Free driving, reports, live terminal table | **Working** |
 | Split-screen ML car window | **Working**, showing the model's real inputs and outputs |
 | Path prediction | **Working.** The ML car uses a [model trained on Waymo data](#train-the-trajectory-model), falling back to road-following without it. Other cars follow the road |
-| Vehicle detection | **CARLA's true positions, as a stand-in.** The overhead LiDAR runs and its data is formatted for a model, but there's no model yet |
+| Vehicle detection | **CARLA's true positions, as a stand-in.** Two corner LiDARs are in place and their sweeps are merged for a model, but there's no model yet, so they only spawn with `--detector onnx` |
 | Physical vehicles (Rosmaster R2, KUKSA) | **Written, not yet run on hardware.** The motor drivers and KUKSA publisher have never run |
 | Fully autonomous physical vehicle (Autoware) | **Not started.** Planned last |
 | Lab-to-CARLA coordinate mapping, SkyEye view, Kafka logging, AI recommendations | **Not started** |

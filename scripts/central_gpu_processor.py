@@ -1,7 +1,7 @@
 """
 Central perception and safety engine. Runs on the GPU machine alongside CARLA.
 
-Pipeline: overhead LiDAR -> 3D detections + Ditto telemetry -> fused tracks -> TTC / PET / DRAC.
+Pipeline: two corner LiDARs -> 3D detections + Ditto telemetry -> fused tracks -> TTC / PET / DRAC.
 This is the master process for CARLA: it enables synchronous mode and drives world.tick(), so
 start it BEFORE ditto_carla_agent.py and waymo_predictor_node.py, which attach to its world.
 When TTC to the ML vehicle drops below 1.5 s, or the vehicles' predicted paths meet within 3 s, it
@@ -56,18 +56,21 @@ INTERSECTION_JUNCTION = 189
 FIXED_DELTA = 0.1       # seconds of simulation per world.tick()
 TRAFFIC_MANAGER_PORT = 8000
 MAP_LOAD_TIMEOUT = 300.0 # seconds; a cold load of a map can take minutes
-GANTRY_HEIGHT = 40.0    # metres above the intersection; camera, LiDAR and spectator sit here
+GANTRY_HEIGHT = 40.0    # metres above the intersection; the overhead view (spectator) sits here
 CAMERA_FOV = 90.0
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT_PX = 720
 
+# Each LiDAR's (x, y, z) in metres from the junction centre, in CARLA's frame. Opposite corners, so one
+# sees what's hidden from the other. training/check_lidar_coverage.py compares the options.
+LIDAR_MOUNTS = ((14.1, 17.2, 7.0), (-14.1, -17.2, 7.0))
 LIDAR_CHANNELS = 64
-LIDAR_POINTS_PER_SECOND = 100000
-LIDAR_RANGE = 50.0
-# CARLA's default FOV (+10 to -30 degrees) suits a roof mount. From a 40 m gantry those rays would
-# all run out of range before reaching the road, so aim the channels down at the intersection.
-LIDAR_UPPER_FOV = -45.0
-LIDAR_LOWER_FOV = -90.0
+LIDAR_POINTS_PER_SECOND = 300000  # each
+LIDAR_RANGE = 80.0
+# Aimed below the horizon, like the OS1-64s on the TUMTraf gantry. The steepest ray leaves a blind
+# circle around the pole as wide as the mount is high, which a corner keeps mostly off the road.
+LIDAR_UPPER_FOV = 0.0
+LIDAR_LOWER_FOV = -45.0
 LIDAR_TIMEOUT = 1.0     # seconds to wait for the sweep belonging to a tick
 MODEL_GROUND_Z = -1.8   # z of the road in the model's frame, as if the LiDAR were on a car roof
 LABEL_LIFE_TIME = 0.1  # text, unlike lines, renders at one tick's life, and longer leaves a ghost behind it
@@ -330,11 +333,13 @@ def parse_lidar(raw_data):
     return np.frombuffer(raw_data, dtype=np.float32).reshape(-1, 4).copy()
 
 
-def lidar_to_model_frame(points, sensor_height, ground_z=MODEL_GROUND_Z):
-    """CARLA sensor frame (y right) to the model's frame (x forward, y LEFT, road at ground_z)."""
+def lidar_to_model_frame(points, mount, ground_z=MODEL_GROUND_Z):
+    """One LiDAR's sweep, in its own CARLA frame (y right), to the model's frame shared by all of them:
+    centred on the junction, x forward, y LEFT, road at ground_z. The sensors aren't rotated."""
     out = points.copy()
-    out[:, 1] *= -1.0
-    out[:, 2] += sensor_height + ground_z
+    out[:, 0] += mount[0]
+    out[:, 1] = -(out[:, 1] + mount[1])
+    out[:, 2] += mount[2] + ground_z
     return out
 
 
@@ -616,6 +621,75 @@ class SafetyEngine:
 # ---------------------------------------------------------------------------
 # Perception (needs CARLA or the model)
 # ---------------------------------------------------------------------------
+def find_junction(world, junction_id):
+    junctions = {}
+    for wp, _ in world.get_map().get_topology():
+        if wp.is_junction:
+            junction = wp.get_junction()
+            junctions[junction.id] = junction
+    if junction_id not in junctions:
+        raise RuntimeError(f"{CARLA_MAP} has no junction {junction_id}. It has: {sorted(junctions)}")
+    return junctions[junction_id]
+
+
+@dataclass
+class Lidar:
+    sensor: object
+    mount: tuple
+    sweeps: queue.Queue
+
+
+def spawn_lidars(carla, world, center, mounts=LIDAR_MOUNTS):
+    bp = world.get_blueprint_library().find("sensor.lidar.ray_cast")
+    bp.set_attribute("channels", str(LIDAR_CHANNELS))
+    bp.set_attribute("points_per_second", str(LIDAR_POINTS_PER_SECOND))
+    bp.set_attribute("range", str(LIDAR_RANGE))
+    bp.set_attribute("upper_fov", str(LIDAR_UPPER_FOV))
+    bp.set_attribute("lower_fov", str(LIDAR_LOWER_FOV))
+    bp.set_attribute("rotation_frequency", str(1.0 / FIXED_DELTA))  # one full sweep per tick
+    bp.set_attribute("dropoff_general_rate", "0.0")  # the default silently drops 45% of points
+    lidars = []
+    for x, y, z in mounts:
+        location = carla.Location(x=center.x + x, y=center.y + y, z=center.z + z)
+        lidar = Lidar(world.spawn_actor(bp, carla.Transform(location)), (x, y, z), queue.Queue(maxsize=1))
+        lidar.sensor.listen(lambda measurement, sweeps=lidar.sweeps: _keep_newest(sweeps, measurement))
+        lidars.append(lidar)
+    return lidars
+
+
+def _keep_newest(sweeps, measurement):
+    try:
+        sweeps.get_nowait()  # only the newest sweep matters
+    except queue.Empty:
+        pass
+    sweeps.put_nowait((measurement.frame, parse_lidar(measurement.raw_data)))
+
+
+def _sweep_for(sweeps, frame):
+    """The sweep from this tick, or None if it doesn't arrive in time."""
+    deadline = time.time() + LIDAR_TIMEOUT
+    while time.time() < deadline:
+        try:
+            sweep_frame, points = sweeps.get(timeout=LIDAR_TIMEOUT)
+        except queue.Empty:
+            return None
+        if sweep_frame >= frame:
+            return points
+    return None
+
+
+def merged_sweep(lidars, frame):
+    """Every LiDAR's sweep from this tick as one cloud in the model's frame. None if any is late, since
+    a partial cloud would quietly hide part of the junction."""
+    parts = []
+    for lidar in lidars:
+        points = _sweep_for(lidar.sweeps, frame)
+        if points is None:
+            return None
+        parts.append(lidar_to_model_frame(points, lidar.mount))
+    return np.vstack(parts)
+
+
 class CenterPointDetector:
     """3D boxes from a LiDAR sweep. See models/README.md for the expected model contract."""
 
@@ -641,7 +715,7 @@ class CenterPointDetector:
 
 
 class CarlaPerception:
-    """Owns the simulation clock and the overhead gantry at the intersection."""
+    """Owns the simulation clock, the overhead view and the LiDARs at the intersection."""
 
     def __init__(self, junction_id, detector_mode, model_path):
         import carla
@@ -661,7 +735,7 @@ class CarlaPerception:
             self.world = self.client.load_world(CARLA_MAP)
             self.client.set_timeout(60.0)
 
-        self.center = self._find_intersection(junction_id)
+        self.center = find_junction(self.world, junction_id).bounding_box.location
         print(f"[CARLA] {INTERSECTION_NAME} is junction {junction_id} "
               f"at x={self.center.x:.1f} y={self.center.y:.1f}")
         self.gantry = carla.Location(x=self.center.x, y=self.center.y, z=self.center.z + GANTRY_HEIGHT)
@@ -687,8 +761,8 @@ class CarlaPerception:
             self.box_color = carla.Color(*BOX_COLOR_GROUND_TRUTH)
             print("[LIDAR] No detection model: using CARLA GROUND-TRUTH actor positions, not LiDAR.")
 
-        self.sweeps = queue.Queue(maxsize=1)
-        self.sensors = [self._spawn_lidar()]
+        # Only with a detector: ray tracing them slows every tick, and ground truth doesn't read them
+        self.lidars = spawn_lidars(carla, self.world, self.center) if self.detector else []
         self.world.get_spectator().set_transform(
             carla.Transform(self.gantry, carla.Rotation(pitch=-90.0, yaw=0.0)))
 
@@ -718,48 +792,6 @@ class CarlaPerception:
         settings.fixed_delta_seconds = None
         self.world.apply_settings(settings)
 
-    def _find_intersection(self, junction_id):
-        junctions = {}
-        for wp, _ in self.world.get_map().get_topology():
-            if wp.is_junction:
-                junction = wp.get_junction()
-                junctions[junction.id] = junction
-        if junction_id not in junctions:
-            raise RuntimeError(f"{CARLA_MAP} has no junction {junction_id}. It has: {sorted(junctions)}")
-        return junctions[junction_id].bounding_box.location
-
-    def _spawn_lidar(self):
-        bp = self.world.get_blueprint_library().find("sensor.lidar.ray_cast")
-        bp.set_attribute("channels", str(LIDAR_CHANNELS))
-        bp.set_attribute("points_per_second", str(LIDAR_POINTS_PER_SECOND))
-        bp.set_attribute("range", str(LIDAR_RANGE))
-        bp.set_attribute("upper_fov", str(LIDAR_UPPER_FOV))
-        bp.set_attribute("lower_fov", str(LIDAR_LOWER_FOV))
-        bp.set_attribute("rotation_frequency", str(1.0 / FIXED_DELTA))  # one full sweep per tick
-        bp.set_attribute("dropoff_general_rate", "0.0")  # the default silently drops 45% of points
-        lidar = self.world.spawn_actor(bp, self.carla.Transform(self.gantry))
-        lidar.listen(self._on_sweep)
-        return lidar
-
-    def _on_sweep(self, measurement):
-        try:
-            self.sweeps.get_nowait()  # only the newest sweep matters
-        except queue.Empty:
-            pass
-        self.sweeps.put_nowait((measurement.frame, parse_lidar(measurement.raw_data)))
-
-    def _sweep_for(self, frame):
-        """The sweep from this tick, or None if it doesn't arrive in time."""
-        deadline = time.time() + LIDAR_TIMEOUT
-        while time.time() < deadline:
-            try:
-                sweep_frame, points = self.sweeps.get(timeout=LIDAR_TIMEOUT)
-            except queue.Empty:
-                return None
-            if sweep_frame >= frame:
-                return points
-        return None
-
     def tick(self):
         """Advance the simulation one step and return the tracks detected in it."""
         frame = self.world.tick()
@@ -767,12 +799,12 @@ class CarlaPerception:
         return self._detect(frame, now) if self.detector else self._ground_truth(now)
 
     def _detect(self, frame, now):
-        points = self._sweep_for(frame)
+        points = merged_sweep(self.lidars, frame)
         if points is None:
             print("[LIDAR] No sweep arrived for this tick.")
             self.boxes = []
             return []
-        rows = self.detector.detect(lidar_to_model_frame(points, GANTRY_HEIGHT))
+        rows = self.detector.detect(points)
         self.boxes = [model_box_to_world(r, self.center.x, self.center.y, self.center.z) for r in rows]
         return self.tracker.update([(b.x, b.y) for b in self.boxes], now)
 
@@ -840,9 +872,9 @@ class CarlaPerception:
                 thickness=BOX_THICKNESS, color=ml_color if b.is_ml else self.box_color, life_time=BOX_LIFE_TIME)
 
     def cleanup(self):
-        for sensor in self.sensors:
-            sensor.stop()
-            sensor.destroy()
+        for lidar in self.lidars:
+            lidar.sensor.stop()
+            lidar.sensor.destroy()
         self.traffic_manager.set_synchronous_mode(False)
         self._leave_synchronous_mode()
 
