@@ -413,6 +413,20 @@ This runs the five tests and opens a top-down window of the sweeps the processor
 - **Health:** the panel measures each LiDAR's points and sweeps per second, and turns red if a sweep is late. It says `NO NEW SWEEPS` after 2 s without one, and `Waiting for the processor` until the feed exists.
 - **Keys:** 1 or 2 hides a LiDAR's points, which shows what the other one covers. That only changes the window, and the detector still gets both.
 
+**Why there are two.** This is one moment with four cars, showing one LiDAR's points at a time. Each pole sees the road around it densely and thins out with distance, and whatever stands on its corner blocks its view behind it. The other pole covers much of what it misses. The boxes are the same in both pictures, because the detector always gets both LiDARs.
+
+| LiDAR A only | LiDAR B only |
+| :---: | :---: |
+| <img src="docs/images/lidar_a_only.png" alt="Blue points fan out from the top-right pole, dense nearby and sparse far away, with a dark area behind the structures on its corner. Four cars have green and white boxes."> | <img src="docs/images/lidar_b_only.png" alt="The same moment with only orange points, fanning out from the bottom-left pole, which is densest where the blue picture is sparse. The same four cars have the same boxes."> |
+
+**Up close.** The bright points are LiDAR returns from the cars themselves, from both poles. These pictures are enlarged four times, and the white box is drawn slightly bigger than the car so that it doesn't hide the green one.
+
+| Two cars detected | A car missed at the edge |
+| :---: | :---: |
+| <img src="docs/images/lidar_cars_close.png" alt="Two cars close up, each filled with orange and blue points. Each has a green detected box inside a white true box. The box on the angled car sits a little off from the true one."> | <img src="docs/images/lidar_edge_miss.png" alt="Two cars in a line near the top edge of the view. The lower one has a green box inside its white box. The upper one has a white box with a few points in it and no green box, and it runs off the top of the picture."> |
+
+The missed car on the right is mostly past the top of the picture, which is the edge of the 60 m grid. All of these are real frames from a `--roadside --lidar-view` run of the five tests.
+
 It reads the sweeps through shared memory, so it can't hold up the clock, and the true boxes are only for comparing by eye. In 30 cars with no ML car window, the simulation ran at 9.95 ticks per second without the feed, 9.76 with it, and 9.71 with the window open too, as the mean of two 60 s runs each.
 
 ### Reproduce the measurements
@@ -644,7 +658,7 @@ These are the targets from the project report, against what has been measured so
 | Requirement | Target | Measured so far |
 | ----------- | ------ | --------------- |
 | End-to-end latency (REQ-SYS-002) | At most 100 ms, sensor to CARLA rendering | About 60 ms (p95) from Ditto write to simulated motor cut, on one machine. The sensor-to-rendering path isn't measured |
-| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) | 10.0 Hz simulation tick, at real-time speed with 15 cars. It fell to about 2 Hz in a `--roadside --lidar-view` run of the five tests, with both windows open |
+| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) | 10.0 Hz simulation tick, at real-time speed with 15 cars. It fell to about 2 to 3 Hz in `--roadside --lidar-view` runs of the five tests, with both windows open |
 | Safety metrics (REQ-SYS-011) | TTC and headway; flag TTC under 1.5 s | TTC, PET and DRAC done, and the 1.5 s flag works. Headway isn't implemented |
 | Telemetry payload (REQ-SYS-001) | Full state vector, JSON over MQTT/HTTP | Position and velocity only |
 | Position and heading accuracy (REQ-SYS-004, 005) | Within 5 cm and 2 degrees | Not measured; needs physical vehicles |
@@ -668,8 +682,8 @@ These are the targets from the project report, against what has been measured so
 - **The comparison tells the car where its containers are.** A stopped car close to one is dropped from what the car is told, because the detector calls containers cars and the car would queue behind them forever. A real unit would have to learn its background. The safety gate still receives those tracks.
 - **The link from the roadside unit is local UDP,** with no loss handling or signing. A real one needs a V2X radio. If its tracks go stale the car brakes.
 - **The simulation is built around 10 Hz.** The models, the speed controller and the LiDAR sweeps all assume a 0.1 s tick, so a faster tick isn't a one-line change, and every result here would need measuring again.
-- **The five tests can run well below 10 Hz.** One `--roadside --lidar-view` run held about 2 ticks per second. The LiDAR feed costs about 2%, so it isn't the cause, and the ML car window's cameras are the main suspect, but that hasn't been measured. Other setups haven't been timed during the tests.
-- **The detector can see a person who isn't there.** The LiDAR window showed a stationary false person on the kerb by one pole. It doesn't move, so it shouldn't set off the safety gate. Whether it becomes a track that changes how the car drives hasn't been checked.
+- **The five tests can run well below 10 Hz.** `--roadside --lidar-view` runs held about 2 to 3 ticks per second. The LiDAR feed costs about 2%, so it isn't the cause, and the ML car window's cameras are the main suspect, but that hasn't been measured. Other setups haven't been timed during the tests.
+- **The detector can see a person who isn't there.** The LiDAR window showed a stationary false person on the kerb by one pole in one run, though not in 18 frames sampled from a later one. It doesn't move, so it shouldn't set off the safety gate. Whether it becomes a track that changes how the car drives hasn't been checked.
 - **The server crashed once** during the roadside work, with exit code 3 and no crash log. The cause wasn't found.
 - **More traffic is less stable.** At 40 cars, the brake's repeated stops could strand the ML car in the junction and cause contact. The default of 15 didn't.
 - **In the earlier scripted left turns the ML car isn't physics-driven.** They move it directly along its plan. When the model drives, it uses real physics.
