@@ -73,8 +73,8 @@ def training_chart(history):
         body.append(text(end[0] + 8, end[1] + 4, label))
     best = min(history, key=lambda h: h["validation"])
     x, y = place(best["epoch"], best["validation"])
-    body.append(f'<circle class="s2 ring" cx="{x:.1f}" cy="{y:.1f}" r="5" stroke-width="2" style="stroke:var(--none)"/>')
-    body.append(text(x, y - 12, f"Kept: epoch {best['epoch']}, {best['validation']:.2f}", anchor="middle", size=12))
+    body.append(f'<circle class="s2 ring" cx="{x:.1f}" cy="{y:.1f}" r="5" stroke-width="2"/>')
+    body.append(text(x, y + 22, f"Kept: epoch {best['epoch']}, {best['validation']:.2f}", anchor="middle", size=12))
     body.append(legend(left, height - 6, ("Training", "Validation")))
     return svg(width, height, "".join(body), f"Line chart of detector training and validation loss over {len(history)} epochs. The lowest validation loss, {best['validation']:.2f}, was at epoch {best['epoch']}.")
 
