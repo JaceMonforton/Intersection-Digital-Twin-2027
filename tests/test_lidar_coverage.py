@@ -5,7 +5,6 @@ from check_lidar_coverage import (
     corner_mounts,
     coverage_image,
     is_clear,
-    points_in_box,
     rank_pairs,
 )
 
@@ -48,15 +47,3 @@ def test_coverage_colours_a_road_point_by_how_many_corners_see_it():
     assert image[9 * scale, 50 * scale].tolist() == [40, 180, 70]
     assert image[49 * scale, 70 * scale].tolist() == [230, 200, 40]
     assert image[89 * scale, 50 * scale].tolist() == [220, 40, 40]
-
-
-def test_points_on_a_box_are_counted_along_its_heading():
-    # A car 2 m long each way and 1 m wide each way, at CARLA (10, 20), heading along CARLA's +y.
-    # The cloud is in the model's frame, where y is minus CARLA's y, with the road at -1.8.
-    cloud = np.array([
-        [10.0, -21.5, -0.8, 0.0],  # 1.5 m ahead of its centre and on it: counts
-        [11.5, -20.0, -0.8, 0.0],  # 1.5 m to its side: past the 1 m half-width
-        [10.0, -20.0, -1.8, 0.0],  # the road under it
-        [10.0, -20.0, 5.0, 0.0],   # high above it
-    ], dtype=np.float32)
-    assert points_in_box(cloud, 10.0, 20.0, 90.0, 2.0, 1.0, 1.5, ground_z=-1.8) == 1

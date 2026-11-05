@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import requests
 import websocket
+from detection_features import MODEL_GROUND_Z
 from model_panel import SafetySender
 from waymo_predictor_node import (
     DEFAULT_MODEL as TRAJECTORY_MODEL,
@@ -72,7 +73,6 @@ LIDAR_RANGE = 80.0
 LIDAR_UPPER_FOV = 0.0
 LIDAR_LOWER_FOV = -45.0
 LIDAR_TIMEOUT = 1.0     # seconds to wait for the sweep belonging to a tick
-MODEL_GROUND_Z = -1.8   # z of the road in the model's frame, as if the LiDAR were on a car roof
 LABEL_LIFE_TIME = 0.1  # text, unlike lines, renders at one tick's life, and longer leaves a ghost behind it
 BOX_LIFE_TIME = 0.11    # must outlive one tick: at exactly FIXED_DELTA a shape expires before it renders
 BOX_THICKNESS = 0.1
@@ -665,25 +665,28 @@ def _keep_newest(sweeps, measurement):
     sweeps.put_nowait((measurement.frame, parse_lidar(measurement.raw_data)))
 
 
-def _sweep_for(sweeps, frame):
-    """The sweep from this tick, or None if it doesn't arrive in time."""
+def _sweep_for(sweeps, frame, exact=False):
+    """The sweep from this tick, or None if it doesn't arrive in time. A later one will do, unless it's
+    to be exact, as when it has to match labels from this tick."""
     deadline = time.time() + LIDAR_TIMEOUT
     while time.time() < deadline:
         try:
             sweep_frame, points = sweeps.get(timeout=LIDAR_TIMEOUT)
         except queue.Empty:
             return None
-        if sweep_frame >= frame:
+        if sweep_frame == frame or (sweep_frame > frame and not exact):
             return points
+        if sweep_frame > frame:
+            return None
     return None
 
 
-def merged_sweep(lidars, frame):
+def merged_sweep(lidars, frame, exact=False):
     """Every LiDAR's sweep from this tick as one cloud in the model's frame. None if any is late, since
     a partial cloud would quietly hide part of the junction."""
     parts = []
     for lidar in lidars:
-        points = _sweep_for(lidar.sweeps, frame)
+        points = _sweep_for(lidar.sweeps, frame, exact)
         if points is None:
             return None
         parts.append(lidar_to_model_frame(points, lidar.mount))

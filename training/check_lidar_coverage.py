@@ -35,11 +35,11 @@ from central_gpu_processor import (
     CARLA_PORT,
     INTERSECTION_JUNCTION,
     LIDAR_MOUNTS,
-    MODEL_GROUND_Z,
     find_junction,
     merged_sweep,
     spawn_lidars,
 )
+from detection_features import ABOVE_ROAD, MIN_POINTS, MODEL_GROUND_Z, points_in_box
 from ml_car_view import bgra_to_rgb
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "lidar_check"
@@ -50,10 +50,8 @@ TARGET_HEIGHT = 1.4  # m above the road: about a car's roof, the part a raised s
 NEAR_TARGET = 0.5    # m; a hit this close to the target is the target's own surface, not something in the way
 COVERAGE_CELL = 1.0  # m per pixel in the coverage map, before scaling up
 BEV_CELL = 0.25      # m per pixel in the top-down view
-ABOVE_ROAD = 0.3     # m; points higher than this are drawn as objects
 SCALE = 6            # the coverage map's screen pixels per cell
 TICKS_TIMED = 30
-MIN_POINTS = 3       # LiDAR points on an actor for it to count as seen, the same as the labels will use
 
 
 def corner_mounts(half_x, half_y, margin, height):
@@ -73,16 +71,6 @@ def rank_pairs(seen):
     pairs = [(float(np.mean(seen[a] | seen[b])), float(np.mean(seen[a] & seen[b])), (a, b))
              for a, b in itertools.combinations(seen, 2)]
     return sorted(pairs, key=lambda p: p[:2], reverse=True)
-
-
-def points_in_box(points, x, y, yaw, half_length, half_width, height, ground_z=MODEL_GROUND_Z):
-    """How many points of a cloud in the model's frame land on a box standing on the road. x, y and yaw
-    (degrees) are in CARLA's frame, from the junction centre. The road under the box doesn't count."""
-    dx, dy = points[:, 0] - x, -points[:, 1] - y
-    cos, sin = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
-    up = points[:, 2] - ground_z
-    inside = (np.abs(dx * cos + dy * sin) <= half_length) & (np.abs(-dx * sin + dy * cos) <= half_width)
-    return int(np.sum(inside & (up > ABOVE_ROAD) & (up <= height)))
 
 
 def cell_counts(xs, ys, half_size, cell):
@@ -249,7 +237,7 @@ def probe_actor(carla, world, junction, blueprint):
                 points = merged_sweep([lidar], frame)
                 if points is None:
                     raise RuntimeError("A LiDAR sweep didn't arrive.")
-                row.append(points_in_box(points, x, y, yaw, box.extent.x, box.extent.y, 2 * box.extent.z))
+                row.append(points_in_box(points, x, -y, -math.radians(yaw), box.extent.x, box.extent.y, 2 * box.extent.z))
             counts.append(row)
             if number % 100 == 0:
                 print(f"{number} of {len(road)} road points...", flush=True)
