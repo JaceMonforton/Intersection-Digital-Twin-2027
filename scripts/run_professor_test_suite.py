@@ -49,6 +49,7 @@ from ml_driver import (
     smoothness,
 )
 from model_panel import SUITE_ADDRESS, SafetyReceiver, TelemetrySender
+from roadside_link import MODES, RoadsideReceiver, make_view
 from traffic_monitor import (
     GATE_URL,
     LOOK_AHEAD,
@@ -139,6 +140,7 @@ class StageResult:
     checks: dict = field(default_factory=dict)
     collisions: list = field(default_factory=list)
     red_light_violations: int = 0
+    hazard_gap: float = None  # m; how close the test's hazard came, where it has one
     stopping_margin: float = None
     min_gap: float = None
     min_ttc: float = None
@@ -549,8 +551,10 @@ class Tick:
 
 
 class Suite:
-    def __init__(self, carla, client, policy, console, seed=0):
+    def __init__(self, carla, client, policy, console, seed=0, perception="truth"):
         self.seed = seed  # picks the oncoming traffic in test 2
+        self.perception = perception  # what the ML car is told about the actors around it: see roadside_link.py
+        self.receiver = RoadsideReceiver() if perception == "rsu" else None
         self.carla = carla
         self.client = client
         self.world = client.get_world()
@@ -589,7 +593,7 @@ class Suite:
                 pass
         self.client.apply_batch_sync([self.carla.command.DestroyActor(a) for a in self.sensors])
         self.sensors = []
-        cars = list(self.world.get_actors().filter("vehicle.*"))
+        cars = [*self.world.get_actors().filter("vehicle.*"), *self.world.get_actors().filter("walker.pedestrian.*")]
         self.client.apply_batch_sync([self.carla.command.DestroyActor(a) for a in cars])
         self.actors = []
         for _ in range(3):
@@ -645,15 +649,14 @@ class Suite:
         return self.map.get_waypoint(self.carla.Location(x=float(x), y=float(y), z=0.0), project_to_road=True,
                                      lane_type=self.carla.LaneType.Driving)
 
-    def straight_path(self, waypoint, metres=120, every=5):
-        """Locations straight through the junction, for the Traffic Manager to follow."""
-        chooser, current, points = TurnChooser(STRAIGHT), waypoint, []
+    def straight_path(self, waypoint, metres=120, every=5, turn=STRAIGHT):
+        """Locations through the junction on this turn, straight on unless told otherwise, for the Traffic Manager to follow."""
+        chooser, current, points = TurnChooser(turn), waypoint, []
         for step in range(metres):
             following = current.next(1.0)
             if not following:
                 break
             current = chooser.choice(following) if len(following) > 1 else following[0]
-            chooser.turn = STRAIGHT
             if step % every == 0:
                 points.append(current.transform.location)
         return points
@@ -688,6 +691,7 @@ class Suite:
         self.sensors.append(sensor)
         if build is not None:
             build(ml)
+        view = make_view(self.perception, carla, self.world, ml, 0.1, self.receiver)
         for _ in range(SETTLE_TICKS):
             self.world.wait_for_tick(TICK_TIMEOUT)
 
@@ -712,9 +716,10 @@ class Suite:
                 ego = actor_state(ml)
                 speed = math.hypot(ego[2], ego[3])
                 others = {a.id: actor_state(a) for a in self.world.get_actors().filter("vehicle.*") if a.id != ml.id}
-                walkers = [(w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
-                           for w in self.world.get_actors().filter("walker.pedestrian.*")]
+                walkers = {w.id: (w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
+                           for w in self.world.get_actors().filter("walker.pedestrian.*")}
                 not_green = lights.not_green()
+                seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
 
                 asked = time.perf_counter()
                 try:
@@ -722,8 +727,9 @@ class Suite:
                     polls.append((time.perf_counter() - asked) * 1000.0)
                 except (requests.RequestException, ValueError):
                     gate = {}
-                released = brake_is_off(gate)
-                steer, throttle, brake = driver.controls(ego, not_green, list(others.values()), walkers, released)
+                # With only its own sight, the car has no roadside unit behind a safety gate to stop it
+                released = fresh and (self.perception == "sight" or brake_is_off(gate))
+                steer, throttle, brake = driver.controls(ego, not_green, seen_cars, seen_walkers, released)
                 ml.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
                 for series, value in zip(driven, (steer, throttle, brake, speed)):
                     series.append(value)
@@ -778,6 +784,7 @@ class Suite:
                 self.hud.send()
 
                 tick = Tick(t, ego, speed, others, stop_gap, engaged)
+                tick.walkers, tick.throttle, tick.brake = walkers, throttle, brake
                 tick.held_for = 0.0 if held_since is None else t - held_since
                 tick.turn_yaw = ego[4]
                 done = on_tick(tick, result, driver)
@@ -786,6 +793,7 @@ class Suite:
                     self.hud.event("Ran out of time")
                     done = True
         finally:
+            view.close()
             result.duration = round(now - started, 1) if started is not None else 0.0
             result.red_light_violations = len(lights.runs)
             result.min_ttc = None if math.isinf(min_ttc) else round(min_ttc, 3)
@@ -1035,6 +1043,7 @@ class Suite:
         result = self.run_stage(3, "Blind corner and MQTT safety gate", "[TEST 3/5] BLIND CORNER HAZARD - MQTT SAFETY GATE ACTIVE", stop, STRAIGHT, T3_LIMIT, on_tick, build)
         result.notes += notes
         result.notes.append(f"closest the speeding car came: {shown(state['closest_runner'], 1)} m")
+        result.hazard_gap = None if math.isinf(state["closest_runner"]) else state["closest_runner"]
         return grade_blind_corner(result, state["heard"], state["stopped_at"] is not None)
 
     def test_cut_in(self):
@@ -1102,6 +1111,8 @@ class Suite:
         self.release_lights()
         self.mqtt.stop()
         self.safety.close()
+        if self.receiver is not None:
+            self.receiver.close()
         self.csv_file.close()
 
 
@@ -1126,8 +1137,8 @@ def load_rounds():
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
-def run_tests(carla, client, chosen, console, seed=0, repeat=1):
-    suite = Suite(carla, client, Policy(), console, seed)
+def run_tests(carla, client, chosen, console, seed=0, repeat=1, perception="truth"):
+    suite = Suite(carla, client, Policy(), console, seed, perception)
     tests = {1: suite.test_lights, 2: suite.test_left_turn, 3: suite.test_blind_corner, 4: suite.test_cut_in, 5: suite.test_light_change}
     results = []
     try:
@@ -1158,6 +1169,7 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="leave out the live table of values")
     parser.add_argument("--seed", type=int, help="picks test 2's traffic; different each time if left out")
     parser.add_argument("--repeat", type=int, default=1, help="run the tests this many times, saving only to output/repeat_results.json")
+    parser.add_argument("--perception", choices=MODES, default="truth", help="what the ML car is told about other actors; rsu needs the processor running with --detector onnx")
     parser.add_argument("--attached", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     for name in ("SIGBREAK", "SIGTERM"):
@@ -1174,9 +1186,15 @@ def main():
     client.set_timeout(30.0)
     console = Console(args.quiet)
     chosen = args.only or [1, 2, 3, 4, 5]
-    results = run_tests(carla, client, chosen, console, int(time.time()) if args.seed is None else args.seed, args.repeat)
+    results = run_tests(carla, client, chosen, console, int(time.time()) if args.seed is None else args.seed, args.repeat, args.perception)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
+    if args.perception != "truth":  # these don't replace the suite's own results, which are for true positions
+        (OUTPUT_DIR / f"suite_results_{args.perception}.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+        passed = sum(r["passed"] for r in results)
+        console.plain("\n" + "\n".join(results_table(results)) + "\n")
+        console.line("SCENARIO", f"Finished with {args.perception}: {passed} of {len(results)} tests passed.")
+        return 0 if passed == len(results) else 2
     if args.repeat > 1:
         (OUTPUT_DIR / "repeat_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
         for number in chosen:

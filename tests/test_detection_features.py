@@ -12,10 +12,14 @@ from detection_features import (
     GRID_SIZE,
     MAX_HEIGHT,
     MODEL_GROUND_Z,
+    OUTPUT_CHANNELS,
+    OUTPUT_SIZE,
     PEDESTRIAN,
     VEHICLE,
     count_points,
     crop_to_grid,
+    decode,
+    encode_labels,
     label_row,
     points_in_box,
     rasterize,
@@ -153,3 +157,54 @@ def test_a_crossing_is_walked_from_the_nearer_kerb_and_only_when_in_reach():
     assert sum(len(route) == 2 for route in picks) < 40  # most of the time they stay on the pavement
     far = ((500.0, 0.0), (500.0, 19.0))
     assert all(next_route((0.0, 0.0), [(1.0, 0.0)], [far], random.Random(seed)) == [(1.0, 0.0)] for seed in range(50))
+
+
+def labelled(x, y, kind=VEHICLE, points=40, yaw_degrees=30.0):
+    # Given in CARLA's frame, where y is right, as a recording would make it
+    size = (2.25, 1.0, 0.75) if kind == VEHICLE else (0.3, 0.3, 0.9)
+    row = label_row((x, y, size[2]), size, yaw_degrees, (0.0, 0.0), kind)
+    row[8] = points
+    return row
+
+
+def test_decoding_perfect_targets_gives_the_labels_back():
+    labels = np.array([labelled(10.3, -20.2), labelled(-30.1, 15.7, PEDESTRIAN)], dtype=np.float32)
+    target, weight, centres = encode_labels(labels)
+    assert target.shape == (OUTPUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE)
+    assert centres.sum() == 2
+    assert weight.min() == 1.0
+    rows = decode(target, 0.5)
+    assert len(rows) == 2
+    for label in labels:
+        found = rows[rows[:, 8] == label[7]][0]
+        assert found[:6] == pytest.approx(label[:6], abs=1e-3)
+        assert math.sin(2 * found[6]) == pytest.approx(math.sin(2 * label[6]), abs=1e-3)
+        assert found[7] == pytest.approx(1.0)
+
+
+def test_an_actor_too_hidden_to_see_is_neither_a_target_nor_a_mistake():
+    target, weight, centres = encode_labels(np.array([labelled(10.0, 10.0, points=1)], dtype=np.float32))
+    assert target.max() == 0.0
+    assert centres.sum() == 0
+    assert weight[VEHICLE].min() == 0.0
+    assert weight[PEDESTRIAN].min() == 1.0  # and only for its own class
+
+
+def test_a_seen_actor_beside_a_hidden_one_is_still_a_target():
+    labels = np.array([labelled(10.0, 10.0), labelled(10.5, 10.5, points=0)], dtype=np.float32)
+    target, weight, _ = encode_labels(labels)
+    assert weight[VEHICLE][target[VEHICLE] > 0.5].min() == 1.0
+
+
+def test_decode_takes_one_box_per_peak_and_respects_each_class_threshold():
+    target, _, _ = encode_labels(np.array([labelled(0.0, 0.0), labelled(20.0, 0.0, PEDESTRIAN)], dtype=np.float32))
+    target[PEDESTRIAN] *= 0.4
+    assert len(decode(target, 0.5)) == 1
+    assert len(decode(target, 0.3)) == 2
+    assert len(decode(target, (0.5, 0.3))) == 2
+    assert len(decode(target, (1.1, 0.3))) == 1
+
+
+def test_an_empty_scene_decodes_to_nothing():
+    assert decode(np.zeros((OUTPUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE), dtype=np.float32), 0.5).shape == (0, 9)
+    assert encode_labels(np.zeros((0, 11), dtype=np.float32))[2].sum() == 0

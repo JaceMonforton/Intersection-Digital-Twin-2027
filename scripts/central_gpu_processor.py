@@ -29,13 +29,22 @@ from pathlib import Path
 import numpy as np
 import requests
 import websocket
-from detection_features import MODEL_GROUND_Z
+from detection_features import (
+    GRID_SIZE,
+    MODEL_GROUND_Z,
+    PEDESTRIAN,
+    VEHICLE,
+    decode,
+    rasterize,
+)
 from model_panel import SafetySender
+from roadside_link import RoadsideSender
 from waymo_predictor_node import (
     DEFAULT_MODEL as TRAJECTORY_MODEL,
 )
 from waymo_predictor_node import (
     STEP_SECONDS,
+    STRAIGHT,
     YAW_HISTORY,
     HistoryBuffer,
     LaneFollower,
@@ -94,8 +103,12 @@ INTERSECTION_THING = "org.example:intersection_01"
 CONTROLLED_VEHICLE = "vehicle_ml"  # the only vehicle with a SafetyGate
 VEHICLES = ("vehicle_ml", "human_vehicle")
 
-DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "centerpoint_3d.onnx"
-DETECTION_THRESHOLD = 0.5
+DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "rsu_detector.onnx"
+DETECTION_THRESHOLD = (0.585, 0.223)  # vehicle, pedestrian: the best F1 on seed 4, kept apart from the final test on seed 5
+TRACK_ALPHA, TRACK_BETA = 0.4, 0.1  # how much of each new position's surprise goes into the position and the velocity
+TRACK_CONFIRM = 2           # sightings before a track counts, so one false box can't latch the brake
+PEDESTRIAN_GATE = 1.5       # metres; people walk beside each other, so match them more tightly than cars
+EGO_RADIUS = 3.0            # metres; a box this close to the ML car's own position is the ML car
 
 TTC_BRAKE = 1.5             # seconds; REQ-SYS-011
 # Straight-line TTC can't see a turn coming, and by the time it fires the car is across the lane.
@@ -279,30 +292,66 @@ def fuse(telemetry, detections, gate=FUSION_GATE):
 
 
 class CentroidTracker:
-    """Gives per-frame detections stable ids and a velocity from successive positions."""
+    """Gives per-frame detections stable ids, a smoothed position and velocity, and a yaw that faces the way the
+    track is moving. A velocity from two positions alone would turn 0.2 m of jitter into 2 m/s at 10 Hz.
+    A track keeps going on its velocity for up to max_age without a sighting, so a missed frame isn't a missed car."""
 
-    def __init__(self, gate=FUSION_GATE, max_age=0.5):
+    def __init__(self, gate=FUSION_GATE, max_age=0.5, confirm=1, name="lidar"):
         self.gate = gate
         self.max_age = max_age
-        self.tracks = {}  # id -> (Track, last seen)
+        self.confirm = confirm
+        self.name = name
+        self.tracks = {}  # id -> [Track, time of its state, last sighting, sightings, recent yaws]
         self._ids = itertools.count()
 
-    def update(self, points, now):
-        self.tracks = {k: v for k, v in self.tracks.items() if now - v[1] <= self.max_age}
-        free = dict(self.tracks)
-        result = {}
-        for x, y in points:
-            best = min(free, key=lambda k: math.hypot(free[k][0].x - x, free[k][0].y - y), default=None)
-            if best is not None and math.hypot(free[best][0].x - x, free[best][0].y - y) <= self.gate:
-                prev, seen = free.pop(best)
-                dt = now - seen
-                track = Track(best, x, y, *(((x - prev.x) / dt, (y - prev.y) / dt) if dt > 0
-                                            else (prev.vx, prev.vy)))
-            else:
-                track = Track(f"lidar:{next(self._ids)}", x, y)
-            result[track.id] = (track, now)
-        self.tracks.update(result)
-        return [v[0] for v in result.values()]
+    def update(self, detections, now):
+        """detections are (x, y) or (x, y, yaw in degrees, which may be half a turn out). Returns the confirmed tracks."""
+        self.tracks = {k: v for k, v in self.tracks.items() if now - v[2] <= self.max_age}
+        predicted = {k: (v[0].x + v[0].vx * (now - v[1]), v[0].y + v[0].vy * (now - v[1])) for k, v in self.tracks.items()}
+        free = dict(predicted)
+        for x, y, *rest in detections:
+            best = min(free, key=lambda k: math.hypot(free[k][0] - x, free[k][1] - y), default=None)
+            if best is None or math.hypot(free[best][0] - x, free[best][1] - y) > self.gate:
+                track = Track(f"{self.name}:{next(self._ids)}", x, y)
+                self.tracks[track.id] = [track, now, now, 1, deque(maxlen=YAW_HISTORY)]
+                self._set_yaw(self.tracks[track.id], rest[0] if rest else None)
+                continue
+            px, py = free.pop(best)
+            state = self.tracks[best]
+            self._correct(state, px, py, x, y, now)
+            self._set_yaw(state, rest[0] if rest else None)
+        for key in free:  # no sighting this tick, so carry on at the same velocity
+            state = self.tracks[key]
+            state[0].x, state[0].y = predicted[key]
+            state[1] = now
+        return [v[0] for v in self.tracks.values() if v[3] >= self.confirm]
+
+    @staticmethod
+    def _correct(state, px, py, x, y, now):
+        track, updated, _seen, sightings, _yaws = state
+        dt = now - updated
+        if sightings == 1 and dt > 0:  # nothing to smooth against yet
+            track.vx, track.vy = (x - track.x) / dt, (y - track.y) / dt
+            track.x, track.y = x, y
+        else:
+            rx, ry = x - px, y - py
+            track.x, track.y = px + TRACK_ALPHA * rx, py + TRACK_ALPHA * ry
+            if dt > 0:
+                track.vx += TRACK_BETA * rx / dt
+                track.vy += TRACK_BETA * ry / dt
+        state[1], state[2], state[3] = now, now, sightings + 1
+
+    @staticmethod
+    def _set_yaw(state, yaw):
+        track, yaws = state[0], state[4]
+        if yaw is not None:
+            ahead = (math.degrees(math.atan2(track.vy, track.vx)) if math.hypot(track.vx, track.vy) >= STOPPED_SPEED
+                     else track.yaw)
+            if ahead is not None and abs((yaw - ahead + 180.0) % 360.0 - 180.0) > 90.0:
+                yaw = (yaw + 180.0) % 360.0
+            track.yaw = yaw
+            yaws.append(yaw)
+        track.yaw_rate = turn_rate(list(yaws))
 
 
 @dataclass
@@ -341,18 +390,6 @@ def lidar_to_model_frame(points, mount, ground_z=MODEL_GROUND_Z):
     out[:, 1] = -(out[:, 1] + mount[1])
     out[:, 2] += mount[2] + ground_z
     return out
-
-
-def fit_model_input(points, shape):
-    """Shape an N x 4 matrix for an input declared as [N, 4] or [1, N, 4]. A fixed N is met by
-    evenly thinning, which keeps the scan pattern, or by padding with zero points."""
-    declared_n = shape[-2]
-    if isinstance(declared_n, int):
-        if len(points) > declared_n:
-            points = points[np.linspace(0, len(points) - 1, declared_n).astype(int)]
-        elif len(points) < declared_n:
-            points = np.vstack((points, np.zeros((declared_n - len(points), 4), dtype=np.float32)))
-    return points[None] if len(shape) == 3 else points
 
 
 def model_box_to_world(row, center_x, center_y, center_z, ground_z=MODEL_GROUND_Z):
@@ -693,8 +730,8 @@ def merged_sweep(lidars, frame, exact=False):
     return np.vstack(parts)
 
 
-class CenterPointDetector:
-    """3D boxes from a LiDAR sweep. See models/README.md for the expected model contract."""
+class RoadsideDetector:
+    """3D boxes from a merged sweep. See models/README.md for the model contract."""
 
     def __init__(self, path):
         import onnxruntime
@@ -704,17 +741,15 @@ class CenterPointDetector:
                                  "CPUExecutionProvider") if p in available]
         self.session = onnxruntime.InferenceSession(str(path), providers=providers)
         model_input = self.session.get_inputs()[0]
-        self.shape = model_input.shape
-        if len(self.shape) not in (2, 3) or self.shape[-1] != 4:
-            raise ValueError(f"{path} takes input of shape {self.shape}, but this detector feeds "
-                             "[N, 4] or [1, N, 4] points. See models/README.md.")
+        if model_input.shape != [1, 2, GRID_SIZE, GRID_SIZE]:
+            raise ValueError(f"{path} takes input of shape {model_input.shape}, but this detector feeds "
+                             f"[1, 2, {GRID_SIZE}, {GRID_SIZE}]. See models/README.md.")
         self.input_name = model_input.name
 
     def detect(self, points):
         """Rows of (x, y, z, length, width, height, yaw, score, class) above the score threshold."""
-        tensor = fit_model_input(points, self.shape).astype(np.float32)
-        rows = self.session.run(None, {self.input_name: tensor})[0].reshape(-1, 9)
-        return rows[rows[:, 7] >= DETECTION_THRESHOLD]
+        output = self.session.run(None, {self.input_name: rasterize(points)[None]})[0][0]
+        return decode(output, DETECTION_THRESHOLD)
 
 
 class CarlaPerception:
@@ -744,7 +779,9 @@ class CarlaPerception:
         self.gantry = carla.Location(x=self.center.x, y=self.center.y, z=self.center.z + GANTRY_HEIGHT)
 
         self.detector = None
-        self.tracker = CentroidTracker()
+        self.tracker = CentroidTracker(confirm=TRACK_CONFIRM)
+        self.walker_tracker = CentroidTracker(gate=PEDESTRIAN_GATE, confirm=TRACK_CONFIRM, name="walker")
+        self.roadside = RoadsideSender()
         self.lanes = LaneFollower(carla, self.world.get_map())
         self._recent_yaws = {}  # actor id -> recent yaws, for the turn rate
         self._ml_history = HistoryBuffer()
@@ -757,7 +794,7 @@ class CarlaPerception:
         self.boxes = []
         self._previous = {}  # actor id -> (x, y, time), for actors CARLA reports no velocity for
         if detector_mode == "onnx" or (detector_mode == "auto" and Path(model_path).exists()):
-            self.detector = CenterPointDetector(model_path)
+            self.detector = RoadsideDetector(model_path)
             self.box_color = carla.Color(*BOX_COLOR_MODEL)
             print(f"[LIDAR] Using model {model_path}")
         else:
@@ -808,8 +845,43 @@ class CarlaPerception:
             self.boxes = []
             return []
         rows = self.detector.detect(points)
-        self.boxes = [model_box_to_world(r, self.center.x, self.center.y, self.center.z) for r in rows]
-        return self.tracker.update([(b.x, b.y) for b in self.boxes], now)
+        found = [model_box_to_world(r, self.center.x, self.center.y, self.center.z) for r in rows]
+        own, own_box = self._own_track(now)
+        if own is not None:
+            keep = [math.hypot(b.x - own.x, b.y - own.y) > EGO_RADIUS for b in found]
+            rows, found = rows[keep] if len(rows) else rows, [b for b, k in zip(found, keep) if k]
+        self.boxes = found + ([own_box] if own_box else [])
+        cars = self.tracker.update([(b.x, b.y, b.yaw) for b, r in zip(found, rows) if r[8] == VEHICLE], now)
+        walkers = self.walker_tracker.update([(b.x, b.y) for b, r in zip(found, rows) if r[8] == PEDESTRIAN], now)
+        for car in cars:
+            car.path = self._detected_path(car)
+        self.roadside.send(now, [(c.x, c.y, c.vx, c.vy, c.yaw if c.yaw is not None else math.degrees(math.atan2(c.vy, c.vx))) for c in cars],
+                           [(w.x, w.y, w.vx, w.vy) for w in walkers])
+        # Only vehicles reach the safety checks: a person standing by the road would otherwise latch the brake
+        return [*cars, own] if own is not None else cars
+
+    def _own_track(self, now):
+        """The ML car's own state, which it knows from its own telemetry, and needn't be told by a detector."""
+        car = next((a for a in self.world.get_actors().filter("vehicle.*") if a.attributes.get("role_name") == CONTROLLED_VEHICLE), None)
+        if car is None:
+            return None, None
+        tf, v = car.get_transform(), car.get_velocity()
+        x, y = tf.location.x, tf.location.y
+        path = self._predict_path(car, tf, x, y, v.x, v.y)
+        self._ml_history.retain([car.id])
+        bb = car.bounding_box
+        c = tf.transform(bb.location)
+        box = Box(c.x + v.x * FIXED_DELTA, c.y + v.y * FIXED_DELTA, c.z, 2 * bb.extent.x, 2 * bb.extent.y, 2 * bb.extent.z, tf.rotation.yaw, True)
+        return Track(CONTROLLED_VEHICLE, x, y, v.x, v.y, path, tf.rotation.yaw, turn_rate(list(self._recent_yaws[car.id]))), box
+
+    def _detected_path(self, track):
+        """Where a detected car is expected to go, from its track. It has no blinker to read, so unless it's already
+        turning it's taken to carry straight on, and a car about to turn is only predicted once it starts."""
+        if track.yaw is None:
+            return None
+        speed = math.hypot(track.vx, track.vy)
+        path = self.lanes.path(track.x, track.y, track.yaw, speed, turn_intent(STRAIGHT, track.yaw_rate))
+        return path if path is not None else curve_path(track.x, track.y, track.yaw, speed, track.yaw_rate)
 
     def _ground_truth(self, now):
         tracks, boxes, previous = [], [], {}

@@ -45,10 +45,12 @@ from detection_features import (
     GRID_HALF,
     MIN_POINTS,
     PEDESTRIAN,
+    POINT_SCALE,
     VEHICLE,
     count_points,
     crop_to_grid,
     label_row,
+    load_sweep,
 )
 
 RAW_DIR = ROOT / "data" / "detection" / "raw"
@@ -68,7 +70,6 @@ CROSSING_CHANCE = 0.1   # of using a crossing in reach, each time it picks somew
 WALKER_STANDING = 0.15  # the share of pedestrians that stand still, as at a crossing
 LOCATION_TRIES = 5000
 TRAFFIC_TIMEOUT = 120.0
-POINT_SCALE = 100.0     # points are saved as whole centimetres, which is a third of the size
 
 
 def _raise_keyboard_interrupt(signum, frame):
@@ -82,12 +83,6 @@ def traffic_level(seed):
 def save_sweep(path, points, labels):
     np.savez_compressed(path, points=np.round(crop_to_grid(points)[:, :3] * POINT_SCALE).astype(np.int16),
                         labels=np.array(labels, np.float32).reshape(-1, 11))
-
-
-def load_sweep(path):
-    """The saved points as float32 (x, y, z), and the labels as in detection_features.LABEL_COLUMNS."""
-    with np.load(path) as data:
-        return data["points"].astype(np.float32) / POINT_SCALE, data["labels"]
 
 
 def labels_for(actors, snapshot, center, points):

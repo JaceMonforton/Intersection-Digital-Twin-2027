@@ -414,7 +414,7 @@ These are the targets from the project report, against what has been measured so
 - **Cars are recycled.** Autopilot routes wander off, so cars far from the intersection are moved back onto nearby roads, out of sight, to keep it busy.
 - **Other cars' boxes show in the ML car's window.** CARLA draws debug shapes into every camera. The ML car's own box is hidden by drawing it above its cameras' view.
 - **The path check only works on CARLA actors.** Telemetry alone and model detections fall back to the 1.5 s TTC rule. That includes physical vehicles until lab positions are mapped into CARLA.
-- **No trained models are in the repo.** The driving and trajectory models are trained locally, and the trajectory model stays out of git until the Waymo licence is checked. There's no detection model at all, and a stock CenterPoint is unlikely to work from an overhead sensor. See [models/README.md](models/README.md).
+- **No trained models are in the repo.** The driving and trajectory models are trained locally, and the trajectory model stays out of git until the Waymo licence is checked. The roadside detection model isn't switched on yet, so the safety gate still uses CARLA's true positions. See [models/README.md](models/README.md).
 - **The trajectory model can't anticipate a turn.** It only sees 1 s of motion, with no map or turn signal. See [its results](#train-the-trajectory-model).
 - **The vehicle can't tell if the processor has died.** The gate fails safe if the broker link drops, but a crashed processor simply stops sending hazards.
 - **A silent Wi-Fi drop took 3.8 s to detect** in testing, which is longer than the 1.5 s brake window. Lowering `MQTT_KEEPALIVE` shortens it.

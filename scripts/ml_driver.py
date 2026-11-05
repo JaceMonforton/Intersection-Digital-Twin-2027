@@ -25,6 +25,7 @@ import numpy as np
 import requests
 from central_gpu_processor import ML_PAINT
 from driving_features import CROSSING_LOOK, SpeedController, encode_inputs
+from roadside_link import MODES, make_view
 from traffic_monitor import (
     GATE_URL,
     LOOK_AHEAD,
@@ -265,7 +266,7 @@ def actor_state(actor):
     return tf.location.x, tf.location.y, v.x, v.y, tf.rotation.yaw
 
 
-def drive(carla, world, policy, duration, seed, ignore_brake, release_hold=None):
+def drive(carla, world, policy, duration, seed, ignore_brake, release_hold=None, perception="truth"):
     """release_hold is seconds after which a latched brake is released, standing in for an operator. Left
     as None, nothing here releases it."""
     rng = random.Random(seed)
@@ -297,6 +298,8 @@ def drive(carla, world, policy, duration, seed, ignore_brake, release_hold=None)
     held_since = None
     last_log = now = 0.0
     seen_turns = set()
+    view = make_view(perception, carla, world, car, 0.1)
+    print(f"[ML DRIVER] It's told about other actors by: {view.name}", flush=True)
     try:
         while duration <= 0 or now < duration:
             snapshot = world.wait_for_tick(10.0)
@@ -308,10 +311,11 @@ def drive(carla, world, policy, duration, seed, ignore_brake, release_hold=None)
 
             ego = actor_state(car)
             speed = math.hypot(ego[2], ego[3])
-            cars = [actor_state(a) for a in world.get_actors().filter("vehicle.*") if a.id != car.id]
-            walkers = [(w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
-                       for w in world.get_actors().filter("walker.pedestrian.*")]
+            cars = {a.id: actor_state(a) for a in world.get_actors().filter("vehicle.*") if a.id != car.id}
+            walkers = {w.id: (w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
+                       for w in world.get_actors().filter("walker.pedestrian.*")}
             not_green = lights.not_green()
+            seen_cars, seen_walkers, fresh = view.see(ego, cars, walkers, snapshot.timestamp.elapsed_seconds)
 
             try:
                 gate = session.get(GATE_URL, timeout=0.5).json()
@@ -333,7 +337,7 @@ def drive(carla, world, policy, duration, seed, ignore_brake, release_hold=None)
             elif gate:
                 held_since = None
 
-            steer, throttle, brake = driver.controls(ego, not_green, cars, walkers, released or ignore_brake)
+            steer, throttle, brake = driver.controls(ego, not_green, seen_cars, seen_walkers, fresh and (released or ignore_brake))
             car.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
             for series, value in zip(driven, (steer, throttle, brake, speed)):
                 series.append(value)
@@ -373,6 +377,7 @@ def drive(carla, world, policy, duration, seed, ignore_brake, release_hold=None)
     except KeyboardInterrupt:
         pass
     finally:
+        view.close()
         sensor.stop()
         sensor.destroy()
         car.destroy()
@@ -399,6 +404,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="picks the start and the route")
     parser.add_argument("--ignore-brake", action="store_true", help="drive through brake requests, to measure the model alone")
     parser.add_argument("--model", default=str(MODEL_PATH))
+    parser.add_argument("--perception", choices=MODES, default="truth", help="what it's told about other actors; rsu needs the processor running with --detector onnx")
     args = parser.parse_args()
 
     for name in ("SIGBREAK", "SIGTERM"):
@@ -416,7 +422,7 @@ def main():
     client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(30.0)
     try:
-        report = drive(carla, client.get_world(), policy, args.duration, args.seed, args.ignore_brake)
+        report = drive(carla, client.get_world(), policy, args.duration, args.seed, args.ignore_brake, perception=args.perception)
     except RuntimeError as error:
         print(f"[ML DRIVER] Stopped: {error}. Is central_gpu_processor.py running?")
         return 1
