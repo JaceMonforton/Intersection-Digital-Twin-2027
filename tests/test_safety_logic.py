@@ -166,20 +166,20 @@ def test_tracker_smooths_jitter_into_a_steady_velocity():
 
 
 def test_tracker_only_reports_a_track_seen_often_enough():
-    tracker = CentroidTracker(confirm=2)
+    tracker = CentroidTracker(confirm=(2, 5))
     assert tracker.update([(0.0, 0.0)], 0.0) == []
     assert len(tracker.update([(0.1, 0.0)], 0.1)) == 1
 
 
 def test_a_single_false_box_never_becomes_a_track():
-    tracker = CentroidTracker(confirm=2)
+    tracker = CentroidTracker(confirm=(2, 5))
     assert tracker.update([(0.0, 0.0)], 0.0) == []
     assert tracker.update([], 0.1) == []
     assert tracker.update([(50.0, 0.0)], 0.2) == []
 
 
 def test_tracker_carries_a_missed_car_on_at_its_velocity_then_drops_it():
-    tracker = CentroidTracker(max_age=0.5, confirm=2)
+    tracker = CentroidTracker(max_age=0.5, confirm=(2, 5))
     for tick in range(10):
         tracks = tracker.update([(0.5 * tick, 0.0)], tick * 0.1)
     before = tracks[0]
@@ -187,6 +187,22 @@ def test_tracker_carries_a_missed_car_on_at_its_velocity_then_drops_it():
     assert coasted[0].id == before.id
     assert coasted[0].x == pytest.approx(5.0, abs=0.3)
     assert tracker.update([], 2.0) == []
+
+
+def test_a_spot_that_only_flickers_never_becomes_a_steady_ghost():
+    tracker = CentroidTracker(max_age=0.5, confirm=(5, 10))
+    reported = 0
+    for tick in range(100):  # a pole above the threshold one tick in three, always in the same place
+        reported += len(tracker.update([(10.0, 10.0)] if tick % 3 == 0 else [], tick * 0.1))
+    assert reported == 0
+
+
+def test_a_person_detected_most_of_the_time_is_reported_without_gaps():
+    tracker = CentroidTracker(max_age=0.5, confirm=(5, 10))
+    reported = []
+    for tick in range(60):  # missed one tick in four
+        reported.append(len(tracker.update([] if tick % 4 == 3 else [(0.15 * tick, 0.0)], tick * 0.1)))
+    assert reported[10:] == [1] * 50
 
 
 def test_tracker_turns_a_box_yaw_to_face_the_way_the_track_moves():
@@ -217,6 +233,14 @@ def test_lidar_frame_is_y_left_with_the_road_at_ground_z():
     points = np.array([[1.0, 2.0, -7.0, 0.5]], dtype=np.float32)
     assert lidar_to_model_frame(points, (0.0, 0.0, 7.0), ground_z=-1.8).tolist()[0] == pytest.approx([1.0, -2.0, -1.8, 0.5])
     assert points[0, 1] == 2.0  # input untouched
+
+
+def test_a_turned_lidar_still_puts_a_spot_in_the_same_place():
+    # 10 m along the world's x from a sensor turned 90 degrees: it reads that as 10 m to its left, which in CARLA is -y
+    turned = np.array([[0.0, -10.0, -7.0, 0.5]], dtype=np.float32)
+    straight = np.array([[10.0, 0.0, -7.0, 0.5]], dtype=np.float32)
+    mount = (1.0, 2.0, 7.0)
+    assert lidar_to_model_frame(turned, mount, ground_z=-1.8, yaw=90.0).tolist()[0] == pytest.approx(lidar_to_model_frame(straight, mount, ground_z=-1.8).tolist()[0])
 
 
 def test_two_lidars_put_the_same_spot_at_the_same_place():

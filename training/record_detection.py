@@ -9,7 +9,7 @@ doesn't mean recording again. A sweep is only saved if it's from the same frame 
 
 Needs the processor running, and the main Python environment, which has carla. Keep whole seeds aside for
 testing, since neighbouring sweeps are nearly the same.
-    python training/record_detection.py --seeds 1 2 3 4 5 --sweeps 600
+    python training/record_detection.py --seeds 20 21 22 23 25 26 28 29 --sweeps 600
     python training/record_detection.py --check 1    # summarise a seed and save an image with its boxes on
 """
 import argparse
@@ -56,6 +56,7 @@ from detection_features import (
 RAW_DIR = ROOT / "data" / "detection" / "raw"
 CHECK_DIR = ROOT / "data" / "lidar_check"
 TICKS_PER_SWEEP = 10    # 1 s apart, since neighbouring ticks are nearly the same scene
+SWEEPS_PER_PHASE = 30   # sweeps before the LiDARs are respawned at a new phase, which a real one doesn't hold either
 WARM_UP_TICKS = 300     # so that the traffic has spread out and reached the junction
 # (vehicles, pedestrians at the junction), by seed. --near-view has 53 spawn points far enough from the stop lines
 TRAFFIC_LEVELS = ((25, 15), (35, 30), (50, 45))
@@ -74,6 +75,16 @@ TRAFFIC_TIMEOUT = 120.0
 
 def _raise_keyboard_interrupt(signum, frame):
     raise KeyboardInterrupt
+
+
+def random_phases(rng):
+    return [rng.uniform(0.0, 360.0) for _ in LIDAR_MOUNTS]
+
+
+def destroy_lidars(lidars):
+    for lidar in lidars:
+        lidar.sensor.stop()
+        lidar.sensor.destroy()
 
 
 def traffic_level(seed):
@@ -233,7 +244,8 @@ def record_seed(carla, client, world, center, seed, sweeps):
                 snapshot = world.wait_for_tick(10.0)
                 if tick % WALKER_STEER_TICKS == 0:
                     steer_walkers(carla, walkers, snapshot, spots, crossings, rng)
-            lidars = spawn_lidars(carla, world, center)
+            phase_rng = random.Random(seed)
+            lidars = spawn_lidars(carla, world, center, yaws=random_phases(phase_rng))
 
             saved, late, ticks = 0, 0, 0
             while saved < sweeps:
@@ -250,12 +262,13 @@ def record_seed(carla, client, world, center, seed, sweeps):
                 actors = [*world.get_actors().filter("vehicle.*"), *world.get_actors().filter("walker.pedestrian.*")]
                 save_sweep(out / f"{snapshot.frame}.npz", points, labels_for(actors, snapshot, center, points))
                 saved += 1
+                if saved % SWEEPS_PER_PHASE == 0:
+                    destroy_lidars(lidars)
+                    lidars = spawn_lidars(carla, world, center, yaws=random_phases(phase_rng))
                 if saved % 60 == 0:
                     print(f"[RECORD] Seed {seed}: {saved} of {sweeps} sweeps, {late} dropped for arriving late.", flush=True)
         finally:
-            for lidar in lidars:
-                lidar.sensor.stop()
-                lidar.sensor.destroy()
+            destroy_lidars(lidars)
             client.apply_batch_sync([carla.command.DestroyActor(w.actor.id) for w in walkers])
             stop_traffic(traffic)
 
@@ -307,7 +320,7 @@ def check_seed(seed):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 4, 5])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[20, 21, 22, 23, 25, 26, 28, 29])
     parser.add_argument("--sweeps", type=int, default=600, help="sweeps per seed")
     parser.add_argument("--check", type=int, help="summarise this seed's recording, with no CARLA running")
     args = parser.parse_args()

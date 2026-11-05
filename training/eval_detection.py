@@ -1,10 +1,10 @@
 """
-Measures the roadside detector on a recorded seed. Run it with a seed that wasn't trained on. Seed 4 is for
-choosing the thresholds, and seed 5 is for the final figures, so seed 5 should only be used once a model is
+Measures the roadside detector on a recorded seed. Run it with a seed that wasn't trained on. Seed 28 is for
+choosing the thresholds, and seed 29 is for the final figures, so seed 29 should only be used once a model is
 chosen. Needs only numpy and onnxruntime.
 
-    python training/eval_detection.py models/rsu_detector.candidate.onnx --seed 4
-    python training/eval_detection.py models/rsu_detector.candidate.onnx --seed 5 --threshold 0.4 0.3
+    python training/eval_detection.py models/rsu_detector.candidate.onnx --seed 28
+    python training/eval_detection.py models/rsu_detector.candidate.onnx --seed 29 --threshold 0.4 0.3
 
 "Seen" actors are those with at least MIN_POINTS LiDAR points on them. A box beside an actor with fewer points
 isn't counted as a mistake, nor is missing that actor. "On the road" is approximate: it's within ROAD_REACH of
@@ -165,7 +165,7 @@ def seed_files(seed):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("model")
-    parser.add_argument("--seed", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=28)
     parser.add_argument("--threshold", type=float, nargs=CLASSES, help="vehicle and pedestrian; chosen for the best F1 if left out")
     parser.add_argument("--output", help="also save the results to this JSON file")
     args = parser.parse_args()

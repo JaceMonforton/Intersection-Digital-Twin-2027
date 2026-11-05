@@ -106,7 +106,10 @@ VEHICLES = ("vehicle_ml", "human_vehicle")
 DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "rsu_detector.onnx"
 DETECTION_THRESHOLD = (0.585, 0.223)  # vehicle, pedestrian: the best F1 on seed 4, kept apart from the final test on seed 5
 TRACK_ALPHA, TRACK_BETA = 0.4, 0.1  # how much of each new position's surprise goes into the position and the velocity
-TRACK_CONFIRM = 2           # sightings before a track counts, so one false box can't latch the brake
+# A track only counts while it was seen in this many of its last ticks: (sightings, ticks). A real actor is detected in
+# most ticks, while a pole flickers above the threshold now and then, which a memory alone would join into a steady ghost.
+CAR_CONFIRM = (2, 5)        # so that one false box can't latch the brake, and a car is reported within 0.2 s
+WALKER_CONFIRM = (5, 10)
 PEDESTRIAN_GATE = 1.5       # metres; people walk beside each other, so match them more tightly than cars
 EGO_RADIUS = 3.0            # metres; a box this close to the ML car's own position is the ML car
 
@@ -296,12 +299,12 @@ class CentroidTracker:
     track is moving. A velocity from two positions alone would turn 0.2 m of jitter into 2 m/s at 10 Hz.
     A track keeps going on its velocity for up to max_age without a sighting, so a missed frame isn't a missed car."""
 
-    def __init__(self, gate=FUSION_GATE, max_age=0.5, confirm=1, name="lidar"):
+    def __init__(self, gate=FUSION_GATE, max_age=0.5, confirm=(1, 5), name="lidar"):
         self.gate = gate
         self.max_age = max_age
-        self.confirm = confirm
+        self.confirm, self.window = confirm
         self.name = name
-        self.tracks = {}  # id -> [Track, time of its state, last sighting, sightings, recent yaws]
+        self.tracks = {}  # id -> [Track, time of its state, last sighting, sightings, recent yaws, seen in recent ticks]
         self._ids = itertools.count()
 
     def update(self, detections, now):
@@ -313,22 +316,24 @@ class CentroidTracker:
             best = min(free, key=lambda k: math.hypot(free[k][0] - x, free[k][1] - y), default=None)
             if best is None or math.hypot(free[best][0] - x, free[best][1] - y) > self.gate:
                 track = Track(f"{self.name}:{next(self._ids)}", x, y)
-                self.tracks[track.id] = [track, now, now, 1, deque(maxlen=YAW_HISTORY)]
+                self.tracks[track.id] = [track, now, now, 1, deque(maxlen=YAW_HISTORY), deque([True], maxlen=self.window)]
                 self._set_yaw(self.tracks[track.id], rest[0] if rest else None)
                 continue
             px, py = free.pop(best)
             state = self.tracks[best]
             self._correct(state, px, py, x, y, now)
+            state[5].append(True)
             self._set_yaw(state, rest[0] if rest else None)
         for key in free:  # no sighting this tick, so carry on at the same velocity
             state = self.tracks[key]
             state[0].x, state[0].y = predicted[key]
             state[1] = now
-        return [v[0] for v in self.tracks.values() if v[3] >= self.confirm]
+            state[5].append(False)
+        return [v[0] for v in self.tracks.values() if sum(v[5]) >= self.confirm]
 
     @staticmethod
     def _correct(state, px, py, x, y, now):
-        track, updated, _seen, sightings, _yaws = state
+        track, updated, _seen, sightings = state[:4]
         dt = now - updated
         if sightings == 1 and dt > 0:  # nothing to smooth against yet
             track.vx, track.vy = (x - track.x) / dt, (y - track.y) / dt
@@ -382,12 +387,14 @@ def parse_lidar(raw_data):
     return np.frombuffer(raw_data, dtype=np.float32).reshape(-1, 4).copy()
 
 
-def lidar_to_model_frame(points, mount, ground_z=MODEL_GROUND_Z):
+def lidar_to_model_frame(points, mount, ground_z=MODEL_GROUND_Z, yaw=0.0):
     """One LiDAR's sweep, in its own CARLA frame (y right), to the model's frame shared by all of them:
-    centred on the junction, x forward, y LEFT, road at ground_z. The sensors aren't rotated."""
+    centred on the junction, x forward, y LEFT, road at ground_z. yaw is how far the sensor is turned, in degrees."""
     out = points.copy()
-    out[:, 0] += mount[0]
-    out[:, 1] = -(out[:, 1] + mount[1])
+    cos, sin = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+    x, y = points[:, 0] * cos - points[:, 1] * sin, points[:, 0] * sin + points[:, 1] * cos
+    out[:, 0] = x + mount[0]
+    out[:, 1] = -(y + mount[1])
     out[:, 2] += mount[2] + ground_z
     return out
 
@@ -674,9 +681,13 @@ class Lidar:
     sensor: object
     mount: tuple
     sweeps: queue.Queue
+    yaw: float = 0.0
 
 
-def spawn_lidars(carla, world, center, mounts=LIDAR_MOUNTS):
+def spawn_lidars(carla, world, center, mounts=LIDAR_MOUNTS, yaws=None):
+    """yaws turns each sensor, which moves where its rays land without moving the view, once it's turned back in
+    lidar_to_model_frame. A sensor spawned before the clock starts sits at a phase that depends on timing, so a model
+    has to be trained across phases, or it learns one scan pattern and sees false actors on any other."""
     bp = world.get_blueprint_library().find("sensor.lidar.ray_cast")
     bp.set_attribute("channels", str(LIDAR_CHANNELS))
     bp.set_attribute("points_per_second", str(LIDAR_POINTS_PER_SECOND))
@@ -686,9 +697,10 @@ def spawn_lidars(carla, world, center, mounts=LIDAR_MOUNTS):
     bp.set_attribute("rotation_frequency", str(1.0 / FIXED_DELTA))  # one full sweep per tick
     bp.set_attribute("dropoff_general_rate", "0.0")  # the default silently drops 45% of points
     lidars = []
-    for x, y, z in mounts:
+    for (x, y, z), yaw in zip(mounts, yaws or [0.0] * len(mounts)):
         location = carla.Location(x=center.x + x, y=center.y + y, z=center.z + z)
-        lidar = Lidar(world.spawn_actor(bp, carla.Transform(location)), (x, y, z), queue.Queue(maxsize=1))
+        place = carla.Transform(location, carla.Rotation(yaw=yaw))
+        lidar = Lidar(world.spawn_actor(bp, place), (x, y, z), queue.Queue(maxsize=1), yaw)
         lidar.sensor.listen(lambda measurement, sweeps=lidar.sweeps: _keep_newest(sweeps, measurement))
         lidars.append(lidar)
     return lidars
@@ -726,7 +738,7 @@ def merged_sweep(lidars, frame, exact=False):
         points = _sweep_for(lidar.sweeps, frame, exact)
         if points is None:
             return None
-        parts.append(lidar_to_model_frame(points, lidar.mount))
+        parts.append(lidar_to_model_frame(points, lidar.mount, yaw=lidar.yaw))
     return np.vstack(parts)
 
 
@@ -779,8 +791,8 @@ class CarlaPerception:
         self.gantry = carla.Location(x=self.center.x, y=self.center.y, z=self.center.z + GANTRY_HEIGHT)
 
         self.detector = None
-        self.tracker = CentroidTracker(confirm=TRACK_CONFIRM)
-        self.walker_tracker = CentroidTracker(gate=PEDESTRIAN_GATE, confirm=TRACK_CONFIRM, name="walker")
+        self.tracker = CentroidTracker(confirm=CAR_CONFIRM)
+        self.walker_tracker = CentroidTracker(gate=PEDESTRIAN_GATE, confirm=WALKER_CONFIRM, name="walker")
         self.roadside = RoadsideSender()
         self.lanes = LaneFollower(carla, self.world.get_map())
         self._recent_yaws = {}  # actor id -> recent yaws, for the turn rate

@@ -1,8 +1,8 @@
 """
 Trains the roadside detector on sweeps from training/record_detection.py, and exports it to ONNX.
 
-It saves rsu_detector.candidate.onnx, which nothing loads by itself. Seeds 1 to 3 train it and seed 4 picks the best
-epoch. Seed 5 isn't read here, so that training/eval_detection.py can give a fair final figure on it.
+It saves rsu_detector.candidate.onnx, which nothing loads by itself. TRAIN_SEEDS train it and VALIDATION_SEED picks the
+best epoch. Seed 29 isn't read here, so that training/eval_detection.py can give a fair final figure on it.
 
 Usage (in .venv, which has torch):
     python training/train_detection.py
@@ -34,8 +34,8 @@ from detection_features import (
 
 RAW_DIR = ROOT / "data" / "detection" / "raw"
 MODEL_OUT = ROOT / "models" / "rsu_detector.candidate.onnx"
-TRAIN_SEEDS = (1, 2, 3)
-VALIDATION_SEED = 4
+TRAIN_SEEDS = (20, 21, 22, 23, 25, 26)
+VALIDATION_SEED = 28
 ONNX_OPSET = 17
 FOCAL_ALPHA, FOCAL_BETA = 2.0, 4.0
 SIZE_WEIGHT, YAW_WEIGHT = 1.0, 0.5
