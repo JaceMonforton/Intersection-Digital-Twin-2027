@@ -63,6 +63,9 @@ def test_sending_to_nobody_never_stops_the_driver():
 
 @pytest.mark.parametrize("message, text, in_control", (
     ({"model_driving": True}, "MODEL DRIVING", True),
+    ({"model_driving": True, "source": "rsu", "fresh": True}, "MODEL DRIVING: ROADSIDE UNIT", True),
+    ({"model_driving": False, "source": "rsu", "fresh": False}, "NO ROADSIDE DATA: BRAKING", False),
+    ({"model_driving": False, "source": "truth", "fresh": True}, "SAFETY BRAKE OVERRIDE", False),
     ({"model_driving": False}, "SAFETY BRAKE OVERRIDE", False),
     (None, "NO MODEL DATA", False),
 ))

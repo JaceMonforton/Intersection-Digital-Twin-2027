@@ -684,6 +684,7 @@ class Suite:
         start = start or stop.previous(APPROACH)[0]
         ml = self.spawn_car("vehicle.tesla.model3", start, role="vehicle_ml", paint=ML_PAINT)
         telemetry = RememberingSender()
+        telemetry.source = self.perception
         driver = ModelDriver(self.policy, LaneDriver(start, TurnChooser(turn)), self.find_waypoint, rng, telemetry)
         hits = []
         sensor = self.world.spawn_actor(self.world.get_blueprint_library().find("sensor.other.collision"), carla.Transform(), attach_to=ml)
@@ -720,6 +721,7 @@ class Suite:
                            for w in self.world.get_actors().filter("walker.pedestrian.*")}
                 not_green = lights.not_green()
                 seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
+                telemetry.fresh = fresh
 
                 asked = time.perf_counter()
                 try:
