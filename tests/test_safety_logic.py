@@ -19,6 +19,7 @@ from central_gpu_processor import (
     parse_lidar,
     path_check_applies,
     path_time_to_collision,
+    person_track,
     post_encroachment_time,
     thing_to_track,
     time_to_collision,
@@ -657,3 +658,56 @@ def test_velocity_is_measured_only_when_carla_reports_none():
     assert measured_velocity(3.0, 4.0, 10.0, 0.0, (0.0, 0.0, 0.0, 0.0), 0.1) == (3.0, 4.0)
     assert measured_velocity(0.0, 0.0, 1.0, 2.0, (0.0, 0.0, 0.0, 0.0), 0.1) == pytest.approx((10.0, 20.0))
     assert measured_velocity(0.0, 0.0, 1.0, 2.0, None, 0.1) == (0.0, 0.0)
+
+
+def _car_heading_along_x():
+    path = np.column_stack((5.0 * 0.1 * np.arange(1, 31), np.zeros(30)))
+    return Track("vehicle_ml", 0.0, 0.0, 5.0, 0.0, path, 0.0)
+
+
+def test_brakes_for_a_person_walking_into_the_cars_path():
+    ditto = FakeDitto([_car_heading_along_x(), person_track("walker:1", 10.0, -3.0, 0.0, 1.5)])
+    SafetyEngine(ditto).step(100.0)
+    assert len(ditto.brakes) == 1
+
+
+def test_a_person_standing_at_the_kerb_is_not_a_track_at_all():
+    assert person_track("walker:1", 10.0, -3.0, 0.0, 0.5) is None
+
+
+def test_no_brake_for_a_person_walking_along_the_kerb():
+    ditto = FakeDitto([_car_heading_along_x(), person_track("walker:1", 10.0, -2.5, 1.5, 0.0)])
+    SafetyEngine(ditto).step(100.0)
+    assert ditto.brakes == []
+
+
+def test_a_person_close_to_a_car_is_never_merged_into_it():
+    car = Track("vehicle_ml", 0.0, 0.0, 5.0, 0.0)
+    person = person_track("walker:1", 1.0, 1.0, 1.5, 0.0)
+    assert fuse([car], [person]) == [car, person]
+
+
+def test_people_are_only_checked_against_the_ml_car():
+    other = Track("carla:1", 0.0, 0.0, 5.0, 0.0, np.zeros((30, 2)))
+    assert SafetyEngine(FakeDitto([])).evaluate([other, person_track("walker:1", 1.0, 0.0, 1.5, 0.0)]) == []
+
+
+def test_a_held_track_outlasts_its_sightings_until_its_memory_runs_out():
+    tracker = CentroidTracker(max_age=2.0, confirm=(5, 10), hold=True, gate=1.5)
+    for tick in range(6):
+        tracker.update([(0.0, 0.0)], tick * 0.1)
+    assert len(tracker.update([], 1.5)) == 1
+    assert tracker.update([], 2.6) == []
+    assert tracker.confirmed == set()
+
+
+def test_a_faster_tracker_believes_a_person_setting_off_sooner():
+    def speed_after_setting_off(**settings):
+        tracker = CentroidTracker(gate=1.5, **settings)
+        for tick in range(5):
+            tracker.update([(0.0, 0.0)], tick * 0.1)
+        for tick in range(5):
+            tracks = tracker.update([(0.16 * (tick + 1), 0.0)], 0.5 + tick * 0.1)
+        return tracks[0].vx
+
+    assert speed_after_setting_off(beta=0.25) > 1.5 * speed_after_setting_off()

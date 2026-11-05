@@ -584,6 +584,10 @@ class Suite:
         self.sensors = []
 
     # --- set-up and teardown ---
+    def believed(self, cars):
+        """Which of the cars it's been told about the driver should act on."""
+        return cars
+
     def clear(self):
         """Removes every car and their sensors, and releases the brake, so no test inherits anything."""
         for sensor in self.sensors:
@@ -721,6 +725,7 @@ class Suite:
                            for w in self.world.get_actors().filter("walker.pedestrian.*")}
                 not_green = lights.not_green()
                 seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
+                seen_cars = self.believed(seen_cars)
                 telemetry.fresh = fresh
 
                 asked = time.perf_counter()
@@ -973,7 +978,7 @@ class Suite:
         ahead = [a for a, side in ahead if a > 0.0 and abs(side) < 2.0]
         return min(ahead) if ahead else None
 
-    def test_blind_corner(self):
+    def test_blind_corner(self, lead=T3_LEAD):
         stop = self.lane_with_turn(STRAIGHT)
         yaw = stop.transform.rotation.yaw
         red, green = self.carla.TrafficLightState.Red, self.carla.TrafficLightState.Green
@@ -1021,7 +1026,7 @@ class Suite:
             runner = state["runner"]
             nearest = int(np.argmin(np.hypot(my_path[:, 0] - tick.ego[0], my_path[:, 1] - tick.ego[1])))
             if state["launched_at"] is None:
-                if launch_now(my_index - nearest, max(tick.speed, 4.0), their_index, T3_SPEED, T3_LEAD):
+                if launch_now(my_index - nearest, max(tick.speed, 4.0), their_index, T3_SPEED, lead):
                     state["launched_at"] = tick.t
                     # Autopilot won't hold a set speed through a junction, so this speed is enforced
                     runner.enable_constant_velocity(self.carla.Vector3D(x=T3_SPEED))

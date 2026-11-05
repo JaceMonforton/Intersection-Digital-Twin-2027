@@ -36,7 +36,7 @@ from run_professor_test_suite import (
     CARLA_HOST,
     CARLA_PORT,
     OUTPUT_DIR,
-    TRUCK,
+    T3_LEAD,
     Console,
     Policy,
     Suite,
@@ -55,6 +55,13 @@ from waymo_predictor_node import LEFT, STRAIGHT
 ROOT = Path(__file__).resolve().parent.parent
 SCENARIOS = ("runner", "pedestrian", "turner", "clear")
 PROCESSOR_TIMEOUT = 180.0
+# Shipping containers, solid to the ground, as a lorry or a bus stands high on its wheels and a LiDAR sees a person's legs underneath
+HIDER = "static.prop.container"
+HIDER_BACKS = (3.0, 10.0)  # m from the stop line to the centre of each one
+CROSSING_AHEAD = 5.0    # m past the stop line that the person crosses, on the crossing, just in front of the containers
+HIDER_HALF_WIDTH = 1.3  # m
+HIDER_REACH = 7.0       # m from a container's centre to a stopped car that is really that container
+CRUISE = 6.0            # m/s; what the car settles to here, for timing a hazard, since it may slow before one sets off
 WALK_SPEED = 1.6        # m/s
 TURNER_SPEED = 8.0      # m/s
 TURNER_BACK = 30.0      # m before its stop line that the oncoming car starts
@@ -94,6 +101,18 @@ def report_rows(results):
 
 
 class Comparison(Suite):
+    def believed(self, cars):
+        """The detector reports a container as a parked car, which would slow only that version, so it's left out of what the
+        driver is told, as a fixed roadside unit would learn its static background.
+        shortcut: told where the containers are; a real unit needs background learning, and the safety gate still gets them."""
+        places = [a.get_location() for a in self.world.get_actors().filter(HIDER)]
+        return [c for c in cars if math.hypot(c[2], c[3]) > STOPPED or all(math.hypot(c[0] - p.x, c[1] - p.y) > HIDER_REACH for p in places)]
+
+    def clear(self):
+        """Suite.clear only removes cars and people. Any containers still in the world have to go too, or they stay in the road."""
+        self.client.apply_batch_sync([self.carla.command.DestroyActor(a) for a in self.world.get_actors().filter(HIDER)])
+        super().clear()
+
     def _beside_truck(self, truck_side):
         """(stop line of a lane going straight with a lane beside it on this side, that lane's stop waypoint)."""
         for stop, _ in sorted(self.controlled, key=lambda c: (round(c[0].transform.rotation.yaw / 10.0), c[0].lane_id)):
@@ -107,16 +126,15 @@ class Comparison(Suite):
         raise RuntimeError(f"No lane at junction 189 goes straight with a lane on its {truck_side}.")
 
     def _park_truck(self, waypoint):
-        bp = self.world.get_blueprint_library().find(TRUCK)
-        bp.set_attribute("role_name", "truck")
-        place = waypoint.previous(4.0)[0].transform
-        place.location.z += 1.5
-        truck = self.world.try_spawn_actor(bp, place)
-        if truck is None:
-            raise RuntimeError("Couldn't place the truck.")
-        truck.set_simulate_physics(False)
-        self.actors.append(truck)
-        return truck
+        bp = self.world.get_blueprint_library().find(HIDER)
+        for back in HIDER_BACKS:
+            place = waypoint.previous(back)[0].transform
+            place.location.z += 0.1
+            place.rotation.yaw += 90.0  # the container's long side is its y
+            hider = self.world.try_spawn_actor(bp, place)
+            if hider is None:
+                raise RuntimeError("Couldn't place the container.")
+            hider.set_simulate_physics(False)
 
     def _green_for(self, stop):
         red, green = self.carla.TrafficLightState.Red, self.carla.TrafficLightState.Green
@@ -128,9 +146,10 @@ class Comparison(Suite):
         my_path = locations_array(self.straight_path(stop.previous(APPROACH)[0], every=1))
         forward, right = stop.transform.get_forward_vector(), stop.transform.get_right_vector()
         line = stop.transform.location
-        # The person starts on the far side of the truck's lane, and crosses just past the stop lines
-        crossing = (line.x + forward.x * 2.0, line.y + forward.y * 2.0)
-        start = self.carla.Location(x=crossing[0] + right.x * 7.0, y=crossing[1] + right.y * 7.0, z=line.z + 1.0)
+        # The person waits right in front of the truck, at its far side, so that it hides them from every distance
+        crossing = (line.x + forward.x * CROSSING_AHEAD, line.y + forward.y * CROSSING_AHEAD)
+        walk = stop.lane_width + HIDER_HALF_WIDTH
+        start = self.carla.Location(x=crossing[0] + right.x * walk, y=crossing[1] + right.y * walk, z=line.z + 1.0)
         my_index = int(np.argmin(np.hypot(my_path[:, 0] - crossing[0], my_path[:, 1] - crossing[1])))
         state = {"person": None, "launched_at": None, "closest": math.inf, "stopped": False, "speed_at_closest": None}
 
@@ -149,7 +168,7 @@ class Comparison(Suite):
             nearest = int(np.argmin(np.hypot(my_path[:, 0] - tick.ego[0], my_path[:, 1] - tick.ego[1])))
             person = state["person"]
             if person is not None:
-                if state["launched_at"] is None and launch_now(my_index - nearest, max(tick.speed, 4.0), 7.0, WALK_SPEED, lead):
+                if state["launched_at"] is None and launch_now(my_index - nearest, CRUISE, walk, WALK_SPEED, lead):
                     state["launched_at"] = tick.t
                     person.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=-right.x, y=-right.y), speed=WALK_SPEED))
                     self.console.line("SCENARIO", f"Person steps out, ML car {my_index - nearest} m away, t={tick.t:.1f} s")
@@ -222,7 +241,7 @@ class Comparison(Suite):
         return result, state["closest"], state["stopped"], state["launched_at"] is not None
 
     def run_runner(self, lead):
-        result = self.test_blind_corner()
+        result = self.test_blind_corner(T3_LEAD + lead)
         gap = result.hazard_gap if result.hazard_gap is not None else math.inf
         return result, gap, result.brake_at is not None or bool(result.stopping_margin), gap != math.inf
 
@@ -275,11 +294,19 @@ def main():
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    results_path = OUTPUT_DIR / "rsu_comparison.json"
+    if len(args.modes) > 1:
+        # Each version gets its own process, as a Traffic Manager doesn't survive being reused after its processor changes
+        results_path.unlink(missing_ok=True)
+        rest = [a for a in sys.argv[1:] if a not in args.modes and a != "--modes"]
+        return max(subprocess.call([sys.executable, "-u", __file__, *rest, "--modes", mode], cwd=ROOT) for mode in args.modes)
+
     import carla
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
     console = Console(args.quiet)
-    results = {name: {} for name in args.scenarios}
+    earlier = json.loads(results_path.read_text(encoding="utf-8"))["runs"] if results_path.exists() else {}
+    results = {name: earlier.get(name, {}) for name in args.scenarios}  # the other versions' runs, measured separately
     for mode in args.modes:
         console.line("SCENARIO", f"=== Version: {mode} ===")
         process, log = start_processor(mode, args.model, OUTPUT_DIR / f"rsu_processor_{mode}.log")
@@ -301,7 +328,7 @@ def main():
         finally:
             stop_processor(process, log)
         time.sleep(3.0)
-        (OUTPUT_DIR / "rsu_comparison.json").write_text(json.dumps({"generated": datetime.now(timezone.utc).isoformat(), "model": args.model, "repeat": args.repeat,
+        results_path.write_text(json.dumps({"generated": datetime.now(timezone.utc).isoformat(), "model": args.model, "repeat": args.repeat,
                                                                     "summary": {n: {m: summarise(r) for m, r in v.items()} for n, v in results.items()},
                                                                     "runs": results}, indent=2), encoding="utf-8")
     rows = report_rows(results)

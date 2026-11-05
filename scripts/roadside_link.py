@@ -12,12 +12,14 @@ dead link look the same. No carla or numpy imports here, so that it stays testab
 import json
 import socket
 import struct
+from collections import Counter
 
 # A plain UDP socket, not Ditto, so the Windows localhost rule doesn't apply. It costs no tick of delay on one machine.
 # shortcut: one machine only, with no loss handling; a real roadside unit needs a V2X radio link and signed messages.
 ROADSIDE_ADDRESS = ("127.0.0.1", 47805)
 STALE_AFTER = 0.5        # simulated seconds; older roadside tracks don't count
 SIGHT_MEMORY = 1.0       # seconds a car remembers an actor its LiDAR has stopped hitting
+SIGHT_MIN_POINTS = 3     # hits in a sweep to count as seen; the same as MIN_POINTS in detection_features.py
 # Roof LiDAR for the line-of-sight baseline, like a typical car-mounted unit
 SIGHT_LIDAR = {"channels": "32", "points_per_second": "300000", "range": "70", "upper_fov": "10", "lower_fov": "-30"}
 SIGHT_HEIGHT = 1.9       # m above the car's origin
@@ -77,6 +79,7 @@ class RoadsideView:
     name = "rsu"
 
     def __init__(self, receiver=None):
+        self.owns_receiver = receiver is None  # a shared one outlives this view, for the next car
         self.receiver = receiver or RoadsideReceiver()
 
     def see(self, ego, cars, walkers, now):
@@ -86,14 +89,15 @@ class RoadsideView:
         return [tuple(car) for car in message["cars"]], [tuple(walker) for walker in message["walkers"]], True
 
     def close(self):
-        self.receiver.close()
+        if self.owns_receiver:
+            self.receiver.close()
 
 
-def visible_actors(raw_data):
-    """The ids of the actors in a semantic LiDAR sweep. Id 0 means the point hit the map, not an actor."""
-    ids = {hit[4] for hit in SEMANTIC_POINT.iter_unpack(raw_data[:len(raw_data) - len(raw_data) % SEMANTIC_POINT.size])}
-    ids.discard(0)
-    return ids
+def visible_actors(raw_data, min_points=SIGHT_MIN_POINTS):
+    """The ids of the actors with at least min_points in a semantic LiDAR sweep: the same bar as "seen" for the roadside
+    unit, as a stray ray or two under a truck can't be told from noise. Id 0 means the point hit the map, not an actor."""
+    hits = Counter(hit[4] for hit in SEMANTIC_POINT.iter_unpack(raw_data[:len(raw_data) - len(raw_data) % SEMANTIC_POINT.size]))
+    return {actor_id for actor_id, count in hits.items() if actor_id != 0 and count >= min_points}
 
 
 class LineOfSightView:

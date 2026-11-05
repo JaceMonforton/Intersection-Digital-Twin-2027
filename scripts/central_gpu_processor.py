@@ -33,7 +33,6 @@ from detection_features import (
     GRID_SIZE,
     MODEL_GROUND_Z,
     PEDESTRIAN,
-    VEHICLE,
     decode,
     rasterize,
 )
@@ -104,12 +103,15 @@ CONTROLLED_VEHICLE = "vehicle_ml"  # the only vehicle with a SafetyGate
 VEHICLES = ("vehicle_ml", "human_vehicle")
 
 DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "rsu_detector.onnx"
-DETECTION_THRESHOLD = (0.585, 0.223)  # vehicle, pedestrian: the best F1 on seed 4, kept apart from the final test on seed 5
+DETECTION_THRESHOLD = (0.624, 0.561)  # vehicle, pedestrian: the best F1 on seed 28, kept apart from the final test on seed 29
 TRACK_ALPHA, TRACK_BETA = 0.4, 0.1  # how much of each new position's surprise goes into the position and the velocity
 # A track only counts while it was seen in this many of its last ticks: (sightings, ticks). A real actor is detected in
 # most ticks, while a pole flickers above the threshold now and then, which a memory alone would join into a steady ghost.
 CAR_CONFIRM = (2, 5)        # so that one false box can't latch the brake, and a car is reported within 0.2 s
 WALKER_CONFIRM = (5, 10)
+WALKER_BETA = 0.25          # a person sets off in a step, which the cars' slower setting takes over 1 s to believe
+WALKER_MEMORY = 2.0         # seconds; a person seen in the road is still there when the LiDARs lose them for a moment
+PERSON_LENGTH = 1.4         # metres; a "vehicle" box shorter than this is a person, as no vehicle in the training data is
 PEDESTRIAN_GATE = 1.5       # metres; people walk beside each other, so match them more tightly than cars
 EGO_RADIUS = 3.0            # metres; a box this close to the ML car's own position is the ML car
 
@@ -123,6 +125,8 @@ PATH_MOVING_SPEED = 1.0     # m/s; the path check is for crossing traffic, so sl
 IN_LINE_HEADING = 30.0      # degrees between two cars that counts as following the same way
 TURNING_RATE = 15.0         # degrees per second; turning faster than this, straight-line TTC means little
 COLLISION_RADIUS = 2.5      # metres between centres that counts as contact (two car half-lengths)
+PERSON_RADIUS = 1.8         # metres from the car's centre to a person that counts as contact, tighter so that a kerb isn't in range
+PERSON_MOVING_SPEED = 1.0   # m/s; below this a person's track is mostly position noise
 TELEMETRY_STALE_AFTER = 1.0 # seconds without an update before a vehicle leaves the evaluation
 FUSION_GATE = 3.0           # metres; max distance to associate a detection with telemetry
 TELEMETRY_WEIGHT = 0.7      # share of the fused position taken from telemetry
@@ -146,6 +150,16 @@ class Track:
     path: np.ndarray = None  # predicted (x, y) at each STEP_SECONDS, where one is known
     yaw: float = None        # degrees, where known
     yaw_rate: float = 0.0    # degrees per second
+    person: bool = False     # only the path check applies: see person_track
+
+
+def person_track(track_id, x, y, vx, vy):
+    """A pedestrian for the safety checks, walking straight on. Only someone walking into the car's path counts: a person
+    standing or strolling by the road is normal and mustn't latch the brake, so None if they aren't moving."""
+    speed = math.hypot(vx, vy)
+    if speed < PERSON_MOVING_SPEED:
+        return None
+    return Track(track_id, x, y, vx, vy, curve_path(x, y, math.degrees(math.atan2(vy, vx)), speed, 0.0), person=True)
 
 
 def time_to_collision(a, b, radius=COLLISION_RADIUS):
@@ -281,7 +295,7 @@ def fuse(telemetry, detections, gate=FUSION_GATE):
     for t in telemetry:
         best = next((d for d in unmatched if d.id == t.id), None)
         if best is None:
-            near = min(unmatched, key=lambda d: math.hypot(d.x - t.x, d.y - t.y), default=None)
+            near = min((d for d in unmatched if not d.person), key=lambda d: math.hypot(d.x - t.x, d.y - t.y), default=None)
             if near is not None and math.hypot(near.x - t.x, near.y - t.y) <= gate:
                 best = near
         if best is None:
@@ -299,11 +313,14 @@ class CentroidTracker:
     track is moving. A velocity from two positions alone would turn 0.2 m of jitter into 2 m/s at 10 Hz.
     A track keeps going on its velocity for up to max_age without a sighting, so a missed frame isn't a missed car."""
 
-    def __init__(self, gate=FUSION_GATE, max_age=0.5, confirm=(1, 5), name="lidar"):
+    def __init__(self, gate=FUSION_GATE, max_age=0.5, confirm=(1, 5), name="lidar", beta=TRACK_BETA, hold=False):
         self.gate = gate
+        self.beta = beta
+        self.hold = hold  # once confirmed, a track stays until max_age, however few sightings it has had lately
         self.max_age = max_age
         self.confirm, self.window = confirm
         self.name = name
+        self.confirmed = set()
         self.tracks = {}  # id -> [Track, time of its state, last sighting, sightings, recent yaws, seen in recent ticks]
         self._ids = itertools.count()
 
@@ -329,10 +346,16 @@ class CentroidTracker:
             state[0].x, state[0].y = predicted[key]
             state[1] = now
             state[5].append(False)
-        return [v[0] for v in self.tracks.values() if sum(v[5]) >= self.confirm]
+        confirmed = []
+        for track_id, state in self.tracks.items():
+            if sum(state[5]) >= self.confirm:
+                self.confirmed.add(track_id)
+            if track_id in self.confirmed and (self.hold or sum(state[5]) >= self.confirm):
+                confirmed.append(state[0])
+        self.confirmed &= self.tracks.keys()
+        return confirmed
 
-    @staticmethod
-    def _correct(state, px, py, x, y, now):
+    def _correct(self, state, px, py, x, y, now):
         track, updated, _seen, sightings = state[:4]
         dt = now - updated
         if sightings == 1 and dt > 0:  # nothing to smooth against yet
@@ -342,8 +365,8 @@ class CentroidTracker:
             rx, ry = x - px, y - py
             track.x, track.y = px + TRACK_ALPHA * rx, py + TRACK_ALPHA * ry
             if dt > 0:
-                track.vx += TRACK_BETA * rx / dt
-                track.vy += TRACK_BETA * ry / dt
+                track.vx += self.beta * rx / dt
+                track.vy += self.beta * ry / dt
         state[1], state[2], state[3] = now, now, sightings + 1
 
     @staticmethod
@@ -586,6 +609,11 @@ class SafetyEngine:
         """Metrics for every pair, most urgent first."""
         rows = []
         for a, b in itertools.combinations(tracks, 2):
+            if a.person or b.person:
+                if CONTROLLED_VEHICLE in (a.id, b.id):
+                    rows.append({"pair": [a.id, b.id], "tracks": (a, b), "ttc": math.inf, "path_ttc": path_time_to_collision(a, b, PERSON_RADIUS),
+                                 "pet": math.inf, "drac": 0.0})
+                continue
             rows.append({
                 "pair": [a.id, b.id],
                 "tracks": (a, b),
@@ -792,7 +820,7 @@ class CarlaPerception:
 
         self.detector = None
         self.tracker = CentroidTracker(confirm=CAR_CONFIRM)
-        self.walker_tracker = CentroidTracker(gate=PEDESTRIAN_GATE, confirm=WALKER_CONFIRM, name="walker")
+        self.walker_tracker = CentroidTracker(gate=PEDESTRIAN_GATE, max_age=WALKER_MEMORY, confirm=WALKER_CONFIRM, name="walker", beta=WALKER_BETA, hold=True)
         self.roadside = RoadsideSender()
         self.lanes = LaneFollower(carla, self.world.get_map())
         self._recent_yaws = {}  # actor id -> recent yaws, for the turn rate
@@ -863,14 +891,16 @@ class CarlaPerception:
             keep = [math.hypot(b.x - own.x, b.y - own.y) > EGO_RADIUS for b in found]
             rows, found = rows[keep] if len(rows) else rows, [b for b, k in zip(found, keep) if k]
         self.boxes = found + ([own_box] if own_box else [])
-        cars = self.tracker.update([(b.x, b.y, b.yaw) for b, r in zip(found, rows) if r[8] == VEHICLE], now)
-        walkers = self.walker_tracker.update([(b.x, b.y) for b, r in zip(found, rows) if r[8] == PEDESTRIAN], now)
+        # A walking person sometimes scores as a vehicle, which would lose their track just as they step out
+        is_person = [r[8] == PEDESTRIAN or r[3] < PERSON_LENGTH for r in rows]
+        cars = self.tracker.update([(b.x, b.y, b.yaw) for b, person in zip(found, is_person) if not person], now)
+        walkers = self.walker_tracker.update([(b.x, b.y) for b, person in zip(found, is_person) if person], now)
         for car in cars:
             car.path = self._detected_path(car)
         self.roadside.send(now, [(c.x, c.y, c.vx, c.vy, c.yaw if c.yaw is not None else math.degrees(math.atan2(c.vy, c.vx))) for c in cars],
                            [(w.x, w.y, w.vx, w.vy) for w in walkers])
-        # Only vehicles reach the safety checks: a person standing by the road would otherwise latch the brake
-        return [*cars, own] if own is not None else cars
+        people = [person_track(w.id, w.x, w.y, w.vx, w.vy) for w in walkers]
+        return [*cars, *(p for p in people if p), *([own] if own is not None else [])]
 
     def _own_track(self, now):
         """The ML car's own state, which it knows from its own telemetry, and needn't be told by a detector."""
@@ -924,6 +954,11 @@ class CarlaPerception:
         self._recent_yaws = {k: v for k, v in self._recent_yaws.items() if k in previous}
         self._ml_history.retain(previous)
         self.boxes = boxes
+        for walker in self.world.get_actors().filter("walker.pedestrian.*"):
+            place, v = walker.get_location(), walker.get_velocity()
+            person = person_track(f"person:{walker.id}", place.x, place.y, v.x, v.y)
+            if person:
+                tracks.append(person)
         return tracks
 
     def _predict_path(self, actor, tf, x, y, vx, vy):

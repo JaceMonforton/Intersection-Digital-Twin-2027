@@ -86,7 +86,9 @@ def test_truth_view_gives_everything():
 
 def test_semantic_sweep_gives_the_actors_it_hit():
     points = b"".join(SEMANTIC_POINT.pack(1.0, 2.0, 3.0, 0.5, actor, 10) for actor in (0, 7, 7, 12))
-    assert visible_actors(points) == {7, 12}
+    assert visible_actors(points, min_points=1) == {7, 12}
+    assert visible_actors(points * 3) == {7, 12}
+    assert visible_actors(points) == set()
     assert visible_actors(b"") == set()
     assert struct.calcsize("<ffffII") == 24
 
@@ -108,5 +110,15 @@ def test_messages_are_valid_json_with_no_infinity():
         RoadsideSender(ADDRESS).send(1.0, [(0.123456, 0.0, 0.0, 0.0, 0.0)], [])
         assert wait_for(receiver)["cars"][0][0] == 0.12
         assert json.dumps(receiver.latest)
+    finally:
+        receiver.close()
+
+
+def test_a_view_leaves_a_shared_receiver_open_for_the_next_car():
+    receiver = RoadsideReceiver(ADDRESS)
+    try:
+        RoadsideView(receiver).close()
+        RoadsideSender(ADDRESS).send(1.0, [], [])
+        assert wait_for(receiver) is not None
     finally:
         receiver.close()
