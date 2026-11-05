@@ -49,6 +49,7 @@ WALKER = (204, 158, 88)
 BAR_BACK = (46, 48, 54)
 
 ROUTE_NAMES = {LEFT: "LEFT", RIGHT: "RIGHT"}
+SOURCE_NAMES = {"truth": "TRUE POSITIONS", "rsu": "ROADSIDE UNIT", "sight": "OWN SIGHT"}
 
 
 # ---------------------------------------------------------------------------
@@ -60,10 +61,13 @@ class TelemetrySender:
     def __init__(self, address=TELEMETRY_ADDRESS):
         self.address = address
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.source = None  # which view of the world the model is being given: see roadside_link.py
+        self.fresh = True   # whether that view is up to date
 
     def send(self, inputs, output, applied, model_driving):
         message = {"inputs": [round(float(v), 3) for v in inputs], "output": [float(v) for v in output],
-                   "applied": [float(v) for v in applied], "model_driving": bool(model_driving)}
+                   "applied": [float(v) for v in applied], "model_driving": bool(model_driving),
+                   "source": self.source, "fresh": self.fresh}
         try:
             self.socket.sendto(json.dumps(message).encode(), self.address)
         except OSError:
@@ -181,7 +185,12 @@ def control_status(telemetry):
     """(text, is the model in control), or a plain statement that there's no data."""
     if telemetry is None:
         return "NO MODEL DATA", False
-    return ("MODEL DRIVING", True) if telemetry["model_driving"] else ("SAFETY BRAKE OVERRIDE", False)
+    if not telemetry.get("fresh", True):
+        return "NO ROADSIDE DATA: BRAKING", False
+    if not telemetry["model_driving"]:
+        return "SAFETY BRAKE OVERRIDE", False
+    source = SOURCE_NAMES.get(telemetry.get("source"))
+    return (f"MODEL DRIVING: {source}" if source else "MODEL DRIVING"), True
 
 
 # ---------------------------------------------------------------------------

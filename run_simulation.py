@@ -8,6 +8,7 @@ by the trained driving model and the others by CARLA's autopilot.
     python run_simulation.py --free-drive --seconds 0   # until Ctrl+C
     python run_simulation.py --free-drive --traffic 30  # more cars
     python run_simulation.py --leave-running  # keep CARLA and Docker up, for faster repeat runs
+    python run_simulation.py --roadside --lidar-view  # the tests on the roadside detector, with a window of what its LiDARs see
 
 Without models/driving_policy.onnx it refuses to run, since the ML car has no other driver.
 
@@ -32,6 +33,7 @@ COMPOSE = ["docker", "compose", "-f", str(ROOT / "docker" / "docker-compose.yml"
 LOG_DIR = ROOT / "output" / "logs"
 DITTO_THINGS = "http://localhost:8080/api/2/things"
 CARLA_PORT = 2000
+ROADSIDE_MODEL = ROOT / "models" / "rsu_detector.candidate.onnx"
 DRIVING_MODEL = ROOT / "models" / "driving_policy.onnx"
 
 # Packaged builds run directly; a source build runs through the Unreal editor in game mode
@@ -146,7 +148,9 @@ class Launcher:
     def start_processor(self):
         for attempt in range(1, MASTER_ATTEMPTS + 1):
             self.log(f"Starting the central processor (attempt {attempt})...")
-            process, path = self.spawn("processor", "scripts/central_gpu_processor.py")
+            process, path = self.spawn("processor", "scripts/central_gpu_processor.py",
+                                       *(["--detector", "onnx", "--model", str(ROADSIDE_MODEL)] if self.args.roadside else []),
+                                       *(["--lidar-view"] if self.args.lidar_view else []))
             deadline = time.time() + MASTER_TIMEOUT
             while time.time() < deadline and process.poll() is None:
                 if "Master tick" in path.read_text(encoding="utf-8", errors="replace"):
@@ -183,6 +187,8 @@ class Launcher:
                 raise RuntimeError(f"{name} exited early:\n{tail(LOG_DIR / f'{name}.log')}")
         if not self.args.no_view:
             self.spawn("view", "scripts/ml_car_view.py")  # only a display, so it may fail without stopping the run
+        if self.args.lidar_view:
+            self.spawn("lidar_view", "scripts/lidar_view.py")  # likewise
 
         code = self.run_with_traffic() if self.args.free_drive else self.run_suite()
         for name, process in self.processes:
@@ -193,7 +199,8 @@ class Launcher:
 
     def run_suite(self):
         self.log("Running the five-test demonstration. Watch for the magenta ML car. Ctrl+C to stop early.")
-        return self.run_stage("scripts/run_professor_test_suite.py", "--attached", *(["--quiet"] if self.args.quiet else []))
+        return self.run_stage("scripts/run_professor_test_suite.py", "--attached", *(["--quiet"] if self.args.quiet else []),
+                              *(["--perception", "rsu"] if self.args.roadside else []))
 
     def run_stage(self, *command):
         return subprocess.run([sys.executable, "-u", *command], cwd=ROOT, check=False).returncode
@@ -257,6 +264,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--free-drive", action="store_true", help="normal driving in traffic instead of the five tests")
     parser.add_argument("--quiet", action="store_true", help="leave out the test suite's live table of values")
+    parser.add_argument("--roadside", action="store_true", help="run the tests on the roadside detector and the car's own LiDAR, instead of CARLA's true positions")
+    parser.add_argument("--lidar-view", action="store_true", help="with --roadside, open a window of what the two roadside LiDARs see")
     parser.add_argument("--no-view", action="store_true", help="don't open the ML car's split-screen window")
     parser.add_argument("--traffic", type=int, default=15, metavar="N", help="how many other vehicles")
     parser.add_argument("--walkers", type=int, default=8, help="how many pedestrians")
@@ -265,6 +274,11 @@ def main():
     parser.add_argument("--carla-exe", help="path to CarlaUE4.exe, if it isn't found automatically")
     parser.add_argument("--leave-running", action="store_true", help="keep CARLA and Docker up afterwards")
     args = parser.parse_args()
+    if args.roadside and args.free_drive:
+        parser.error("--roadside only works with the tests; use the commands under Roadside detection in README.md to drive with it")
+
+    if args.lidar_view and not args.roadside:
+        parser.error("--lidar-view needs --roadside, as the LiDARs only exist when the detector is running")
 
     launcher = Launcher(args)
     code = 1

@@ -12,7 +12,6 @@ from central_gpu_processor import (
     apply_event,
     approaching_from_behind,
     deceleration_to_avoid_crash,
-    fit_model_input,
     fuse,
     lidar_to_model_frame,
     model_box_to_world,
@@ -20,6 +19,7 @@ from central_gpu_processor import (
     parse_lidar,
     path_check_applies,
     path_time_to_collision,
+    person_track,
     post_encroachment_time,
     thing_to_track,
     time_to_collision,
@@ -155,6 +155,73 @@ def test_tracker_keeps_id_and_estimates_velocity():
     assert second.vx == pytest.approx(2.0)
 
 
+def test_tracker_smooths_jitter_into_a_steady_velocity():
+    tracker = CentroidTracker()
+    rng = np.random.default_rng(0)
+    tracks = []
+    for tick in range(60):  # 5 m/s along x, with 0.15 m of noise, at 10 Hz
+        tracks = tracker.update([(0.5 * tick + rng.normal(0, 0.15), rng.normal(0, 0.15))], tick * 0.1)
+    assert len(tracks) == 1
+    assert tracks[0].vx == pytest.approx(5.0, abs=1.0)
+    assert abs(tracks[0].vy) < 1.0
+
+
+def test_tracker_only_reports_a_track_seen_often_enough():
+    tracker = CentroidTracker(confirm=(2, 5))
+    assert tracker.update([(0.0, 0.0)], 0.0) == []
+    assert len(tracker.update([(0.1, 0.0)], 0.1)) == 1
+
+
+def test_a_single_false_box_never_becomes_a_track():
+    tracker = CentroidTracker(confirm=(2, 5))
+    assert tracker.update([(0.0, 0.0)], 0.0) == []
+    assert tracker.update([], 0.1) == []
+    assert tracker.update([(50.0, 0.0)], 0.2) == []
+
+
+def test_tracker_carries_a_missed_car_on_at_its_velocity_then_drops_it():
+    tracker = CentroidTracker(max_age=0.5, confirm=(2, 5))
+    for tick in range(10):
+        tracks = tracker.update([(0.5 * tick, 0.0)], tick * 0.1)
+    before = tracks[0]
+    coasted = tracker.update([], 1.0)
+    assert coasted[0].id == before.id
+    assert coasted[0].x == pytest.approx(5.0, abs=0.3)
+    assert tracker.update([], 2.0) == []
+
+
+def test_a_spot_that_only_flickers_never_becomes_a_steady_ghost():
+    tracker = CentroidTracker(max_age=0.5, confirm=(5, 10))
+    reported = 0
+    for tick in range(100):  # a pole above the threshold one tick in three, always in the same place
+        reported += len(tracker.update([(10.0, 10.0)] if tick % 3 == 0 else [], tick * 0.1))
+    assert reported == 0
+
+
+def test_a_person_detected_most_of_the_time_is_reported_without_gaps():
+    tracker = CentroidTracker(max_age=0.5, confirm=(5, 10))
+    reported = []
+    for tick in range(60):  # missed one tick in four
+        reported.append(len(tracker.update([] if tick % 4 == 3 else [(0.15 * tick, 0.0)], tick * 0.1)))
+    assert reported[10:] == [1] * 50
+
+
+def test_tracker_turns_a_box_yaw_to_face_the_way_the_track_moves():
+    tracker = CentroidTracker()
+    for tick in range(5):  # moving along +x, with a box that says it faces the other way
+        tracks = tracker.update([(0.5 * tick, 0.0, 180.0)], tick * 0.1)
+    assert abs((tracks[0].yaw + 180.0) % 360.0 - 180.0) < 1.0
+
+
+def test_tracker_keeps_a_stopped_cars_yaw_from_flipping():
+    tracker = CentroidTracker()
+    tracks = tracker.update([(0.0, 0.0, 90.0)], 0.0)
+    for tick, yaw in enumerate((-90.0, 90.0, -90.0), 1):
+        tracks = tracker.update([(0.0, 0.0, yaw)], tick * 0.1)
+    assert tracks[0].yaw == pytest.approx(90.0)
+    assert tracks[0].yaw_rate == pytest.approx(0.0)
+
+
 def test_parse_lidar_reads_xyzi_rows():
     raw = np.array([1, 2, 3, 0.5, 4, 5, 6, 0.25], dtype=np.float32).tobytes()
     points = parse_lidar(raw)
@@ -163,10 +230,29 @@ def test_parse_lidar_reads_xyzi_rows():
 
 
 def test_lidar_frame_is_y_left_with_the_road_at_ground_z():
-    # A point on the road, 2 m to the right of a sensor 40 m up
-    points = np.array([[1.0, 2.0, -40.0, 0.5]], dtype=np.float32)
-    assert lidar_to_model_frame(points, 40.0, ground_z=-1.8).tolist()[0] == pytest.approx([1.0, -2.0, -1.8, 0.5])
+    # A point on the road, 2 m to the right of a sensor 7 m up over the junction centre
+    points = np.array([[1.0, 2.0, -7.0, 0.5]], dtype=np.float32)
+    assert lidar_to_model_frame(points, (0.0, 0.0, 7.0), ground_z=-1.8).tolist()[0] == pytest.approx([1.0, -2.0, -1.8, 0.5])
     assert points[0, 1] == 2.0  # input untouched
+
+
+def test_a_turned_lidar_still_puts_a_spot_in_the_same_place():
+    # 10 m along the world's x from a sensor turned 90 degrees: it reads that as 10 m to its left, which in CARLA is -y
+    turned = np.array([[0.0, -10.0, -7.0, 0.5]], dtype=np.float32)
+    straight = np.array([[10.0, 0.0, -7.0, 0.5]], dtype=np.float32)
+    mount = (1.0, 2.0, 7.0)
+    assert lidar_to_model_frame(turned, mount, ground_z=-1.8, yaw=90.0).tolist()[0] == pytest.approx(lidar_to_model_frame(straight, mount, ground_z=-1.8).tolist()[0])
+
+
+def test_two_lidars_put_the_same_spot_at_the_same_place():
+    # A spot on the road at CARLA (3, 4) from the junction centre, seen from opposite corners
+    a = lidar_to_model_frame(np.array([[23.0, 24.0, -7.0, 0.5]], dtype=np.float32), (-20.0, -20.0, 7.0), ground_z=-1.8)
+    b = lidar_to_model_frame(np.array([[-17.0, -16.0, -7.0, 0.5]], dtype=np.float32), (20.0, 20.0, 7.0), ground_z=-1.8)
+    assert a.tolist()[0] == pytest.approx([3.0, -4.0, -1.8, 0.5])
+    assert b.tolist()[0] == pytest.approx([3.0, -4.0, -1.8, 0.5])
+    # And a box found there comes back at that spot in the world, with the junction at (100, 200)
+    box = model_box_to_world([*a[0, :3], 4.5, 2.0, 1.4, 0.0], 100.0, 200.0, 0.0, ground_z=-1.8)
+    assert (box.x, box.y, box.z) == pytest.approx((103.0, 204.0, 0.0), abs=1e-5)
 
 
 def test_model_box_round_trips_with_the_lidar_frame():
@@ -176,17 +262,6 @@ def test_model_box_round_trips_with_the_lidar_frame():
     assert box.z == pytest.approx(0.7)
     assert (box.length, box.width, box.height) == (4.5, 2.0, 1.4)
     assert box.yaw == pytest.approx(-90.0)  # counter-clockwise in the model is negative yaw in CARLA
-
-
-@pytest.mark.parametrize("n,shape,expected", [
-    (100, ["N", 4], (100, 4)),
-    (100, [1, "N", 4], (1, 100, 4)),
-    (100, [1, 40, 4], (1, 40, 4)),
-    (10, [40, 4], (40, 4)),
-])
-def test_fit_model_input_shapes(n, shape, expected):
-    points = np.ones((n, 4), dtype=np.float32)
-    assert fit_model_input(points, shape).shape == expected
 
 
 def test_thing_to_track_prefers_velocity_feature():
@@ -583,3 +658,56 @@ def test_velocity_is_measured_only_when_carla_reports_none():
     assert measured_velocity(3.0, 4.0, 10.0, 0.0, (0.0, 0.0, 0.0, 0.0), 0.1) == (3.0, 4.0)
     assert measured_velocity(0.0, 0.0, 1.0, 2.0, (0.0, 0.0, 0.0, 0.0), 0.1) == pytest.approx((10.0, 20.0))
     assert measured_velocity(0.0, 0.0, 1.0, 2.0, None, 0.1) == (0.0, 0.0)
+
+
+def _car_heading_along_x():
+    path = np.column_stack((5.0 * 0.1 * np.arange(1, 31), np.zeros(30)))
+    return Track("vehicle_ml", 0.0, 0.0, 5.0, 0.0, path, 0.0)
+
+
+def test_brakes_for_a_person_walking_into_the_cars_path():
+    ditto = FakeDitto([_car_heading_along_x(), person_track("walker:1", 10.0, -3.0, 0.0, 1.5)])
+    SafetyEngine(ditto).step(100.0)
+    assert len(ditto.brakes) == 1
+
+
+def test_a_person_standing_at_the_kerb_is_not_a_track_at_all():
+    assert person_track("walker:1", 10.0, -3.0, 0.0, 0.5) is None
+
+
+def test_no_brake_for_a_person_walking_along_the_kerb():
+    ditto = FakeDitto([_car_heading_along_x(), person_track("walker:1", 10.0, -2.5, 1.5, 0.0)])
+    SafetyEngine(ditto).step(100.0)
+    assert ditto.brakes == []
+
+
+def test_a_person_close_to_a_car_is_never_merged_into_it():
+    car = Track("vehicle_ml", 0.0, 0.0, 5.0, 0.0)
+    person = person_track("walker:1", 1.0, 1.0, 1.5, 0.0)
+    assert fuse([car], [person]) == [car, person]
+
+
+def test_people_are_only_checked_against_the_ml_car():
+    other = Track("carla:1", 0.0, 0.0, 5.0, 0.0, np.zeros((30, 2)))
+    assert SafetyEngine(FakeDitto([])).evaluate([other, person_track("walker:1", 1.0, 0.0, 1.5, 0.0)]) == []
+
+
+def test_a_held_track_outlasts_its_sightings_until_its_memory_runs_out():
+    tracker = CentroidTracker(max_age=2.0, confirm=(5, 10), hold=True, gate=1.5)
+    for tick in range(6):
+        tracker.update([(0.0, 0.0)], tick * 0.1)
+    assert len(tracker.update([], 1.5)) == 1
+    assert tracker.update([], 2.6) == []
+    assert tracker.confirmed == set()
+
+
+def test_a_faster_tracker_believes_a_person_setting_off_sooner():
+    def speed_after_setting_off(**settings):
+        tracker = CentroidTracker(gate=1.5, **settings)
+        for tick in range(5):
+            tracker.update([(0.0, 0.0)], tick * 0.1)
+        for tick in range(5):
+            tracks = tracker.update([(0.16 * (tick + 1), 0.0)], 0.5 + tick * 0.1)
+        return tracks[0].vx
+
+    assert speed_after_setting_off(beta=0.25) > 1.5 * speed_after_setting_off()

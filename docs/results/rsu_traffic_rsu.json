@@ -1,0 +1,8 @@
+{
+ "mode": "rsu",
+ "seconds": 300,
+ "brakes": 1,
+ "reasons": [
+  "TTC 0.92 s with lidar:151"
+ ]
+}

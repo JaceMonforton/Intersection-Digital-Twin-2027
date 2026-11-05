@@ -1,0 +1,33 @@
+{
+ "seconds": 180.0,
+ "seed": 11,
+ "vehicles": 50,
+ "pedestrians": 45,
+ "stale_ticks": 1,
+ "cars": {
+  "actor_ticks_near": 12000,
+  "tracked_share": 0.96,
+  "position_error_median_m": 0.216,
+  "position_error_p95_m": 0.78,
+  "speed_error_median_ms": 0.661,
+  "speed_error_p95_ms": 2.178,
+  "heading_error_median_deg": 1.6,
+  "heading_error_p95_deg": 24.6,
+  "ghost_tracks_per_second": 0.117,
+  "ghosts_within_3m_of_an_actor": 0.476,
+  "ghost_distance_to_actor_median_m": 3.37
+ },
+ "walkers": {
+  "actor_ticks_near": 41121,
+  "tracked_share": 0.809,
+  "position_error_median_m": 0.182,
+  "position_error_p95_m": 0.761,
+  "speed_error_median_ms": 0.341,
+  "speed_error_p95_ms": 1.697,
+  "heading_error_median_deg": null,
+  "heading_error_p95_deg": null,
+  "ghost_tracks_per_second": 7.578,
+  "ghosts_within_3m_of_an_actor": 0.595,
+  "ghost_distance_to_actor_median_m": 2.46
+ }
+}

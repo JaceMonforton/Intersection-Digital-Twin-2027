@@ -10,8 +10,8 @@ README. It predicts the ML car's path, for both its line and the brake. Other ca
 | File | Used by | Without it |
 | ---- | ------- | ---------- |
 | `waymo_trajectory.onnx` | `scripts/waymo_predictor_node.py` | Follows the road at the current speed |
-| `centerpoint_3d.onnx` | `scripts/central_gpu_processor.py` | CARLA ground-truth actor positions and boxes |
-| `driving_policy.onnx` | The ML car's driver (being built) | Refuses to run: there is no stand-in, so nothing can be mistaken for model driving |
+| `rsu_detector.onnx` | `scripts/central_gpu_processor.py` | CARLA ground-truth actor positions and boxes |
+| `driving_policy.onnx` | The ML car's driver, `scripts/ml_driver.py` | Refuses to run: there is no stand-in, so nothing can be mistaken for model driving |
 
 ## `driving_policy.onnx`
 
@@ -37,12 +37,12 @@ README. It predicts the ML car's path, for both its line and the brake. Other ca
 - **Frame, for both:** each actor's own ego frame at the latest history frame: origin at the actor,
   x forward, y **left**. `waymo_predictor_node.py` handles the conversion from CARLA's left-handed frame.
 
-## `centerpoint_3d.onnx`
+## `rsu_detector.onnx`
 
-- **Input:** `float32 [N, 4]` or `[1, N, 4]`: one LiDAR sweep as `(x, y, z, intensity)`. If N is a fixed number, the sweep is evenly thinned or padded with zero points to fit.
-- **Output:** `float32 [M, 9]`: `(x, y, z, length, width, height, yaw, score, class)`. x, y, z is the box centre, sizes are full lengths in metres, and yaw is in radians, counter-clockwise.
-- **Frame, for both:** x forward, y **left**, z up, centred under the gantry, with the road at `z = MODEL_GROUND_Z` (-1.8 m). `central_gpu_processor.py` converts from CARLA's left-handed sensor frame. Boxes scoring below `DETECTION_THRESHOLD` (0.5) are dropped.
+Train it with `training/train_detection.py`. It saves `rsu_detector.candidate.onnx`, which nothing loads by itself, so a model only reaches the safety gate once it's been tested and renamed. `python run_simulation.py --roadside` uses the candidate directly. It hasn't been renamed, [for these reasons](../README.md#why-it-isnt-the-default), and its results are in the [main README](../README.md#results).
 
-The sensor is a `sensor.lidar.ray_cast` on the gantry 40 m above the junction: 64 channels, 100,000 points/s, 50 m range. Its FOV points down (-45 to -90 degrees), because the default FOV would never reach the road from that height. At that height and range it covers a radius of about 30 m and gives about 7,700 points per sweep, with roughly 35 on a car.
+- **Input:** `float32 [1, 2, 480, 480]`: the merged sweep as a top-down grid of 0.25 m cells, covering 60 m each way from the junction centre, with rows along x and columns along y. Channel 0 is how many points landed in a cell and channel 1 is the height of the tallest, both from 0 to 1.
+- **Output:** `float32 [1, 9, 240, 240]`, at half that resolution: two heatmaps of actor centres (vehicle, then pedestrian), then at each centre its place in the cell (2), the log of its length, width and height in metres (3), and sin and cos of twice its yaw (2). Twice, because from above the front of a car looks like its back, so which way it faces has to come from its track.
+- **Frame:** x forward, y **left**, z up, centred on the junction, with the road at `z = MODEL_GROUND_Z` (-1.8 m). The sweeps from both LiDARs are merged into this one frame, and `central_gpu_processor.py` converts from CARLA's left-handed sensor frame. Boxes scoring below `DETECTION_THRESHOLD` are dropped.
 
-**A stock CenterPoint is unlikely to work on this data, even with the shapes matching.** Published models are trained on roof-mounted LiDAR, which sees the sides of nearby cars at high density. This sensor sees only their roofs, sparsely, from above. The -1.8 m ground shift puts the points in the height range such models expect, but it doesn't change that viewpoint. Expect to retrain on overhead sweeps, or lower the gantry. Many CenterPoint exports also take voxelized tensors rather than raw points, and those need a different input step than `fit_model_input`.
+`scripts/detection_features.py` builds the grid and labels, so that recording, training and detecting agree, and `training/record_detection.py` records sweeps with true boxes. The sensors are two `sensor.lidar.ray_cast` at opposite corners of the junction, 7 m up: 64 channels, 300,000 points/s each, 80 m range, aimed from 0 to -45 degrees. They only spawn when a detector is in use. Measured with `training/check_lidar_coverage.py` on the 570 road points through the junction and 45 m either side: a car gets at least 3 points at 94.7% of them, and at 100% within 30 m of the centre, with a median of 128 points there. A pedestrian gets at least 3 at 57.4%, and at 92.5% within 30 m, with a median of 10 there. A merged sweep has about 58,000 points.

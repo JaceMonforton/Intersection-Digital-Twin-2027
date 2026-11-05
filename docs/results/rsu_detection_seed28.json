@@ -1,0 +1,83 @@
+{
+ "seed": 28,
+ "sweeps": 600,
+ "milliseconds_median": 40.30690004583448,
+ "vehicles": {
+  "threshold": 0.623995840549469,
+  "seen": 5799,
+  "average_precision": 0.99767948326521,
+  "recall": {
+   "all": {
+    "actors": 5799,
+    "recall": 0.9851698568718744
+   },
+   "within_30m": {
+    "actors": 2735,
+    "recall": 0.9908592321755028
+   },
+   "on_road": {
+    "actors": 5799,
+    "recall": 0.9851698568718744
+   },
+   "off_road": {
+    "actors": 0,
+    "recall": null
+   },
+   "on_road_within_30m": {
+    "actors": 2735,
+    "recall": 0.9908592321755028
+   },
+   "5_or_fewer_points": {
+    "actors": 565,
+    "recall": 0.9451327433628318
+   },
+   "over_20_points": {
+    "actors": 3930,
+    "recall": 0.9961832061068703
+   }
+  },
+  "precision": 0.9889215855980613,
+  "false_boxes_per_sweep": 0.10666666666666667,
+  "median_position_error_m": 0.1471400409936905,
+  "p90_position_error_m": 0.4632737636566162
+ },
+ "pedestrians": {
+  "threshold": 0.5610743761062622,
+  "seen": 10181,
+  "average_precision": 0.9352519782083639,
+  "recall": {
+   "all": {
+    "actors": 10181,
+    "recall": 0.9108142618603281
+   },
+   "within_30m": {
+    "actors": 5790,
+    "recall": 0.9212435233160622
+   },
+   "on_road": {
+    "actors": 1632,
+    "recall": 0.9117647058823529
+   },
+   "off_road": {
+    "actors": 8549,
+    "recall": 0.9106328225523453
+   },
+   "on_road_within_30m": {
+    "actors": 1571,
+    "recall": 0.9121578612348823
+   },
+   "5_or_fewer_points": {
+    "actors": 2038,
+    "recall": 0.8346418056918548
+   },
+   "over_20_points": {
+    "actors": 2459,
+    "recall": 0.956079707198048
+   }
+  },
+  "precision": 0.9864893617021276,
+  "false_boxes_per_sweep": 0.21166666666666667,
+  "median_position_error_m": 0.08965237438678741,
+  "p90_position_error_m": 0.21128813922405243
+ }
+}
