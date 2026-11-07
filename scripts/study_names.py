@@ -3,13 +3,13 @@ The comparative study's configs, scenarios and windows, shared by run_simulation
 No imports beyond the standard library, so the launcher can check its flags before it starts anything.
 
     lidar_and_rsu   the roadside LiDAR detector's tracks plus the car's own roof LiDAR       (perception rsu)
-    camera_and_rsu  SIMULATED roadside camera tracks plus the car's own roof LiDAR           (perception camera)
+    camera_and_rsu  roadside camera detector tracks plus the car's own roof LiDAR           (perception camera)
     lidar_only      only the car's own roof LiDAR, with no roadside unit and so no safety gate (perception sight)
 """
 CONFIGS = {"lidar_and_rsu": "rsu", "camera_and_rsu": "camera", "lidar_only": "sight"}
 CONFIG_HELP = {
     "lidar_and_rsu": "the roadside LiDAR detector's tracks plus the car's own roof LiDAR, with the safety gate on the detector",
-    "camera_and_rsu": "SIMULATED roadside camera tracks (ground truth plus noise) plus the car's own roof LiDAR, with the gate on them",
+    "camera_and_rsu": "roadside camera detection model tracks plus the car's own roof LiDAR, with the gate on them",
     "lidar_only": "only the car's own roof LiDAR: no roadside unit, so no safety gate",
 }
 SUITE_TESTS = {"traffic_light": 1, "left_turn": 2, "blind_corner": 3, "cut_in": 4, "yellow_light": 5}

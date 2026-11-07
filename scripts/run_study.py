@@ -40,7 +40,6 @@ REPORT_COLUMNS = ("config", "traffic", "scenario", "score", "runs", "ran", "pass
 # Points out of 100 for each part of the score, fixed before any results were seen: safety first, then getting the job done
 SCORE_WEIGHTS = {"no collision": 50, "pass": 30, "no false alarm": 10, "TTC margin": 10}
 SAFE_MARGIN = 3.0  # s of TTC in the low tail (P5) that earns all of its points
-SIMULATED = ("camera_and_rsu",)  # ground truth plus noise, not a trained detector: labelled wherever it's ranked
 
 
 def study_seeds(count):
@@ -175,15 +174,10 @@ def ranking_lines(runs):
                   "| Rank | Config | Score | Collision rate | Pass rate | False alarms per run | TTC P5 |",
                   "| ---- | ------ | ----- | -------------- | --------- | -------------------- | ------ |"]
         for rank, (config, s) in enumerate(scored, 1):
-            name = f"{config} (simulated)" if config in SIMULATED else config
-            lines.append(f"| {rank} | {name} | **{s['score']}** | {s['collision_rate_pct']} % | {s['pass_rate_pct']} % "
+            lines.append(f"| {rank} | {config} | **{s['score']}** | {s['collision_rate_pct']} % | {s['pass_rate_pct']} % "
                          f"| {s['false_interventions'] / s['ran']:.2f} | {shown(s['ttc_p5_s'], ' s')} |")
         best, *rest = scored
         lines += ["", f"Best: **{best[0]}** ({best[1]['score']})" + "".join(f", then {c} ({s['score']})" for c, s in rest) + "."]
-        real = next((c for c, s in scored if c not in SIMULATED), None)
-        if best[0] in SIMULATED and real:
-            lines.append(f"{best[0]} is simulated from CARLA's true positions and never sees a false object, so its score is an upper "
-                         f"bound for a real camera, not a measured camera result. Of the configs with real perception, the best is **{real}**.")
         lines.append("")
     return lines
 
@@ -227,8 +221,9 @@ def write_report(runs, directory=OUTPUT_DIR):
               ("- **Clearance**: seconds from first entering junction 189 to first leaving it, over the runs that got through (the count in brackets). "
                "The hidden hazards and clear_road end about 10 m past their conflict point, still inside the junction, so only the suite's tests give one."),
               "- lidar_only has no roadside unit, so no safety gate: its false alarms are always 0.",
-              ("- camera_and_rsu is SIMULATED: CARLA's true positions of the actors the roadside mounts have a clear line to, with assumed camera errors "
-              "(scripts/rsu_camera_sim.py). It can't mistake the containers for parked cars, so it's optimistic."),
+              ("- camera_and_rsu runs the roadside camera detector (models/rsu_camera_detector.candidate.onnx, trained by training/train_camera.py) "
+               "on a CARLA camera at each roadside mount, and places each box on the road from its pixel. Its accuracy on held-out seed 29 is in "
+               "docs/results/camera_detector_seed29.json."),
               "- red_light_runner is blind_corner's speeding car with its timing varied between repeats.", ""]
     (directory / "comparative_study_summary.md").write_text("\n".join(lines), encoding="utf-8")
     return rows

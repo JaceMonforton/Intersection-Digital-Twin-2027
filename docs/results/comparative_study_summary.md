@@ -1,6 +1,6 @@
 # Comparative study
 
-Generated 2026-11-07T07:52:04+00:00. 270 runs; every figure is measured.
+Generated 2026-11-07T22:59:55+00:00. 270 runs; every figure is measured.
 
 ## Which config is best
 
@@ -10,34 +10,31 @@ Each config is scored out of 100 from its measured results: 50 no collision, 30 
 
 | Rank | Config | Score | Collision rate | Pass rate | False alarms per run | TTC P5 |
 | ---- | ------ | ----- | -------------- | --------- | -------------------- | ------ |
-| 1 | camera_and_rsu (simulated) | **91.7** | 2.2 % | 97.8 % | 0.11 | 1.36 s |
-| 2 | lidar_and_rsu | **81.3** | 11.1 % | 88.9 % | 0.04 | 0.18 s |
+| 1 | lidar_and_rsu | **81.3** | 11.1 % | 88.9 % | 0.04 | 0.18 s |
+| 2 | camera_and_rsu | **76.7** | 13.3 % | 84.4 % | 0.20 | 0.0 s |
 | 3 | lidar_only | **60.2** | 35.6 % | 60.0 % | 0.00 | 0.0 s |
 
-Best: **camera_and_rsu** (91.7), then lidar_and_rsu (81.3), then lidar_only (60.2).
-camera_and_rsu is simulated from CARLA's true positions and never sees a false object, so its score is an upper bound for a real camera, not a measured camera result. Of the configs with real perception, the best is **lidar_and_rsu**.
+Best: **lidar_and_rsu** (81.3), then camera_and_rsu (76.7), then lidar_only (60.2).
 
 ### 15 background cars
 
 | Rank | Config | Score | Collision rate | Pass rate | False alarms per run | TTC P5 |
 | ---- | ------ | ----- | -------------- | --------- | -------------------- | ------ |
-| 1 | camera_and_rsu (simulated) | **72.6** | 9.1 % | 63.6 % | 0.39 | 0.58 s |
-| 2 | lidar_and_rsu | **71.3** | 9.1 % | 61.4 % | 0.27 | 0.04 s |
+| 1 | lidar_and_rsu | **71.3** | 9.1 % | 61.4 % | 0.27 | 0.04 s |
+| 2 | camera_and_rsu | **69.8** | 13.6 % | 65.9 % | 0.32 | 0.0 s |
 | 3 | lidar_only | **50.9** | 42.2 % | 40.0 % | 0.00 | 0.0 s |
 
-Best: **camera_and_rsu** (72.6), then lidar_and_rsu (71.3), then lidar_only (50.9).
-camera_and_rsu is simulated from CARLA's true positions and never sees a false object, so its score is an upper bound for a real camera, not a measured camera result. Of the configs with real perception, the best is **lidar_and_rsu**.
+Best: **lidar_and_rsu** (71.3), then camera_and_rsu (69.8), then lidar_only (50.9).
 
 ### All traffic loads
 
 | Rank | Config | Score | Collision rate | Pass rate | False alarms per run | TTC P5 |
 | ---- | ------ | ----- | -------------- | --------- | -------------------- | ------ |
-| 1 | camera_and_rsu (simulated) | **81.5** | 5.6 % | 80.9 % | 0.25 | 0.76 s |
-| 2 | lidar_and_rsu | **76.2** | 10.1 % | 75.3 % | 0.16 | 0.06 s |
+| 1 | lidar_and_rsu | **76.2** | 10.1 % | 75.3 % | 0.16 | 0.06 s |
+| 2 | camera_and_rsu | **73.3** | 13.5 % | 75.3 % | 0.26 | 0.0 s |
 | 3 | lidar_only | **55.5** | 38.9 % | 50.0 % | 0.00 | 0.0 s |
 
-Best: **camera_and_rsu** (81.5), then lidar_and_rsu (76.2), then lidar_only (55.5).
-camera_and_rsu is simulated from CARLA's true positions and never sees a false object, so its score is an upper bound for a real camera, not a measured camera result. Of the configs with real perception, the best is **lidar_and_rsu**.
+Best: **lidar_and_rsu** (76.2), then camera_and_rsu (73.3), then lidar_only (55.5).
 
 ## 0 background cars, by scenario
 
@@ -54,15 +51,15 @@ camera_and_rsu is simulated from CARLA's true positions and never sees a false o
 | lidar_and_rsu | clear_road | 100.0 | 5 of 5 | 100.0 % | 0.0 % | 0 | n/a | n/a | n/a | n/a (0) |
 | lidar_and_rsu | **all** | 81.3 | 45 of 45 | 88.9 % | 11.1 % | 2 | 2.89 s | 5.4 s | 0.18 s | 22.29 s (15) |
 | camera_and_rsu | traffic_light | 100.0 | 5 of 5 | 100.0 % | 0.0 % | 0 | n/a | n/a | n/a | n/a (0) |
-| camera_and_rsu | left_turn | 100.0 | 5 of 5 | 100.0 % | 0.0 % | 0 | 6.0 s | 6.79 s | 5.22 s | 39.44 s (5) |
-| camera_and_rsu | blind_corner | 98.9 | 5 of 5 | 100.0 % | 0.0 % | 0 | 2.84 s | 3.06 s | 2.66 s | n/a (0) |
-| camera_and_rsu | cut_in | 96.0 | 5 of 5 | 100.0 % | 0.0 % | 2 | 3.32 s | 3.69 s | 3.12 s | 11.34 s (5) |
-| camera_and_rsu | yellow_light | 100.0 | 5 of 5 | 100.0 % | 0.0 % | 0 | 4.16 s | 5.01 s | 3.65 s | 16.24 s (5) |
-| camera_and_rsu | red_light_runner | 73.8 | 5 of 5 | 80.0 % | 20.0 % | 1 | 2.27 s | 3.0 s | 0.53 s | 9.1 s (1) |
-| camera_and_rsu | hidden_pedestrian | 94.5 | 5 of 5 | 100.0 % | 0.0 % | 0 | 1.85 s | 2.28 s | 1.34 s | n/a (0) |
-| camera_and_rsu | oncoming_turner | 91.0 | 5 of 5 | 100.0 % | 0.0 % | 2 | 2.05 s | 2.42 s | 1.5 s | n/a (0) |
+| camera_and_rsu | left_turn | 75.6 | 5 of 5 | 60.0 % | 20.0 % | 0 | 5.3 s | 8.08 s | 2.27 s | 39.4 s (5) |
+| camera_and_rsu | blind_corner | 98.9 | 5 of 5 | 100.0 % | 0.0 % | 0 | 2.83 s | 3.01 s | 2.67 s | n/a (0) |
+| camera_and_rsu | cut_in | 94.0 | 5 of 5 | 100.0 % | 0.0 % | 3 | 6.42 s | 9.66 s | 3.16 s | 11.6 s (2) |
+| camera_and_rsu | yellow_light | 100.0 | 5 of 5 | 100.0 % | 0.0 % | 0 | 4.33 s | 5.18 s | 3.71 s | 15.42 s (5) |
+| camera_and_rsu | red_light_runner | 95.2 | 5 of 5 | 100.0 % | 0.0 % | 2 | 3.04 s | 3.65 s | 2.75 s | n/a (0) |
+| camera_and_rsu | hidden_pedestrian | 10.0 | 5 of 5 | 0.0 % | 100.0 % | 0 | 0.0 s | 0.0 s | 0.0 s | n/a (0) |
+| camera_and_rsu | oncoming_turner | 88.3 | 5 of 5 | 100.0 % | 0.0 % | 4 | 2.18 s | 2.49 s | 1.9 s | n/a (0) |
 | camera_and_rsu | clear_road | 100.0 | 5 of 5 | 100.0 % | 0.0 % | 0 | n/a | n/a | n/a | n/a (0) |
-| camera_and_rsu | **all** | 91.7 | 45 of 45 | 97.8 % | 2.2 % | 5 | 2.98 s | 5.17 s | 1.36 s | 21.51 s (16) |
+| camera_and_rsu | **all** | 76.7 | 45 of 45 | 84.4 % | 13.3 % | 9 | 3.3 s | 8.69 s | 0.0 s | 24.78 s (12) |
 | lidar_only | traffic_light | 100.0 | 5 of 5 | 100.0 % | 0.0 % | 0 | n/a | n/a | n/a | n/a (0) |
 | lidar_only | left_turn | 94.0 | 5 of 5 | 80.0 % | 0.0 % | 0 | 4.86 s | 7.9 s | 3.06 s | 39.06 s (5) |
 | lidar_only | blind_corner | 10.0 | 5 of 5 | 0.0 % | 100.0 % | 0 | 0.0 s | 0.0 s | 0.0 s | 12.0 s (5) |
@@ -88,16 +85,16 @@ camera_and_rsu is simulated from CARLA's true positions and never sees a false o
 | lidar_and_rsu | oncoming_turner | 75.2 | 5 of 5 | 80.0 % | 20.0 % | 0 | 1.22 s | 2.84 s | 0.37 s | n/a (0) |
 | lidar_and_rsu | clear_road | 69.3 | 5 of 5 | 40.0 % | 0.0 % | 3 | 18.57 s | 66.68 s | 0.99 s | n/a (0) |
 | lidar_and_rsu | **all** | 71.3 | 44 of 45 | 61.4 % | 9.1 % | 12 | 4.56 s | 7.04 s | 0.04 s | 24.19 s (9) |
-| camera_and_rsu | traffic_light | 73.9 | 5 of 5 | 40.0 % | 0.0 % | 1 | 3.61 s | 9.02 s | 1.18 s | n/a (0) |
-| camera_and_rsu | left_turn | 36.0 | 5 of 5 | 20.0 % | 40.0 % | 9 | 2.78 s | 7.54 s | 0.0 s | 39.77 s (4) |
-| camera_and_rsu | blind_corner | 96.4 | 5 of 5 | 100.0 % | 0.0 % | 0 | 2.44 s | 2.87 s | 1.91 s | n/a (0) |
-| camera_and_rsu | cut_in | 70.1 | 5 of 5 | 60.0 % | 20.0 % | 0 | 2.19 s | 3.56 s | 0.64 s | 8.9 s (1) |
-| camera_and_rsu | yellow_light | 76.0 | 5 of 5 | 20.0 % | 0.0 % | 0 | 5.42 s | 7.73 s | 3.71 s | 19.0 s (5) |
-| camera_and_rsu | red_light_runner | 76.6 | 4 of 5 | 75.0 % | 25.0 % | 1 | 3.25 s | 3.63 s | 2.73 s | 9.2 s (1) |
-| camera_and_rsu | hidden_pedestrian | 89.0 | 5 of 5 | 100.0 % | 0.0 % | 2 | 1.62 s | 2.37 s | 0.89 s | n/a (0) |
-| camera_and_rsu | oncoming_turner | 90.8 | 5 of 5 | 100.0 % | 0.0 % | 2 | 1.96 s | 2.75 s | 1.45 s | n/a (0) |
-| camera_and_rsu | clear_road | 77.4 | 5 of 5 | 60.0 % | 0.0 % | 2 | 5.23 s | 12.44 s | 1.01 s | n/a (0) |
-| camera_and_rsu | **all** | 72.6 | 44 of 45 | 63.6 % | 9.1 % | 17 | 3.17 s | 8.55 s | 0.58 s | 24.75 s (11) |
+| camera_and_rsu | traffic_light | 76.2 | 5 of 5 | 80.0 % | 20.0 % | 0 | 5.65 s | 14.98 s | 0.65 s | n/a (0) |
+| camera_and_rsu | left_turn | 45.5 | 5 of 5 | 0.0 % | 20.0 % | 3 | 2.16 s | 3.2 s | 0.45 s | 38.5 s (3) |
+| camera_and_rsu | blind_corner | 92.5 | 5 of 5 | 100.0 % | 0.0 % | 1 | 3.82 s | 8.27 s | 1.35 s | n/a (0) |
+| camera_and_rsu | cut_in | 90.9 | 5 of 5 | 100.0 % | 0.0 % | 2 | 2.82 s | 5.17 s | 1.46 s | 9.4 s (2) |
+| camera_and_rsu | yellow_light | 70.0 | 5 of 5 | 20.0 % | 0.0 % | 3 | 5.06 s | 6.15 s | 4.37 s | 17.63 s (3) |
+| camera_and_rsu | red_light_runner | 93.1 | 4 of 5 | 100.0 % | 0.0 % | 2 | 5.03 s | 10.29 s | 2.43 s | n/a (0) |
+| camera_and_rsu | hidden_pedestrian | 26.0 | 5 of 5 | 20.0 % | 80.0 % | 0 | 0.0 s | 0.0 s | 0.0 s | n/a (0) |
+| camera_and_rsu | oncoming_turner | 93.0 | 5 of 5 | 100.0 % | 0.0 % | 2 | 2.6 s | 3.09 s | 2.09 s | n/a (0) |
+| camera_and_rsu | clear_road | 86.5 | 5 of 5 | 80.0 % | 0.0 % | 1 | 4.99 s | 10.92 s | 1.36 s | n/a (0) |
+| camera_and_rsu | **all** | 69.8 | 44 of 45 | 65.9 % | 13.6 % | 14 | 3.54 s | 11.2 s | 0.0 s | 23.4 s (8) |
 | lidar_only | traffic_light | 93.8 | 5 of 5 | 100.0 % | 0.0 % | 0 | 4.8 s | 14.66 s | 1.15 s | n/a (0) |
 | lidar_only | left_turn | 57.0 | 5 of 5 | 20.0 % | 20.0 % | 0 | 1.8 s | 3.25 s | 0.3 s | 27.7 s (3) |
 | lidar_only | blind_corner | 42.0 | 5 of 5 | 40.0 % | 60.0 % | 0 | 1.22 s | 3.88 s | 0.0 s | 11.08 s (4) |
@@ -117,5 +114,5 @@ camera_and_rsu is simulated from CARLA's true positions and never sees a false o
 - **TTC**: each run's lowest true straight-line TTC to any car or person, as the gate measures it but from CARLA's true positions. Mean, P95 and P5 are over the runs where anything was ever on a collision course. P5 is the dangerous tail.
 - **Clearance**: seconds from first entering junction 189 to first leaving it, over the runs that got through (the count in brackets). The hidden hazards and clear_road end about 10 m past their conflict point, still inside the junction, so only the suite's tests give one.
 - lidar_only has no roadside unit, so no safety gate: its false alarms are always 0.
-- camera_and_rsu is SIMULATED: CARLA's true positions of the actors the roadside mounts have a clear line to, with assumed camera errors (scripts/rsu_camera_sim.py). It can't mistake the containers for parked cars, so it's optimistic.
+- camera_and_rsu runs the roadside camera detector (models/rsu_camera_detector.candidate.onnx, trained by training/train_camera.py) on a CARLA camera at each roadside mount, and places each box on the road from its pixel. Its accuracy on held-out seed 29 is in docs/results/camera_detector_seed29.json.
 - red_light_runner is blind_corner's speeding car with its timing varied between repeats.

@@ -1,8 +1,7 @@
 """
 A live window of the two roadside cameras, for the camera_and_rsu config: what a camera at each roadside mount sees,
-with the camera tracks the processor sends the ML car drawn over it as 3D boxes. The images are CARLA's real renders.
-The boxes are SIMULATED, ground truth plus noise (scripts/rsu_camera_sim.py), not a detector, and the window says so.
-CARLA's true boxes are drawn dimly underneath them, for comparing by eye.
+with the roadside camera detector's boxes (models/rsu_camera_detector.candidate.onnx, run by the processor on its
+own cameras in the same places) drawn over it. CARLA's true boxes are drawn dimly underneath, for comparing by eye.
 
     python run_simulation.py --camera_and_rsu
     python scripts/rsu_camera_view.py     # alongside a processor started with --detector camera --lidar-view
@@ -16,23 +15,17 @@ import sys
 import time
 
 import numpy as np
+from camera_features import FOV, IMAGE_HEIGHT, IMAGE_WIDTH, aim_at_centre, project
 from central_gpu_processor import CARLA_HOST, CARLA_PORT, LIDAR_MOUNTS, find_junction
 from detection_features import MODEL_GROUND_Z, PEDESTRIAN
 from lidar_view import FEED_NAME, STOPPED_AFTER, SweepFeed
 
 JUNCTION_ID = 189
-IMAGE_WIDTH, IMAGE_HEIGHT, FOV = 640, 360, 90.0
 HEADER = 64             # pixels of text above the images
 FPS = 20
 EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7))
 TRACK_CAR, TRACK_PERSON = (70, 230, 120), (240, 90, 220)
 TRUE_BOX, BAD, TEXT, TITLE, BACKGROUND = (120, 120, 125), (240, 90, 80), (205, 205, 205), (240, 240, 240), (16, 16, 18)
-
-
-def aim_at_centre(mount):
-    """(pitch, yaw) in degrees that point a camera at mount (x, y, z from the junction centre) at the centre."""
-    x, y, z = mount
-    return -math.degrees(math.atan2(z, math.hypot(x, y))), math.degrees(math.atan2(-y, -x))
 
 
 def box_corners_world(row, center):
@@ -43,17 +36,6 @@ def box_corners_world(row, center):
     cos, sin = math.cos(yaw), math.sin(yaw)
     flat = [(a, b) for a, b in ((half_length, half_width), (half_length, -half_width), (-half_length, -half_width), (-half_length, half_width))]
     return np.array([(x + a * cos - b * sin, y + a * sin + b * cos, z + c) for c in (-half_height, half_height) for a, b in flat])
-
-
-def project(points, world_to_camera, width=IMAGE_WIDTH, height=IMAGE_HEIGHT, fov=FOV):
-    """World points (N x 3) to pixels (N x 2), NaN for any behind the camera. world_to_camera is the camera
-    transform's inverse matrix; in its frame x is forward, y right and z up, as everywhere in CARLA."""
-    local = (np.asarray(world_to_camera) @ np.c_[points, np.ones(len(points))].T)[:3].T
-    focal = width / (2.0 * math.tan(math.radians(fov) / 2.0))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pixels = np.c_[focal * local[:, 1] / local[:, 0] + width / 2.0, -focal * local[:, 2] / local[:, 0] + height / 2.0]
-    pixels[local[:, 0] < 0.1] = np.nan
-    return pixels
 
 
 class RoadsideCamera:
@@ -94,7 +76,7 @@ class Window:
         self.cameras = [RoadsideCamera(carla, world, location, mount) for mount in LIDAR_MOUNTS]
         pygame.init()
         self.screen = pygame.display.set_mode((IMAGE_WIDTH * len(self.cameras), IMAGE_HEIGHT + HEADER))
-        pygame.display.set_caption("Roadside cameras (simulated tracks)")
+        pygame.display.set_caption("Roadside cameras: camera detector")
         self.small, self.large = pygame.font.SysFont("segoeui", 14), pygame.font.SysFont("segoeui", 19, bold=True)
         self.clock = pygame.time.Clock()
         self.feed = None
@@ -117,17 +99,17 @@ class Window:
     def draw(self, now):
         pygame = self.pygame
         self.screen.fill(BACKGROUND)
-        title = "Roadside cameras: SIMULATED tracks (CARLA ground truth + camera noise), not a detector"
+        title = "Roadside cameras: the camera detection model's boxes"
         self.screen.blit(self.large.render(title, True, TITLE), (16, 8))
         if self.state is None:
             words, colour = "Waiting for a processor started with --detector camera --lidar-view.", BAD
         elif now - self.updated > STOPPED_AFTER:
-            words, colour = f"NO NEW TRACKS for {now - self.updated:.0f} s", BAD
+            words, colour = f"NO NEW DETECTIONS for {now - self.updated:.0f} s", BAD
         else:
             detections = self.state["detections"]
             people = int((detections[:, 8] == PEDESTRIAN).sum()) if len(detections) else 0
             words, colour = (f"{len(detections) - people} vehicles and {people} people reported, of {len(self.state['true_boxes'])} in CARLA. "
-                             "Green: simulated vehicle track, magenta: simulated person track, grey: CARLA's true box. Esc closes."), TEXT
+                             "Green: detected vehicle, magenta: detected person, grey: CARLA's true box. Esc closes."), TEXT
         self.screen.blit(self.small.render(words, True, colour), (16, 38))
         for index, camera in enumerate(self.cameras):
             offset = index * IMAGE_WIDTH

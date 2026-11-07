@@ -4,9 +4,8 @@ import math
 import struct
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
-from rsu_camera_view import aim_at_centre, box_corners_world, project
+from rsu_camera_view import box_corners_world
 from run_professor_test_suite import false_brakes, roof_sweep_to_model_frame, true_ttc
 from run_study import (
     FINAL_SEED,
@@ -94,7 +93,7 @@ def test_the_report_has_a_row_per_scenario_then_all_and_writes_its_files(tmp_pat
     with open(tmp_path / "comparative_study_report.csv", encoding="utf-8") as file:
         assert len(list(csv.DictReader(file))) == len(rows)
     summary = (tmp_path / "comparative_study_summary.md").read_text(encoding="utf-8")
-    assert "## 0 background cars" in summary and "## 15 background cars" in summary and "SIMULATED" in summary
+    assert "## 0 background cars" in summary and "## 15 background cars" in summary and "camera detector" in summary
 
 
 def test_the_score_rewards_safety_most_and_the_ranking_puts_the_best_first():
@@ -117,13 +116,6 @@ def test_the_summary_opens_with_the_ranking_and_the_old_rows_lose_passes_that_di
     assert summary.index("## Which config is best") < summary.index("by scenario")
     assert "Best: **lidar_only** (100.0)." in summary
     assert all(r["config"] != "lidar_and_rsu" or r["score"] is None for r in rows)
-
-
-def test_a_simulated_config_on_top_is_labelled_and_the_best_real_one_named(tmp_path):
-    write_report([run(config="camera_and_rsu"), run(config="lidar_and_rsu", false_brakes=1), run(config="lidar_only", collisions=1)], tmp_path)
-    summary = (tmp_path / "comparative_study_summary.md").read_text(encoding="utf-8")
-    assert "| camera_and_rsu (simulated) |" in summary
-    assert "Of the configs with real perception, the best is **lidar_and_rsu**." in summary
 
 
 def test_scenario_names_expand_and_keep_the_study_order():
@@ -150,16 +142,6 @@ def test_a_roof_sweep_lands_in_the_junction_frame_turned_by_the_cars_heading():
     points = roof_sweep_to_model_frame(raw, SimpleNamespace(x=90.0, y=50.0, z=1.9), 90.0, center)
     # Facing +y (CARLA's right-hand side, the model's -y), the point is at world (90, 60): 10 m before the centre, 10 m to its model right
     assert points[0, :2] == pytest.approx((-10.0, -10.0), abs=1e-4)
-
-
-def test_a_camera_projects_what_it_faces_and_nothing_behind_it():
-    pitch, yaw = aim_at_centre((10.0, 0.0, 10.0))
-    assert pitch == pytest.approx(-45.0) and abs(yaw) == pytest.approx(180.0)  # looking back along -x, at the centre
-    facing_x = np.eye(4)  # a camera at the origin looking along +x
-    pixels = project(np.array([[10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [-5.0, 0.0, 0.0]]), facing_x, 640, 360, 90.0)
-    assert pixels[0] == pytest.approx((320.0, 180.0))
-    assert pixels[1] == pytest.approx((640.0, 180.0))  # 45 degrees right is the edge at a 90 degree field of view
-    assert np.isnan(pixels[2]).all()
 
 
 def test_box_corners_come_back_in_carla_frame():

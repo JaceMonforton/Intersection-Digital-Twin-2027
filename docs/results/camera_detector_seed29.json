@@ -1,0 +1,59 @@
+{
+ "seed": 29,
+ "frames": 400,
+ "milliseconds_median_both_cameras": 34.27509998437017,
+ "vehicles": {
+  "threshold": 0.333,
+  "seen": 3612,
+  "average_precision": 0.7774064663268551,
+  "recall": {
+   "all": {
+    "actors": 3612,
+    "recall": 0.7718715393133998
+   },
+   "within_30m": {
+    "actors": 1762,
+    "recall": 0.9540295119182747
+   },
+   "beyond_30m": {
+    "actors": 1850,
+    "recall": 0.5983783783783784
+   }
+  },
+  "precision": 0.7779017857142857,
+  "false_boxes_per_frame": 1.99,
+  "median_position_error_m": {
+   "all": 0.49824702739715576,
+   "within_30m": 0.37499430775642395,
+   "beyond_30m": 0.7156736850738525
+  },
+  "p90_position_error_m": 1.2392504215240479
+ },
+ "pedestrians": {
+  "threshold": 0.611,
+  "seen": 9340,
+  "average_precision": 0.43863510946346174,
+  "recall": {
+   "all": {
+    "actors": 9340,
+    "recall": 0.534796573875803
+   },
+   "within_30m": {
+    "actors": 7282,
+    "recall": 0.6156275748420763
+   },
+   "beyond_30m": {
+    "actors": 2058,
+    "recall": 0.2487852283770651
+   }
+  },
+  "precision": 0.6726366819283598,
+  "false_boxes_per_frame": 6.0775,
+  "median_position_error_m": {
+   "all": 0.3142072558403015,
+   "within_30m": 0.2921517789363861,
+   "beyond_30m": 0.5348886251449585
+  },
+  "p90_position_error_m": 0.8127667903900146
+ }
+}

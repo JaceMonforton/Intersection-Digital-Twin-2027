@@ -5,7 +5,7 @@ How the ML car learns about the actors around it, whichever way it's getting the
     rsu     tracks from the roadside unit's detector, sent by the processor, plus what the car's own roof LiDAR hits,
             as the roadside unit only covers 60 m around the junction and a car alone past that is blind
     sight   only what a LiDAR on the car's own roof hits: the baseline the roadside unit has to beat
-    camera  as rsu, but the roadside tracks are SIMULATED cameras (ground truth plus noise, see rsu_camera_sim.py),
+    camera  as rsu, but the roadside tracks come from the roadside camera detector (scripts/camera_features.py),
             from a processor run with --detector camera. The car can't tell the difference, which is the point
 
 Each view gives the driver cars as (x, y, vx, vy, yaw) and pedestrians as (x, y, vx, vy), in CARLA's frame, plus
