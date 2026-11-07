@@ -7,6 +7,7 @@ for comparing by eye: nothing else reads them from here. Everything shown is mea
 
     python run_simulation.py --roadside --lidar-view
     python scripts/lidar_view.py         # alongside a processor started with --detector onnx --lidar-view
+    python scripts/lidar_view.py --feed roof   # the ML car's own roof LiDAR, in lidar_only: run_simulation.py --lidar_only
 
 Press 1 or 2 to hide a LiDAR's points, which shows what the other one covers. It only changes this window.
 AI-driven pedestrians (controller.ai.walker) stay as dim true boxes, because LiDAR rays pass straight through them.
@@ -34,6 +35,7 @@ from detection_features import (
 )
 
 FEED_NAME = "intersection_lidar_view"
+ROOF_FEED = "intersection_roof_view"  # the ML car's own roof LiDAR, written by the test suite in lidar_only
 LIDARS = 2
 MAX_POINTS = 60000      # per LiDAR; each makes 30,000 a sweep
 MAX_DETECTIONS = 300
@@ -80,18 +82,19 @@ class SweepFeed:
         return BODY_START + LIDARS * 2 * 4 + points + points % 4 + (MAX_DETECTIONS * DETECTION_SIZE + MAX_TRUE * LABEL_SIZE) * 4
 
     @classmethod
-    def create(cls):
+    def create(cls, name=None):
+        name = name or FEED_NAME  # read when called, not when defined
         try:
-            memory = shared_memory.SharedMemory(FEED_NAME, create=True, size=cls.size())
+            memory = shared_memory.SharedMemory(name, create=True, size=cls.size())
         except FileExistsError:  # a window from the last run is still open, so carry on with its block
-            memory = shared_memory.SharedMemory(FEED_NAME)
+            memory = shared_memory.SharedMemory(name)
         return cls(memory)
 
     @classmethod
-    def attach(cls):
+    def attach(cls, name=None):
         """None until a processor has made the feed."""
         try:
-            return cls(shared_memory.SharedMemory(FEED_NAME))
+            return cls(shared_memory.SharedMemory(name or FEED_NAME))
         except FileNotFoundError:
             return None
 
@@ -185,12 +188,16 @@ class SweepRate:
 
 
 class Window:
-    def __init__(self, pygame):
+    def __init__(self, pygame, roof=False):
+        """roof shows the ML car's own roof LiDAR instead, which has no detector: its boxes are only CARLA's true ones."""
         self.pygame = pygame
+        self.roof = roof
+        self.title = "ML car's own roof LiDAR" if roof else "Roadside LiDARs"
+        self.names = ("on the roof",) if roof else ("A", "B")
         pygame.init()
         self.size = min(MAX_WINDOW, pygame.display.Info().current_h - 120)
         self.screen = pygame.display.set_mode((self.size + PANEL_WIDTH, self.size))
-        pygame.display.set_caption("Roadside LiDARs")
+        pygame.display.set_caption(self.title)
         self.small, self.medium, self.large = (pygame.font.SysFont("segoeui", size) for size in (14, 17, 22))
         self.clock = pygame.time.Clock()
         self.feed = None
@@ -201,7 +208,7 @@ class Window:
         self.rates = [SweepRate() for _ in range(LIDARS)]
 
     def poll(self, now):
-        self.feed = self.feed or SweepFeed.attach()
+        self.feed = self.feed or SweepFeed.attach(ROOF_FEED if self.roof else FEED_NAME)
         state = self.feed.read() if self.feed else None
         if state is not None:
             self.state, self.updated = state, now
@@ -213,8 +220,12 @@ class Window:
         self.screen.fill(BACKGROUND)
         self.pygame.draw.rect(self.screen, PANEL, (self.size, 0, PANEL_WIDTH, self.size))
         self.cursor = 22
-        self._line("Roadside LiDARs", self.large, TITLE, 36)
-        if self.state is None:
+        self._line(self.title, self.large, TITLE, 36)
+        if self.state is None and self.roof:
+            self._line("Waiting for the test suite.", colour=BAD)
+            self._line("It needs --perception sight")
+            self._line("and --roof-view.")
+        elif self.state is None:
             self._line("Waiting for the processor.", colour=BAD)
             self._line("It needs --detector onnx")
             self._line("and --lidar-view.")
@@ -257,7 +268,7 @@ class Window:
 
     def _draw_panel(self, now):
         state = self.state
-        for index, name in enumerate(("A", "B")):
+        for index, name in enumerate(self.names):
             self.pygame.draw.circle(self.screen, COLOURS[index], (self.size + 31, self.cursor + 12), 6)
             self._line(f"LiDAR {name}" + (" (hidden)" if self.hidden[index] else ""), self.medium, TITLE, 28, indent=22)
             self._line(f"Points in the grid: {len(state['sweeps'][index]):,}")
@@ -269,17 +280,18 @@ class Window:
         true_boxes, seen = state["true_boxes"], self.seen_counts >= MIN_POINTS
         for label, kind in (("Vehicles", VEHICLE), ("People", PEDESTRIAN)):
             of_kind = true_boxes[:, 7] == kind
-            self._line(f"{label}: {int((state['detections'][:, 8] == kind).sum())} detected,", gap=20)
-            self._line(f"{int((of_kind & seen).sum())} hit by LiDAR, {int(of_kind.sum())} in CARLA", gap=28, indent=12)
+            if not self.roof:
+                self._line(f"{label}: {int((state['detections'][:, 8] == kind).sum())} detected,", gap=20)
+            self._line(f"{label + ': ' if self.roof else ''}{int((of_kind & seen).sum())} hit by LiDAR, {int(of_kind.sum())} in CARLA", gap=28, indent=0 if self.roof else 12)
         self.cursor += 8
         self._line("Key", self.medium, TITLE, 28)
-        for colour, words in ((TRUE_SEEN, "CARLA's true box"), (TRUE_UNSEEN, f"True box, under {MIN_POINTS} LiDAR points"),
-                              (DETECTED_CAR, "Detected vehicle"), (DETECTED_PERSON, "Detected person")):
+        key = ((TRUE_SEEN, "CARLA's true box"), (TRUE_UNSEEN, f"True box, under {MIN_POINTS} LiDAR points"))
+        for colour, words in key + (() if self.roof else ((DETECTED_CAR, "Detected vehicle"), (DETECTED_PERSON, "Detected person"))):
             self.pygame.draw.rect(self.screen, colour, (self.size + 24, self.cursor + 4, 16, 12), 2)
             self._line(words, indent=26)
         self.cursor += 6
         self._line("Dim points are the road, bright are above it.")
-        self._line("1 or 2 hides a LiDAR. Esc closes.")
+        self._line("Esc closes." if self.roof else "1 or 2 hides a LiDAR. Esc closes.")
         self.cursor = self.size - 34
         waited = now - self.updated
         if waited > STOPPED_AFTER:
@@ -312,12 +324,18 @@ def _raise_keyboard_interrupt(signum, frame):
 
 
 def main():
+    import argparse
+
     import pygame
 
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--feed", choices=("roadside", "roof"), default="roadside",
+                        help="roof: the ML car's own roof LiDAR, from the suite run with --perception sight --roof-view")
+    args = parser.parse_args()
     for name in ("SIGBREAK", "SIGTERM"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
-    window = Window(pygame)
+    window = Window(pygame, roof=args.feed == "roof")
     try:
         window.run()
     except KeyboardInterrupt:

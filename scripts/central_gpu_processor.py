@@ -17,6 +17,7 @@ import itertools
 import json
 import math
 import queue
+import random
 import signal
 import threading
 import time
@@ -33,12 +34,14 @@ from detection_features import (
     GRID_SIZE,
     MODEL_GROUND_Z,
     PEDESTRIAN,
+    VEHICLE,
     decode,
     labels_for,
     rasterize,
 )
 from model_panel import SafetySender
-from roadside_link import RoadsideSender
+from roadside_link import RoadsideSender, visible_actors
+from rsu_camera_sim import camera_observe
 from waymo_predictor_node import (
     DEFAULT_MODEL as TRAJECTORY_MODEL,
 )
@@ -735,6 +738,21 @@ def spawn_lidars(carla, world, center, mounts=LIDAR_MOUNTS, yaws=None):
     return lidars
 
 
+def spawn_sight_lines(carla, world, center, seen, mounts=LIDAR_MOUNTS):
+    """Semantic LiDARs at the roadside mounts, read only for which actors a camera there has a clear line to. Each
+    sweep replaces seen[i] with the ids of the actors it hit, so containers hide hazards from the cameras too."""
+    bp = world.get_blueprint_library().find("sensor.lidar.ray_cast_semantic")
+    for key, value in (("channels", LIDAR_CHANNELS), ("points_per_second", LIDAR_POINTS_PER_SECOND), ("range", LIDAR_RANGE),
+                       ("upper_fov", LIDAR_UPPER_FOV), ("lower_fov", LIDAR_LOWER_FOV), ("rotation_frequency", 1.0 / FIXED_DELTA)):
+        bp.set_attribute(key, str(value))
+    sensors = []
+    for index, (x, y, z) in enumerate(mounts):
+        sensor = world.spawn_actor(bp, carla.Transform(carla.Location(x=center.x + x, y=center.y + y, z=center.z + z)))
+        sensor.listen(lambda measurement, i=index: seen.__setitem__(i, visible_actors(bytes(measurement.raw_data))))
+        sensors.append(sensor)
+    return sensors
+
+
 def _keep_newest(sweeps, measurement):
     try:
         sweeps.get_nowait()  # only the newest sweep matters
@@ -840,7 +858,15 @@ class CarlaPerception:
             print(f"[PREDICT] {TRAJECTORY_MODEL} not found: {CONTROLLED_VEHICLE} falls back to ROAD-FOLLOWING prediction.")
         self.boxes = []
         self._previous = {}  # actor id -> (x, y, time), for actors CARLA reports no velocity for
-        if detector_mode == "onnx" or (detector_mode == "auto" and Path(model_path).exists()):
+        self.camera = detector_mode == "camera"
+        self.sight_seen, self.sight_lines = [set() for _ in LIDAR_MOUNTS], []
+        if self.camera:
+            self.box_color = carla.Color(*BOX_COLOR_GROUND_TRUTH)
+            self.camera_rng = random.Random(0)
+            self.sight_lines = spawn_sight_lines(carla, self.world, self.center, self.sight_seen)
+            print("[CAMERA] SIMULATED roadside camera tracks: CARLA's true positions of the actors the corner mounts have a clear "
+                  "line to, with camera-like depth, yaw and recall errors added (scripts/rsu_camera_sim.py). Not a model.")
+        elif detector_mode == "onnx" or (detector_mode == "auto" and Path(model_path).exists()):
             self.detector = RoadsideDetector(model_path)
             self.box_color = carla.Color(*BOX_COLOR_MODEL)
             print(f"[LIDAR] Using model {model_path}")
@@ -851,11 +877,12 @@ class CarlaPerception:
         # Only with a detector: ray tracing them slows every tick, and ground truth doesn't read them
         self.lidars = spawn_lidars(carla, self.world, self.center) if self.detector else []
         self.lidar_feed = None
-        if lidar_view and self.detector:
+        if lidar_view and (self.detector or self.camera):
             from lidar_view import SweepFeed
 
             self.lidar_feed = SweepFeed.create()
-            print("[LIDAR] Publishing sweeps for scripts/lidar_view.py, with CARLA's true boxes for it to compare against.")
+            print("[LIDAR] Publishing sweeps for scripts/lidar_view.py, with CARLA's true boxes for it to compare against."
+                  if self.detector else "[CAMERA] Publishing the simulated camera tracks for scripts/rsu_camera_view.py.")
         elif lidar_view:
             print("[LIDAR] --lidar-view does nothing here: no detector, so no LiDARs were spawned.")
         self.world.get_spectator().set_transform(
@@ -891,6 +918,8 @@ class CarlaPerception:
         """Advance the simulation one step and return the tracks detected in it."""
         frame = self.world.tick()
         now = self.world.get_snapshot().timestamp.elapsed_seconds
+        if self.camera:
+            return self._camera(frame, now)
         return self._detect(frame, now) if self.detector else self._ground_truth(now)
 
     def _detect(self, frame, now):
@@ -908,6 +937,31 @@ class CarlaPerception:
         if own is not None:
             keep = [math.hypot(b.x - own.x, b.y - own.y) > EGO_RADIUS for b in found]
             rows, found = rows[keep] if len(rows) else rows, [b for b, k in zip(found, keep) if k]
+        return self._track(rows, found, now, own, own_box)
+
+    def _camera(self, frame, now):
+        """Simulated camera boxes, as rows in the detector's own format, so that tracking, the safety gate and the
+        roadside link treat them exactly as they treat the detector's. The ML car is left out, as it is from those."""
+        seen = set().union(*self.sight_seen)
+        actors = [a for pattern in ("vehicle.*", "walker.pedestrian.*") for a in self.world.get_actors().filter(pattern)
+                  if a.id in seen and a.attributes.get("role_name") != CONTROLLED_VEHICLE]
+        centres = []
+        for actor in actors:
+            tf = actor.get_transform()
+            centres.append((tf.transform(actor.bounding_box.location), tf.rotation.yaw, actor.type_id.startswith("walker.")))
+        mounts = [(self.center.x + x, self.center.y + y) for x, y, _ in LIDAR_MOUNTS]
+        reported = camera_observe([(c.x, c.y, yaw, person) for c, yaw, person in centres], mounts, self.camera_rng)
+        rows = np.array([(x - self.center.x, -(y - self.center.y), centres[i][0].z - self.center.z + MODEL_GROUND_Z,
+                          *(2 * e for e in (actors[i].bounding_box.extent.x, actors[i].bounding_box.extent.y, actors[i].bounding_box.extent.z)),
+                          -math.radians(yaw), 1.0, PEDESTRIAN if centres[i][2] else VEHICLE)
+                         for i, x, y, yaw in reported], np.float32).reshape(-1, 9)
+        self._publish_view(frame, now, [None] * len(LIDAR_MOUNTS), rows)
+        found = [model_box_to_world(r, self.center.x, self.center.y, self.center.z) for r in rows]
+        own, own_box = self._own_track(now)
+        return self._track(rows, found, now, own, own_box)
+
+    def _track(self, rows, found, now, own, own_box):
+        """Tracks from this tick's boxes, which it also sends to the ML car over the roadside link."""
         self.boxes = found + ([own_box] if own_box else [])
         # A walking person sometimes scores as a vehicle, which would lose their track just as they step out
         is_person = [r[8] == PEDESTRIAN or r[3] < PERSON_LENGTH for r in rows]
@@ -927,7 +981,7 @@ class CarlaPerception:
         try:
             actors = [a for pattern in ("vehicle.*", "walker.pedestrian.*") for a in self.world.get_actors().filter(pattern)]
             true_boxes = labels_for(actors, self.world.get_snapshot(), self.center)
-            mounts = [(lidar.mount[0], -lidar.mount[1]) for lidar in self.lidars]
+            mounts = [(x, -y) for x, y, _ in LIDAR_MOUNTS]  # where spawn_lidars and spawn_sight_lines put them
             self.lidar_feed.write(frame, now, mounts, parts, rows, true_boxes)
         except (RuntimeError, ValueError, OSError) as error:
             print(f"[LIDAR] Stopped publishing to the LiDAR window: {error}")
@@ -1028,9 +1082,9 @@ class CarlaPerception:
     def cleanup(self):
         if self.lidar_feed is not None:
             self.lidar_feed.destroy()
-        for lidar in self.lidars:
-            lidar.sensor.stop()
-            lidar.sensor.destroy()
+        for sensor in [lidar.sensor for lidar in self.lidars] + self.sight_lines:
+            sensor.stop()
+            sensor.destroy()
         self.traffic_manager.set_synchronous_mode(False)
         self._leave_synchronous_mode()
 
@@ -1043,9 +1097,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-carla", action="store_true", help="evaluate Ditto telemetry only")
     parser.add_argument("--junction", type=int, default=INTERSECTION_JUNCTION, help="id of the map junction to watch")
-    parser.add_argument("--detector", choices=("auto", "onnx", "groundtruth"), default="auto")
+    parser.add_argument("--detector", choices=("auto", "onnx", "groundtruth", "camera"), default="auto",
+                        help="camera: SIMULATED roadside camera tracks, ground truth plus noise (scripts/rsu_camera_sim.py)")
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
-    parser.add_argument("--lidar-view", action="store_true", help="publish the LiDARs' sweeps for scripts/lidar_view.py; needs a detector")
+    parser.add_argument("--lidar-view", action="store_true", help="publish the LiDARs' sweeps for scripts/lidar_view.py, or with "
+                        "--detector camera the camera tracks for scripts/rsu_camera_view.py; needs a detector")
     args = parser.parse_args()
 
     # Without this, Ctrl+Break or a closed console skips the cleanup below, leaving the sensors
