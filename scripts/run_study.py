@@ -40,6 +40,7 @@ REPORT_COLUMNS = ("config", "traffic", "scenario", "score", "runs", "ran", "pass
 # Points out of 100 for each part of the score, fixed before any results were seen: safety first, then getting the job done
 SCORE_WEIGHTS = {"no collision": 50, "pass": 30, "no false alarm": 10, "TTC margin": 10}
 SAFE_MARGIN = 3.0  # s of TTC in the low tail (P5) that earns all of its points
+SIMULATED = ("camera_and_rsu",)  # ground truth plus noise, not a trained detector: labelled wherever it's ranked
 
 
 def study_seeds(count):
@@ -174,10 +175,16 @@ def ranking_lines(runs):
                   "| Rank | Config | Score | Collision rate | Pass rate | False alarms per run | TTC P5 |",
                   "| ---- | ------ | ----- | -------------- | --------- | -------------------- | ------ |"]
         for rank, (config, s) in enumerate(scored, 1):
-            lines.append(f"| {rank} | {config} | **{s['score']}** | {s['collision_rate_pct']} % | {s['pass_rate_pct']} % "
+            name = f"{config} (simulated)" if config in SIMULATED else config
+            lines.append(f"| {rank} | {name} | **{s['score']}** | {s['collision_rate_pct']} % | {s['pass_rate_pct']} % "
                          f"| {s['false_interventions'] / s['ran']:.2f} | {shown(s['ttc_p5_s'], ' s')} |")
         best, *rest = scored
-        lines += ["", f"Best: **{best[0]}** ({best[1]['score']})" + "".join(f", then {c} ({s['score']})" for c, s in rest) + ".", ""]
+        lines += ["", f"Best: **{best[0]}** ({best[1]['score']})" + "".join(f", then {c} ({s['score']})" for c, s in rest) + "."]
+        real = next((c for c, s in scored if c not in SIMULATED), None)
+        if best[0] in SIMULATED and real:
+            lines.append(f"{best[0]} is simulated from CARLA's true positions and never sees a false object, so its score is an upper "
+                         f"bound for a real camera, not a measured camera result. Of the configs with real perception, the best is **{real}**.")
+        lines.append("")
     return lines
 
 

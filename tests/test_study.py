@@ -119,6 +119,13 @@ def test_the_summary_opens_with_the_ranking_and_the_old_rows_lose_passes_that_di
     assert all(r["config"] != "lidar_and_rsu" or r["score"] is None for r in rows)
 
 
+def test_a_simulated_config_on_top_is_labelled_and_the_best_real_one_named(tmp_path):
+    write_report([run(config="camera_and_rsu"), run(config="lidar_and_rsu", false_brakes=1), run(config="lidar_only", collisions=1)], tmp_path)
+    summary = (tmp_path / "comparative_study_summary.md").read_text(encoding="utf-8")
+    assert "| camera_and_rsu (simulated) |" in summary
+    assert "Of the configs with real perception, the best is **lidar_and_rsu**." in summary
+
+
 def test_scenario_names_expand_and_keep_the_study_order():
     assert scenarios_from(["all"]) == list(SCENARIOS)
     assert scenarios_from(["clear_road", "traffic_light", "clear_road"]) == ["traffic_light", "clear_road"]
