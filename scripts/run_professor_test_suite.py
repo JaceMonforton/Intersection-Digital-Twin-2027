@@ -146,8 +146,8 @@ T4_RUN = 25.0                 # s after the cut-in before scoring
 OFF_LANE_LIMIT = 1.0          # m; normal driving stays within about 0.6 m
 JUNCTION_ID = 189
 TRAFFIC_CLEARANCE = 30.0      # m from the ML car's start that no background car is spawned within
-# A safety brake counts as a false alarm when CARLA's true TTC stayed at or above FALSE_SAFE_TTC from FALSE_BEFORE s before
-# it to FALSE_AFTER s after it, with no collision then. A brake that prevented a conflict can also look like that.
+# A safety brake counts as a false alarm when CARLA's true TTC would have stayed at or above FALSE_SAFE_TTC from FALSE_BEFORE s
+# before it to FALSE_AFTER s after it had the car carried on without braking, with no collision then. See false_brakes.
 FALSE_SAFE_TTC, FALSE_BEFORE, FALSE_AFTER = 3.0, 1.0, 3.0
 
 TAGS = {"SCENARIO": "96", "MQTT / DITTO": "94", "ALERT": "91"}
@@ -196,12 +196,21 @@ def true_ttc(ego, others, walkers):
     return min((time_to_collision(me, t) for t in threats if not approaching_from_behind(me, t)), default=math.inf)
 
 
-def false_brakes(engagements, ttcs, collisions, safe=FALSE_SAFE_TTC, before=FALSE_BEFORE, after=FALSE_AFTER):
-    """How many brake engagements had no true danger around them. engagements and collisions are times in s, and
-    ttcs (time, true TTC) pairs."""
+def false_brakes(engagements, states, collisions, safe=FALSE_SAFE_TTC, before=FALSE_BEFORE, after=FALSE_AFTER):
+    """How many brake engagements had no true danger behind them. A brake that works stops the danger coming, so after
+    it the ML car is judged where it would have been had it carried on at the speed and heading it had as the brake
+    came on: a brake is false only if even then the true TTC stays at or above safe. engagements and collisions are
+    times in s, states (time, ego, others, walkers) for each tick, as true_ttc takes them. Straight-line TTC still
+    can't see a car turning across, so a brake for one can still count as false."""
     count = 0
     for at in engagements:
-        window = [ttc for t, ttc in ttcs if at - before <= t <= at + after]
+        if not any(s[0] >= at for s in states):
+            continue
+        # The last tick before the brake came on, when the car still had its own speed
+        start = max((s for s in states if s[0] < at), key=lambda s: s[0], default=states[0])
+        x, y, vx, vy, yaw = start[1]
+        window = [true_ttc(ego if t < at else (x + vx * (t - start[0]), y + vy * (t - start[0]), vx, vy, yaw), others, walkers)
+                  for t, ego, others, walkers in states if at - before <= t <= at + after]
         if all(ttc >= safe for ttc in window) and not any(at - before <= c <= at + after for c in collisions):
             count += 1
     return count
@@ -822,7 +831,7 @@ class Suite:
         held_since = None
         polls = []
         min_ttc = math.inf
-        ttcs, engagements, entered = [], [], None
+        states, ttcs, engagements, entered = [], [], [], None
         self.mqtt.clear()
         done = False
         try:
@@ -871,7 +880,8 @@ class Suite:
                 lights.update({ml.id: ego}, t, ml.id, "SCENARIO")
                 stop_gap = red_light_gap(driver.lane.path_ahead(RED_LOOK), not_green)
 
-                ttcs.append((t, true_ttc(ego, others.values(), walkers.values())))
+                states.append((t, ego, list(others.values()), list(walkers.values())))
+                ttcs.append(true_ttc(*states[-1][1:]))
                 here = self.find_waypoint(ego[0], ego[1])
                 inside = here.is_junction and here.get_junction().id == JUNCTION_ID
                 if inside and entered is None:
@@ -928,9 +938,9 @@ class Suite:
             result.duration = round(now - started, 1) if started is not None else 0.0
             result.red_light_violations = len(lights.runs)
             result.min_ttc = None if math.isinf(min_ttc) else round(min_ttc, 3)
-            lowest = min((ttc for _, ttc in ttcs), default=math.inf)
+            lowest = min(ttcs, default=math.inf)
             result.true_min_ttc = None if math.isinf(lowest) else round(lowest, 3)
-            result.false_brakes = false_brakes(engagements, ttcs, [c["t"] for c in result.collisions])
+            result.false_brakes = false_brakes(engagements, states, [c["t"] for c in result.collisions])
             result.mqtt_latency_ms = self.mqtt.latency
             result.gate_poll_ms = float(np.median(polls)) if polls else None
             result.smoothness = {k: round(v, 3) for k, v in smoothness(*driven).items()}

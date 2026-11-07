@@ -212,8 +212,9 @@ def write_report(runs, directory=OUTPUT_DIR):
     lines += ["## How each figure is measured", "",
               "- **Pass rate**: the suite's tests by their own checks; the hazards with no collision; clear_road with no collision, no safety brake and no stop. Of the runs that ran.",
               "- **Collision rate**: runs with at least one collision. `background_collisions` in the runs file counts those with background traffic.",
-              ("- **False alarms**: safety-brake engagements while CARLA's true TTC stayed at or above 3 s from 1 s before to 3 s after, with no collision then; in clear_road every brake. "
-              "A brake that prevented a conflict can also meet that rule, so this is an upper bound."),
+              ("- **False alarms**: safety-brake engagements after which CARLA's true TTC would have stayed at or above 3 s for 3 s had the car carried on at its "
+               "speed and heading without braking (and was at or above 3 s for the 1 s before), with no collision then; in clear_road every brake. "
+               "Straight-line TTC can't see a car turning across, so a brake for the oncoming turner can still count, which makes this an upper bound."),
               ("- **TTC**: each run's lowest true straight-line TTC to any car or person, as the gate measures it but from CARLA's true positions. "
               "Mean, P95 and P5 are over the runs where anything was ever on a collision course. P5 is the dangerous tail."),
               ("- **Clearance**: seconds from first entering junction 189 to first leaving it, over the runs that got through (the count in brackets). "

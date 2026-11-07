@@ -41,13 +41,30 @@ def test_true_ttc_sees_a_car_ahead_and_ignores_one_coming_up_from_behind():
     assert math.isinf(true_ttc(ego, [], []))
 
 
-def test_a_brake_is_a_false_alarm_only_with_no_danger_or_collision_around_it():
-    safe = [(t / 10, 8.0) for t in range(100)]
-    assert false_brakes([5.0], safe, []) == 1
-    danger = [(t, 1.0 if t == 7.0 else ttc) for t, ttc in safe]
-    assert false_brakes([5.0], danger, []) == 0     # true TTC fell under 3 s within 3 s after it
-    assert false_brakes([5.0], safe, [4.5]) == 0    # a collision just before it
-    assert false_brakes([5.0], [(t, 1.0 if t == 8.5 else ttc) for t, ttc in safe], []) == 1  # danger only after the window
+def driving_then_stopping(stop_at, obstacle_x, person=False):
+    """States of an ML car doing 10 m/s along x that brakes to a halt at stop_at s, with a still car (or a person
+    walking slowly across) at obstacle_x."""
+    states = []
+    for tick in range(100):
+        t = tick / 10
+        x = 10.0 * min(t, stop_at)
+        ego = (x, 0.0, 10.0 if t < stop_at else 0.0, 0.0, 0.0)
+        others, walkers = ([], [(obstacle_x, -0.5 + 0.1 * t, 0.0, 0.1)]) if person else ([(obstacle_x, 0.0, 0.0, 0.0, 0.0)], [])
+        states.append((t, ego, others, walkers))
+    return states
+
+
+def test_a_brake_that_stopped_the_car_short_of_real_danger_is_not_a_false_alarm():
+    # Stopped at 50 m with a car parked at 90 m: once stopped its true TTC is infinite, but carrying on it was 4 s away
+    assert false_brakes([5.0], driving_then_stopping(5.0, 90.0), []) == 0
+    assert false_brakes([5.0], driving_then_stopping(5.0, 90.0, person=True), []) == 0
+
+
+def test_a_brake_is_a_false_alarm_with_no_danger_even_had_the_car_carried_on():
+    assert false_brakes([5.0], driving_then_stopping(5.0, 500.0), []) == 1      # nothing within 3 s however it drove
+    assert false_brakes([5.0], driving_then_stopping(5.0, 500.0), [4.5]) == 0   # but not with a collision just before
+    assert false_brakes([], driving_then_stopping(5.0, 90.0), []) == 0
+    assert false_brakes([99.0], driving_then_stopping(5.0, 90.0), []) == 0      # an engagement after the last tick is skipped
 
 
 def test_the_study_never_uses_the_final_test_seed():
