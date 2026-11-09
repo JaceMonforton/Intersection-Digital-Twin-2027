@@ -49,7 +49,7 @@ WALKER = (204, 158, 88)
 BAR_BACK = (46, 48, 54)
 
 ROUTE_NAMES = {LEFT: "LEFT", RIGHT: "RIGHT"}
-SOURCE_NAMES = {"truth": "TRUE POSITIONS", "rsu": "ROADSIDE UNIT", "sight": "OWN SIGHT"}
+SOURCE_NAMES = {"truth": "TRUE POSITIONS", "rsu": "ROADSIDE UNIT", "sight": "OWN SIGHT", "camera": "ROADSIDE CAMERA"}
 
 
 # ---------------------------------------------------------------------------

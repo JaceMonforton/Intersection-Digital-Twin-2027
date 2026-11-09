@@ -9,6 +9,12 @@ by the trained driving model and the others by CARLA's autopilot.
     python run_simulation.py --free-drive --traffic 30  # more cars
     python run_simulation.py --leave-running  # keep CARLA and Docker up, for faster repeat runs
     python run_simulation.py --roadside --lidar-view  # the tests on the roadside detector, with a window of what its LiDARs see
+    python run_simulation.py --camera_and_rsu --scenario hidden_pedestrian   # one scenario on one study config
+    python run_simulation.py --lidar_only --traffic 15                       # the five tests with 15 background cars
+    python run_simulation.py --run_study_matrix --traffic 0 15 --repeat 5    # the whole comparative study, for hours
+
+Each study config opens its own window besides the ML car's: the roadside LiDARs for --lidar_and_rsu, the roadside
+cameras for --camera_and_rsu, and the car's own roof LiDAR for --lidar_only. --no-view leaves them all out.
 
 Without models/driving_policy.onnx it refuses to run, since the ML car has no other driver.
 
@@ -29,6 +35,9 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "scripts"))
+from study_names import CONFIGS, SCENARIOS, VIEWS, add_config_flags, processor_args
+
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "docker" / "docker-compose.yml")]
 LOG_DIR = ROOT / "output" / "logs"
 DITTO_THINGS = "http://localhost:8080/api/2/things"
@@ -148,9 +157,9 @@ class Launcher:
     def start_processor(self):
         for attempt in range(1, MASTER_ATTEMPTS + 1):
             self.log(f"Starting the central processor (attempt {attempt})...")
+            perception = self.args.perception  # truth keeps the processor's own default
             process, path = self.spawn("processor", "scripts/central_gpu_processor.py",
-                                       *(["--detector", "onnx", "--model", str(ROADSIDE_MODEL)] if self.args.roadside else []),
-                                       *(["--lidar-view"] if self.args.lidar_view else []))
+                                       *(processor_args(perception, ROADSIDE_MODEL, not self.args.no_view) if perception != "truth" else []))
             deadline = time.time() + MASTER_TIMEOUT
             while time.time() < deadline and process.poll() is None:
                 if "Master tick" in path.read_text(encoding="utf-8", errors="replace"):
@@ -178,6 +187,8 @@ class Launcher:
         self.ensure_docker()
         self.ensure_ditto()
         self.ensure_carla()
+        if self.args.run_study_matrix:
+            return self.run_study()
         self.start_processor()
         self.spawn("subscriber", "scripts/physical_ml_subscriber.py", "--driver", "sim")
         self.spawn("predictor", "scripts/waymo_predictor_node.py")
@@ -187,8 +198,8 @@ class Launcher:
                 raise RuntimeError(f"{name} exited early:\n{tail(LOG_DIR / f'{name}.log')}")
         if not self.args.no_view:
             self.spawn("view", "scripts/ml_car_view.py")  # only a display, so it may fail without stopping the run
-        if self.args.lidar_view:
-            self.spawn("lidar_view", "scripts/lidar_view.py")  # likewise
+            if self.args.perception in VIEWS:
+                self.spawn("config_view", *VIEWS[self.args.perception])  # likewise
 
         code = self.run_with_traffic() if self.args.free_drive else self.run_suite()
         for name, process in self.processes:
@@ -198,17 +209,31 @@ class Launcher:
         return code
 
     def run_suite(self):
-        self.log("Running the five-test demonstration. Watch for the magenta ML car. Ctrl+C to stop early.")
-        return self.run_stage("scripts/run_professor_test_suite.py", "--attached", *(["--quiet"] if self.args.quiet else []),
-                              *(["--perception", "rsu"] if self.args.roadside else []))
+        args = self.args
+        self.log(f"Running {'the scenarios ' + ', '.join(args.scenario) if args.scenario else 'the five-test demonstration'} with "
+                 f"{args.perception}. Watch for the magenta ML car. Ctrl+C to stop early.")
+        return self.run_stage("scripts/run_professor_test_suite.py", "--attached", *(["--quiet"] if args.quiet else []),
+                              "--perception", args.perception, "--traffic", str(args.traffic[0] if args.traffic else 0),
+                              *(["--scenario", *args.scenario] if args.scenario else []), *(["--repeat", str(args.repeat)] if args.repeat else []),
+                              *(["--roof-view"] if args.perception == "sight" and not args.no_view else []))
+
+    def run_study(self):
+        """The comparative study runs the processor itself, once per config, so only the stack and CARLA are started here."""
+        args = self.args
+        config = [flag for flag, mode in CONFIGS.items() if mode == args.perception]
+        self.log("Running the comparative study. It starts and stops the processor once per config, and takes hours.")
+        return self.run_stage("scripts/run_study.py", *(["--configs", *config] if config else ["--matrix"]),
+                              "--traffic", *(str(n) for n in (args.traffic or [0, 15])), "--repeat", str(args.repeat or 5),
+                              *(["--no-view"] if args.no_view else []), *(["--quiet"] if args.quiet else []))
 
     def run_stage(self, *command):
         return subprocess.run([sys.executable, "-u", *command], cwd=ROOT, check=False).returncode
 
     def run_with_traffic(self):
         args = self.args
-        self.log(f"Spawning {args.traffic} vehicles and {args.walkers} pedestrians...")
-        command = ["scripts/test_traffic.py", "--asynch", "--near-view", "--safe", "-n", str(args.traffic),
+        traffic = args.traffic[0] if args.traffic else 15
+        self.log(f"Spawning {traffic} vehicles and {args.walkers} pedestrians...")
+        command = ["scripts/test_traffic.py", "--asynch", "--near-view", "--safe", "-n", str(traffic),
                    "-w", str(args.walkers), "--tm-port", "8000", "--car-lights-on"]
         if args.seed is not None:
             command += ["--seed", str(args.seed)]
@@ -264,21 +289,33 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--free-drive", action="store_true", help="normal driving in traffic instead of the five tests")
     parser.add_argument("--quiet", action="store_true", help="leave out the test suite's live table of values")
-    parser.add_argument("--roadside", action="store_true", help="run the tests on the roadside detector and the car's own LiDAR, instead of CARLA's true positions")
-    parser.add_argument("--lidar-view", action="store_true", help="with --roadside, open a window of what the two roadside LiDARs see")
-    parser.add_argument("--no-view", action="store_true", help="don't open the ML car's split-screen window")
-    parser.add_argument("--traffic", type=int, default=15, metavar="N", help="how many other vehicles")
+    configs = add_config_flags(parser)
+    configs.add_argument("--roadside", dest="perception", action="store_const", const="rsu", help="the same as --lidar_and_rsu")
+    parser.set_defaults(perception="truth")
+    parser.add_argument("--lidar-view", action="store_true", help="kept for old commands: --lidar_and_rsu always opens the roadside LiDAR window now")
+    parser.add_argument("--no-view", action="store_true", help="don't open the ML car's split-screen window, or the config's window")
+    parser.add_argument("--scenario", nargs="+", choices=("all", *SCENARIOS), help="run these by name instead of the five tests, the hidden hazards included")
+    parser.add_argument("--run_study_matrix", action="store_true", help="every scenario on every config (or just the config given), "
+                        "at each --traffic load, --repeat times, then output/comparative_study_report.csv and _summary.md")
+    parser.add_argument("--repeat", type=int, help="runs of each test or scenario: 1, or 5 in the study")
+    parser.add_argument("--traffic", type=int, nargs="+", metavar="N", help="other vehicles: 15 in free driving, 0 in the tests, 0 15 in the study, "
+                        "which runs every load given")
     parser.add_argument("--walkers", type=int, default=8, help="how many pedestrians")
     parser.add_argument("--seconds", type=float, default=300.0, help="simulated seconds to run; 0 runs until Ctrl+C")
     parser.add_argument("--seed", type=int, help="makes traffic spawn the same way each run")
     parser.add_argument("--carla-exe", help="path to CarlaUE4.exe, if it isn't found automatically")
     parser.add_argument("--leave-running", action="store_true", help="keep CARLA and Docker up afterwards")
     args = parser.parse_args()
-    if args.roadside and args.free_drive:
-        parser.error("--roadside only works with the tests; use the commands under Roadside detection in README.md to drive with it")
-
-    if args.lidar_view and not args.roadside:
-        parser.error("--lidar-view needs --roadside, as the LiDARs only exist when the detector is running")
+    if args.perception != "truth" and args.free_drive:
+        parser.error("the roadside configs only work with the tests; use the commands under Roadside detection in README.md to drive with it")
+    if args.free_drive and (args.scenario or args.run_study_matrix):
+        parser.error("--free-drive can't be combined with --scenario or --run_study_matrix")
+    if args.lidar_view and args.perception != "rsu":
+        parser.error("--lidar-view needs --lidar_and_rsu, as the LiDARs only exist when the detector is running")
+    if (args.traffic and min(args.traffic) < 0) or (args.repeat is not None and args.repeat < 1):
+        parser.error("--traffic must be 0 or more, and --repeat at least 1")
+    if args.traffic and len(args.traffic) > 1 and not args.run_study_matrix:
+        parser.error("several --traffic loads only work with --run_study_matrix")
 
     launcher = Launcher(args)
     code = 1

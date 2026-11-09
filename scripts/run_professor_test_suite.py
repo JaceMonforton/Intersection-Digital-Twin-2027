@@ -36,7 +36,16 @@ from pathlib import Path
 
 import numpy as np
 import requests
-from central_gpu_processor import ML_PAINT, TRAFFIC_MANAGER_PORT
+from central_gpu_processor import (
+    ML_PAINT,
+    TRAFFIC_MANAGER_PORT,
+    Track,
+    approaching_from_behind,
+    find_junction,
+    lidar_to_model_frame,
+    time_to_collision,
+)
+from detection_features import labels_for
 from driving_features import STOP_LINE_RANGE
 from left_turn_scenario import outline, rectangles_gap
 from ml_driver import DrivingPolicy as Policy
@@ -49,7 +58,20 @@ from ml_driver import (
     smoothness,
 )
 from model_panel import SUITE_ADDRESS, SafetyReceiver, TelemetrySender
-from roadside_link import MODES, RoadsideReceiver, make_view
+from roadside_link import (
+    MODES,
+    ROADSIDE_MODES,
+    SEMANTIC_POINT,
+    RoadsideReceiver,
+    make_view,
+)
+from study_names import (
+    CONFIGS,
+    SCENARIOS,
+    add_config_flags,
+    processor_args,
+    scenarios_from,
+)
 from traffic_monitor import (
     GATE_URL,
     LOOK_AHEAD,
@@ -122,6 +144,11 @@ T4_CUT_AHEAD = 6.0            # m ahead of the ML car, centre to centre, that it
 T4_MERGE = 8.0                # m further on that its path joins the ML car's lane
 T4_RUN = 25.0                 # s after the cut-in before scoring
 OFF_LANE_LIMIT = 1.0          # m; normal driving stays within about 0.6 m
+JUNCTION_ID = 189
+TRAFFIC_CLEARANCE = 30.0      # m from the ML car's start that no background car is spawned within
+# A safety brake counts as a false alarm when CARLA's true TTC would have stayed at or above FALSE_SAFE_TTC from FALSE_BEFORE s
+# before it to FALSE_AFTER s after it had the car carried on without braking, with no collision then. See false_brakes.
+FALSE_SAFE_TTC, FALSE_BEFORE, FALSE_AFTER = 3.0, 1.0, 3.0
 
 TAGS = {"SCENARIO": "96", "MQTT / DITTO": "94", "ALERT": "91"}
 STATUS_INTERVAL = 0.2  # seconds between redraws of the live table
@@ -154,6 +181,79 @@ class StageResult:
     duration: float = 0.0
     smoothness: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
+    # From CARLA's true positions, not what the gate perceived, so they measure the outcome whatever the perception
+    true_min_ttc: float = None    # s; None if nothing was ever on a collision course
+    false_brakes: int = 0
+    clearance_s: float = None     # s from first entering junction 189 to first leaving it; None if it never got through
+    traffic: int = 0              # background cars
+
+
+def true_ttc(ego, others, walkers):
+    """CARLA's true straight-line TTC from the ML car to the nearest threat, as the gate measures it, but leaving out
+    a car coming up from behind as the gate does. ego and others as (x, y, vx, vy, yaw), walkers as (x, y, vx, vy)."""
+    me = Track("ego", *ego[:4], yaw=ego[4])
+    threats = [Track("car", *o[:4], yaw=o[4]) for o in others] + [Track("person", *w[:4]) for w in walkers]
+    return min((time_to_collision(me, t) for t in threats if not approaching_from_behind(me, t)), default=math.inf)
+
+
+def false_brakes(engagements, states, collisions, safe=FALSE_SAFE_TTC, before=FALSE_BEFORE, after=FALSE_AFTER):
+    """How many brake engagements had no true danger behind them. A brake that works stops the danger coming, so after
+    it the ML car is judged where it would have been had it carried on at the speed and heading it had as the brake
+    came on: a brake is false only if even then the true TTC stays at or above safe. engagements and collisions are
+    times in s, states (time, ego, others, walkers) for each tick, as true_ttc takes them. Straight-line TTC still
+    can't see a car turning across, so a brake for one can still count as false."""
+    count = 0
+    for at in engagements:
+        if not any(s[0] >= at for s in states):
+            continue
+        # The last tick before the brake came on, when the car still had its own speed
+        start = max((s for s in states if s[0] < at), key=lambda s: s[0], default=states[0])
+        x, y, vx, vy, yaw = start[1]
+        window = [true_ttc(ego if t < at else (x + vx * (t - start[0]), y + vy * (t - start[0]), vx, vy, yaw), others, walkers)
+                  for t, ego, others, walkers in states if at - before <= t <= at + after]
+        if all(ttc >= safe for ttc in window) and not any(at - before <= c <= at + after for c in collisions):
+            count += 1
+    return count
+
+
+def roof_sweep_to_model_frame(raw, sensor_location, sensor_yaw, center):
+    """A semantic LiDAR sweep (x, y, z, cos, id, tag per point, in the sensor's frame) to the roadside model's frame
+    that lidar_view.py draws in: centred on the junction, y left. Only the sensor's yaw counts, as the car stays level."""
+    points = np.frombuffer(raw[:len(raw) - len(raw) % SEMANTIC_POINT.size], np.float32).reshape(-1, 6)[:, :3]
+    mount = (sensor_location.x - center.x, sensor_location.y - center.y, sensor_location.z - center.z)
+    return lidar_to_model_frame(points, mount, yaw=sensor_yaw)
+
+
+class RoofFeed:
+    """The ML car's own roof LiDAR and CARLA's true boxes, for scripts/lidar_view.py --feed roof. Only a display, so
+    anything going wrong here stops the feed, never the test."""
+
+    def __init__(self, world, carla):
+        from lidar_view import ROOF_FEED, SweepFeed
+
+        self.feed = SweepFeed.create(ROOF_FEED)
+        self.center = find_junction(world, JUNCTION_ID).bounding_box.location
+        self.carla = carla
+        self.written = None  # the frame of the last sweep written, so a stalled LiDAR shows as stalled
+
+    def write(self, world, now, sweep):
+        if self.feed is None or sweep is None or sweep[0] == self.written:
+            return
+        try:
+            frame, transform, raw = sweep
+            self.written = frame
+            points = roof_sweep_to_model_frame(raw, transform.location, transform.rotation.yaw, self.center)
+            actors = [a for pattern in ("vehicle.*", "walker.pedestrian.*") for a in world.get_actors().filter(pattern)]
+            mount = (transform.location.x - self.center.x, -(transform.location.y - self.center.y))
+            self.feed.write(frame, now, [mount, mount], [points, None], (), labels_for(actors, world.get_snapshot(), self.center))
+        except (RuntimeError, ValueError, OSError) as error:
+            print(f"[LIDAR] Stopped publishing the roof LiDAR: {error}", flush=True)
+            self.close()
+
+    def close(self):
+        if self.feed is not None:
+            self.feed.destroy()
+            self.feed = None
 
 
 def finish(result, **checks):
@@ -551,10 +651,11 @@ class Tick:
 
 
 class Suite:
-    def __init__(self, carla, client, policy, console, seed=0, perception="truth"):
+    def __init__(self, carla, client, policy, console, seed=0, perception="truth", traffic=0, roof_view=False):
         self.seed = seed  # picks the oncoming traffic in test 2
         self.perception = perception  # what the ML car is told about the actors around it: see roadside_link.py
-        self.receiver = RoadsideReceiver() if perception == "rsu" else None
+        self.traffic = traffic  # background autopilot cars in every test, on top of each test's own
+        self.receiver = RoadsideReceiver() if perception in ROADSIDE_MODES else None
         self.carla = carla
         self.client = client
         self.world = client.get_world()
@@ -568,6 +669,8 @@ class Suite:
         self.safety = SafetyReceiver()
         self.hud = HudSender()
         self.world.wait_for_tick(10.0)
+        # Only in sight, where the roof LiDAR is all the car has; in rsu and camera the roadside windows show more
+        self.roof = RoofFeed(self.world, carla) if roof_view and perception == "sight" else None
         self.lights = RedLightWatch(carla, self.world)
         self.controlled = []  # (stop waypoint, light) of each lane at the junction
         for light in self.world.get_actors().filter("traffic.traffic_light"):
@@ -665,6 +768,22 @@ class Suite:
                 points.append(current.transform.location)
         return points
 
+    def spawn_traffic(self, rng, away_from):
+        """self.traffic autopilot cars at the map's spawn points, none near the ML car's start. Vehicles only: AI-driven
+        people are invisible to LiDAR, and their controllers mustn't start with LiDARs running. A taken point is skipped."""
+        command = self.carla.command
+        points = [p for p in self.map.get_spawn_points() if p.location.distance(away_from) > TRAFFIC_CLEARANCE]
+        rng.shuffle(points)
+        blueprints = [bp for bp in self.world.get_blueprint_library().filter("vehicle.*") if bp.get_attribute("number_of_wheels").as_int() == 4]
+        batch = []
+        for place in points[:self.traffic]:
+            bp = rng.choice(blueprints)
+            bp.set_attribute("role_name", "background")
+            batch.append(command.SpawnActor(bp, place).then(command.SetAutopilot(command.FutureActor, True, TRAFFIC_MANAGER_PORT)))
+        spawned = sum(not response.error for response in self.client.apply_batch_sync(batch))
+        self.console.line("SCENARIO", f"{spawned} background cars on autopilot.")
+        return spawned
+
     def autopilot(self, car, speed, path=None, ignore_rules=False):
         self.traffic_manager.auto_lane_change(car, False)
         car.set_autopilot(True, TRAFFIC_MANAGER_PORT)
@@ -692,10 +811,12 @@ class Suite:
         driver = ModelDriver(self.policy, LaneDriver(start, TurnChooser(turn)), self.find_waypoint, rng, telemetry)
         hits = []
         sensor = self.world.spawn_actor(self.world.get_blueprint_library().find("sensor.other.collision"), carla.Transform(), attach_to=ml)
-        sensor.listen(lambda event: hits.append((event.other_actor.id, event.other_actor.type_id)))
+        sensor.listen(lambda event: hits.append((event.other_actor.id, event.other_actor.type_id, event.other_actor.attributes.get("role_name", ""))))
         self.sensors.append(sensor)
         if build is not None:
             build(ml)
+        if self.traffic:
+            result.traffic = self.spawn_traffic(random.Random(self.seed * 100 + test), start.transform.location)
         view = make_view(self.perception, carla, self.world, ml, 0.1, self.receiver)
         for _ in range(SETTLE_TICKS):
             self.world.wait_for_tick(TICK_TIMEOUT)
@@ -710,6 +831,7 @@ class Suite:
         held_since = None
         polls = []
         min_ttc = math.inf
+        states, ttcs, engagements, entered = [], [], [], None
         self.mqtt.clear()
         done = False
         try:
@@ -726,6 +848,8 @@ class Suite:
                 not_green = lights.not_green()
                 seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
                 seen_cars = self.believed(seen_cars)
+                if self.roof is not None:
+                    self.roof.write(self.world, now, getattr(view, "last_sweep", None))
                 telemetry.fresh = fresh
 
                 asked = time.perf_counter()
@@ -756,16 +880,26 @@ class Suite:
                 lights.update({ml.id: ego}, t, ml.id, "SCENARIO")
                 stop_gap = red_light_gap(driver.lane.path_ahead(RED_LOOK), not_green)
 
+                states.append((t, ego, list(others.values()), list(walkers.values())))
+                ttcs.append(true_ttc(*states[-1][1:]))
+                here = self.find_waypoint(ego[0], ego[1])
+                inside = here.is_junction and here.get_junction().id == JUNCTION_ID
+                if inside and entered is None:
+                    entered = t
+                elif not inside and entered is not None and result.clearance_s is None:
+                    result.clearance_s = round(t - entered, 2)
+
                 while hits:
-                    other_id, kind = hits.pop()
+                    other_id, kind, role = hits.pop()
                     if is_new_contact(contacts, other_id, t):
-                        result.collisions.append({"t": round(t, 1), "with": kind, "speed": round(speed, 1)})
+                        result.collisions.append({"t": round(t, 1), "with": kind, "role": role, "speed": round(speed, 1)})
                         self.console.line("ALERT", f"COLLISION with {kind} at {speed:.1f} m/s, t={t:.1f} s")
                         self.hud.event(f"COLLISION with {kind.split('.')[-1]} at {speed:.1f} m/s")
 
                 engaged = gate.get("emergency_brake") is True
                 if engaged and not was_braking:
                     result.brake_events += 1
+                    engagements.append(t)
                     reason = gate.get("reason") or ""
                     if result.brake_at is None:
                         result.brake_at, result.brake_ttc = round(t, 2), gate.get("ttc")
@@ -804,6 +938,9 @@ class Suite:
             result.duration = round(now - started, 1) if started is not None else 0.0
             result.red_light_violations = len(lights.runs)
             result.min_ttc = None if math.isinf(min_ttc) else round(min_ttc, 3)
+            lowest = min(ttcs, default=math.inf)
+            result.true_min_ttc = None if math.isinf(lowest) else round(lowest, 3)
+            result.false_brakes = false_brakes(engagements, states, [c["t"] for c in result.collisions])
             result.mqtt_latency_ms = self.mqtt.latency
             result.gate_poll_ms = float(np.median(polls)) if polls else None
             result.smoothness = {k: round(v, 3) for k, v in smoothness(*driven).items()}
@@ -1120,6 +1257,8 @@ class Suite:
         self.safety.close()
         if self.receiver is not None:
             self.receiver.close()
+        if self.roof is not None:
+            self.roof.close()
         self.csv_file.close()
 
 
@@ -1145,8 +1284,8 @@ def load_rounds():
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
-def run_tests(carla, client, chosen, console, seed=0, repeat=1, perception="truth"):
-    suite = Suite(carla, client, Policy(), console, seed, perception)
+def run_tests(carla, client, chosen, console, seed=0, repeat=1, perception="truth", traffic=0, roof_view=False):
+    suite = Suite(carla, client, Policy(), console, seed, perception, traffic, roof_view)
     tests = {1: suite.test_lights, 2: suite.test_left_turn, 3: suite.test_blind_corner, 4: suite.test_cut_in, 5: suite.test_light_change}
     results = []
     try:
@@ -1177,26 +1316,48 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="leave out the live table of values")
     parser.add_argument("--seed", type=int, help="picks test 2's traffic; different each time if left out")
     parser.add_argument("--repeat", type=int, default=1, help="run the tests this many times, saving only to output/repeat_results.json")
-    parser.add_argument("--perception", choices=MODES, default="truth", help="what the ML car is told about other actors; rsu needs the processor running with --detector onnx")
+    configs = add_config_flags(parser)
+    configs.add_argument("--perception", choices=MODES, help="what the ML car is told about other actors (truth if no config is given); "
+                         "rsu needs the processor running with --detector onnx, camera with --detector camera")
+    parser.set_defaults(perception="truth")
+    parser.add_argument("--traffic", type=int, default=0, metavar="N", help="background autopilot cars in every test, on top of each test's own")
+    parser.add_argument("--scenario", nargs="+", choices=("all", *SCENARIOS),
+                        help="run these by name, including the hidden hazards, saving to output/scenario_results_<perception>.json")
+    parser.add_argument("--roof-view", action="store_true", help="with --lidar_only, publish the roof LiDAR for scripts/lidar_view.py --feed roof")
     parser.add_argument("--attached", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.traffic < 0:
+        parser.error("--traffic must be 0 or more")
     for name in ("SIGBREAK", "SIGTERM"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
 
     if not args.attached and not simulation_running():
-        if args.perception != "truth":
-            sys.exit("[SCENARIO] Start the processor first: python scripts/central_gpu_processor.py --detector onnx --model models/rsu_detector.candidate.onnx")
         print("[SCENARIO] The simulation isn't running, so starting everything through run_simulation.py.", flush=True)
-        return subprocess.run([sys.executable, str(ROOT / "run_simulation.py"), *(["--quiet"] if args.quiet else [])], cwd=ROOT, check=False).returncode
+        config = next((flag for flag, mode in CONFIGS.items() if mode == args.perception), None)
+        if config is None and args.perception != "truth":
+            sys.exit(f"[SCENARIO] Start the processor first: python scripts/central_gpu_processor.py {' '.join(processor_args(args.perception, 'models/rsu_detector.candidate.onnx', False))}")
+        forward = [*(["--quiet"] if args.quiet else []), *([f"--{config}"] if config else []), "--traffic", str(args.traffic),
+                   *(["--scenario", *args.scenario] if args.scenario else [])]
+        return subprocess.run([sys.executable, str(ROOT / "run_simulation.py"), *forward], cwd=ROOT, check=False).returncode
 
     import carla
 
     client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(30.0)
     console = Console(args.quiet)
+    if args.scenario:
+        from run_study import run_attached
+
+        runs = run_attached(carla, client, scenarios_from(args.scenario), args.perception, args.traffic, args.repeat, console, args.roof_view)
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        (OUTPUT_DIR / f"scenario_results_{args.perception}.json").write_text(json.dumps(runs, indent=2), encoding="utf-8")
+        passed = sum(r["passed"] for r in runs if r["ran"])
+        console.line("SCENARIO", f"Finished with {args.perception}: {passed} of {sum(r['ran'] for r in runs)} runs passed.")
+        return 0 if passed == sum(r["ran"] for r in runs) else 2
     chosen = args.only or [1, 2, 3, 4, 5]
-    results = run_tests(carla, client, chosen, console, int(time.time()) if args.seed is None else args.seed, args.repeat, args.perception)
+    results = run_tests(carla, client, chosen, console, int(time.time()) if args.seed is None else args.seed, args.repeat, args.perception,
+                        args.traffic, args.roof_view)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     if args.perception != "truth":  # these don't replace the suite's own results, which are for true positions

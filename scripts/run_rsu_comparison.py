@@ -50,6 +50,7 @@ from run_professor_test_suite import (
     release_gate,
     yaw_class,
 )
+from study_names import processor_args
 from waymo_predictor_node import LEFT, STRAIGHT
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -262,10 +263,9 @@ class Comparison(Suite):
                 "gate_brakes": result.brake_events, "stopped": bool(stopped), "seconds": result.duration, "collisions": result.collisions}
 
 
-def start_processor(mode, model, log_path):
-    detector = ["--detector", "onnx", "--model", model] if mode == "rsu" else ["--detector", "groundtruth"]
+def start_processor(mode, model, log_path, view=False):
     log = open(log_path, "w", encoding="utf-8", errors="replace")  # noqa: SIM115
-    process = subprocess.Popen([sys.executable, "-u", "scripts/central_gpu_processor.py", *detector], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+    process = subprocess.Popen([sys.executable, "-u", "scripts/central_gpu_processor.py", *processor_args(mode, model, view)], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
     deadline = time.time() + PROCESSOR_TIMEOUT
     while time.time() < deadline and process.poll() is None:
@@ -290,7 +290,7 @@ def main():
     parser.add_argument("--model", default=str(ROOT / "models" / "rsu_detector.candidate.onnx"))
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=["truth", "rsu", "sight"], help="camera is compared in scripts/run_study.py")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 

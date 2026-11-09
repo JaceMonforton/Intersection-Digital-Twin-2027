@@ -5,6 +5,8 @@ How the ML car learns about the actors around it, whichever way it's getting the
     rsu     tracks from the roadside unit's detector, sent by the processor, plus what the car's own roof LiDAR hits,
             as the roadside unit only covers 60 m around the junction and a car alone past that is blind
     sight   only what a LiDAR on the car's own roof hits: the baseline the roadside unit has to beat
+    camera  as rsu, but the roadside tracks come from the roadside camera detector (scripts/camera_features.py),
+            from a processor run with --detector camera. The car can't tell the difference, which is the point
 
 Each view gives the driver cars as (x, y, vx, vy, yaw) and pedestrians as (x, y, vx, vy), in CARLA's frame, plus
 whether its information is fresh. A driver whose information isn't fresh must brake, because an empty road and a
@@ -25,7 +27,8 @@ SIGHT_MIN_POINTS = 3     # hits in a sweep to count as seen; the same as MIN_POI
 SIGHT_LIDAR = {"channels": "32", "points_per_second": "300000", "range": "70", "upper_fov": "10", "lower_fov": "-30"}
 SIGHT_HEIGHT = 1.9       # m above the car's origin
 SEMANTIC_POINT = struct.Struct("<ffffII")  # x, y, z, cos of the angle, id of the actor hit, semantic tag
-MODES = ("truth", "rsu", "sight")
+MODES = ("truth", "rsu", "sight", "camera")
+ROADSIDE_MODES = ("rsu", "camera")  # the ones that listen to the roadside link
 SAME_CAR, SAME_WALKER = 3.0, 1.5   # m between a roadside track and what the car sees for them to be the same actor
 
 
@@ -116,10 +119,13 @@ class LineOfSightView:
         self.sensor = world.spawn_actor(bp, place, attach_to=car)
         self.last_seen = {}
         self.fresh_ids = set()
+        self.last_sweep = None  # (frame, sensor transform, raw bytes), kept for a window of the roof LiDAR
         self.sensor.listen(self._on_sweep)
 
     def _on_sweep(self, measurement):
-        self.fresh_ids = visible_actors(bytes(measurement.raw_data))
+        raw = bytes(measurement.raw_data)
+        self.fresh_ids = visible_actors(raw)
+        self.last_sweep = (measurement.frame, measurement.transform, raw)
 
     def see(self, ego, cars, walkers, now):
         for actor_id in self.fresh_ids:
@@ -157,8 +163,10 @@ class RoadsideAndSightView:
 
 def make_view(mode, carla, world, car, sweep_seconds, receiver=None):
     """The view for a car. Pass a receiver to reuse its socket from one car to the next."""
-    if mode == "rsu":
-        return RoadsideAndSightView(RoadsideView(receiver), LineOfSightView(carla, world, car, sweep_seconds))
+    if mode in ROADSIDE_MODES:
+        view = RoadsideAndSightView(RoadsideView(receiver), LineOfSightView(carla, world, car, sweep_seconds))
+        view.name = mode
+        return view
     if mode == "sight":
         return LineOfSightView(carla, world, car, sweep_seconds)
     return TruthView()
