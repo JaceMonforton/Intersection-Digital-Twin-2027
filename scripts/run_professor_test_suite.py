@@ -637,9 +637,9 @@ class RememberingSender(TelemetrySender):
         super().__init__()
         self.last = None
 
-    def send(self, inputs, output, applied, model_driving):
-        self.last = {"target": float(output[1]), "applied": applied, "model_driving": bool(model_driving)}
-        super().send(inputs, output, applied, model_driving)
+    def send(self, inputs, output, applied, model_driving, plan=None):
+        self.last = {"target": float(output[1]), "applied": applied, "model_driving": bool(model_driving), "plan": plan}
+        super().send(inputs, output, applied, model_driving, plan)
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +658,7 @@ class Suite:
         self.perception = perception  # what the ML car is told about the actors around it: see roadside_link.py
         self.traffic = traffic  # background autopilot cars in every test, on top of each test's own
         self.variation = None  # a scenario_variation.Variation for the next run, or None for the fixed scenario
+        self.planner = None    # a planner.Planner the ML car plans its speed with, or None to drive on the model's alone
         self.receiver = RoadsideReceiver() if perception in ROADSIDE_MODES else None
         self.carla = carla
         self.client = client
@@ -812,6 +813,7 @@ class Suite:
         telemetry = RememberingSender()
         telemetry.source = self.perception
         driver = ModelDriver(self.policy, LaneDriver(start, TurnChooser(turn)), self.find_waypoint, rng, telemetry)
+        driver.planner = self.planner
         hits = []
         sensor = self.world.spawn_actor(self.world.get_blueprint_library().find("sensor.other.collision"), carla.Transform(), attach_to=ml)
         sensor.listen(lambda event: hits.append((event.other_actor.id, event.other_actor.type_id, event.other_actor.attributes.get("role_name", ""))))

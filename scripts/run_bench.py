@@ -32,7 +32,8 @@ from scenario_variation import SCENARIOS, SPLITS, draw, seeds
 from study_names import CONFIGS
 
 BENCH_DIR = ROOT / "output" / "bench"
-BENCH_CONFIGS = ("oracle", *CONFIGS)
+PLANNED = "+planner"     # a config's name with this drives with planner.Planner choosing the speed
+BENCH_CONFIGS = ("oracle", *CONFIGS, *(f"{c}{PLANNED}" for c in CONFIGS))
 Z95 = 1.96
 
 
@@ -122,7 +123,7 @@ def run_config(config, args):
     from run_rsu_comparison import Comparison, start_processor, stop_processor
     from run_study import run_scenario
 
-    mode = "truth" if config == "oracle" else CONFIGS[config]
+    mode = "truth" if config == "oracle" else CONFIGS[config.removesuffix(PLANNED)]
     path = runs_path(config, args.split)
     done = {(r["scenario"], r["seed"]) for r in load_runs(path)}
     todo = [(name, seed) for name in args.scenarios for seed in seeds(args.split, args.runs, args.start) if (name, seed) not in done]
@@ -143,6 +144,12 @@ def run_config(config, args):
         suite = Comparison(carla, client, policy, Console(args.quiet), seed=1, perception=mode)
         if config == "oracle":
             policy.world = suite.world
+        if config.endswith(PLANNED):
+            from planner import Planner
+            from roadside_link import ROADSIDE_MODES
+            from run_professor_test_suite import JUNCTION
+
+            suite.planner = Planner(JUNCTION, has_roadside=mode in ROADSIDE_MODES)
         try:
             for index, (name, seed) in enumerate(todo, 1):
                 variation = draw(name, seed, args.traffic)
