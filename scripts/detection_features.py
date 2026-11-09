@@ -6,6 +6,7 @@ Everything here is in the model's frame: centred on the junction, x forward, y L
 MODEL_GROUND_Z. See models/README.md.
 """
 import math
+from pathlib import Path
 
 import numpy as np
 
@@ -81,6 +82,12 @@ def label_row(offset, half_size, yaw_degrees, velocity, kind, ground_z=MODEL_GRO
 def count_points(row, points, ground_z=MODEL_GROUND_Z):
     """How many points of a cloud land on a label row."""
     return points_in_box(points, row[0], row[1], row[6], row[3] / 2, row[4] / 2, row[5], ground_z)
+
+
+def sweep_order(path):
+    """Recordings sort by frame. Roof sweeps are named <frame>_<car>, as several cars record each frame."""
+    frame, _, car = Path(path).stem.partition("_")
+    return int(frame), int(car or 0)
 
 
 def load_sweep(path):

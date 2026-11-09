@@ -49,7 +49,7 @@ def study_seeds(count):
 def gate_ignored(suite):
     """In sight the processor still runs a ground-truth safety gate, but that car has no roadside unit and drives on
     through it (see Suite.run_stage), so its engagements are no interventions and aren't counted."""
-    return suite.perception == "sight"
+    return suite.perception in ("sight", "onboard")
 
 
 def run_scenario(suite, name, lead):

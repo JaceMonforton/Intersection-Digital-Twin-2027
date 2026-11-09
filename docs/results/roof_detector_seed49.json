@@ -1,0 +1,59 @@
+{
+ "seed": 49,
+ "sweeps": 900,
+ "milliseconds_median": 38.35290006827563,
+ "vehicles": {
+  "threshold": 0.506,
+  "seen": 5583,
+  "average_precision": 0.9513999033484757,
+  "recall": {
+   "all": {
+    "actors": 5583,
+    "recall": 0.8740820347483432
+   },
+   "within_30m": {
+    "actors": 2035,
+    "recall": 0.9356265356265356
+   },
+   "5_or_fewer_points": {
+    "actors": 499,
+    "recall": 0.533066132264529
+   },
+   "over_20_points": {
+    "actors": 3460,
+    "recall": 0.9523121387283237
+   }
+  },
+  "precision": 0.9191938218120174,
+  "false_boxes_per_sweep": 0.4766666666666667,
+  "median_position_error_m": 0.22661259770393372,
+  "p90_position_error_m": 0.5533479452133179
+ },
+ "pedestrians": {
+  "threshold": 0.542,
+  "seen": 8114,
+  "average_precision": 0.8401243266892254,
+  "recall": {
+   "all": {
+    "actors": 8114,
+    "recall": 0.6614493468079862
+   },
+   "within_30m": {
+    "actors": 4317,
+    "recall": 0.670372944174195
+   },
+   "5_or_fewer_points": {
+    "actors": 2947,
+    "recall": 0.5775364777740075
+   },
+   "over_20_points": {
+    "actors": 1843,
+    "recall": 0.7476939772110689
+   }
+  },
+  "precision": 0.9489038189533239,
+  "false_boxes_per_sweep": 0.3211111111111111,
+  "median_position_error_m": 0.11777427792549133,
+  "p90_position_error_m": 0.22685135900974274
+ }
+}

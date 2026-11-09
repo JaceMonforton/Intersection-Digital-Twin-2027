@@ -27,8 +27,11 @@ SIGHT_MIN_POINTS = 3     # hits in a sweep to count as seen; the same as MIN_POI
 SIGHT_LIDAR = {"channels": "32", "points_per_second": "300000", "range": "70", "upper_fov": "10", "lower_fov": "-30"}
 SIGHT_HEIGHT = 1.9       # m above the car's origin
 SEMANTIC_POINT = struct.Struct("<ffffII")  # x, y, z, cos of the angle, id of the actor hit, semantic tag
-MODES = ("truth", "rsu", "sight", "camera")
-ROADSIDE_MODES = ("rsu", "camera")  # the ones that listen to the roadside link
+MODES = ("truth", "rsu", "sight", "camera", "onboard", "fused", "fused_camera")
+ROADSIDE_MODES = ("rsu", "camera", "fused", "fused_camera")  # the ones that listen to the roadside link
+# The ones that perceive with the car's own LiDAR detector rather than CARLA's truth, in onboard_perception.py.
+# fused_camera fuses with the roadside camera detector's tracks instead of the roadside LiDAR's.
+ONBOARD_MODES = ("onboard", "fused", "fused_camera")
 SAME_CAR, SAME_WALKER = 3.0, 1.5   # m between a roadside track and what the car sees for them to be the same actor
 
 
@@ -163,6 +166,12 @@ class RoadsideAndSightView:
 
 def make_view(mode, carla, world, car, sweep_seconds, receiver=None):
     """The view for a car. Pass a receiver to reuse its socket from one car to the next."""
+    if mode in ONBOARD_MODES:
+        from onboard_perception import (
+            make_onboard_view,  # numpy and the detector, which this module stays free of
+        )
+
+        return make_onboard_view(mode, carla, world, car, sweep_seconds, receiver=receiver)
     if mode in ROADSIDE_MODES:
         view = RoadsideAndSightView(RoadsideView(receiver), LineOfSightView(carla, world, car, sweep_seconds))
         view.name = mode
