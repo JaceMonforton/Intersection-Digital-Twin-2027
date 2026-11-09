@@ -54,7 +54,7 @@ def gate_ignored(suite):
 
 def run_scenario(suite, name, lead):
     """One run of a scenario, as a flat row of what was measured."""
-    hazard = None
+    hazard, stopped = None, False
     try:
         if name in SUITE_TESTS:
             tests = {1: suite.test_lights, 2: suite.test_left_turn, 3: suite.test_blind_corner, 4: suite.test_cut_in, 5: suite.test_light_change}
@@ -81,7 +81,7 @@ def run_scenario(suite, name, lead):
             "collisions": len(r["collisions"]), "background_collisions": sum(c.get("role") == "background" for c in r["collisions"]),
             "brake_events": r["brake_events"], "false_brakes": r["false_brakes"], "true_min_ttc": r["true_min_ttc"],
             "clearance_s": r["clearance_s"], "traffic_spawned": r["traffic"], "duration_s": r["duration"], "notes": "; ".join(r["notes"]),
-            "failed_checks": ", ".join(check for check, ok in r["checks"].items() if not ok)}
+            "failed_checks": ", ".join(check for check, ok in r["checks"].items() if not ok), "stopped": bool(stopped)}
 
 
 def run_runs(suite, names, traffic_loads, repeat, config):

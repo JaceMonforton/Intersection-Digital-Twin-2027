@@ -51,7 +51,7 @@ from run_professor_test_suite import (
     yaw_class,
 )
 from study_names import processor_args
-from waymo_predictor_node import LEFT, STRAIGHT
+from waymo_predictor_node import LEFT, STRAIGHT, yaw_difference
 
 ROOT = Path(__file__).resolve().parent.parent
 SCENARIOS = ("runner", "pedestrian", "turner", "clear")
@@ -70,6 +70,8 @@ LEADS = (-0.4, 0.0, 0.4, -0.2, 0.2)  # s the hazard reaches the ML car's route a
 SCENARIO_LIMIT = 45.0   # s
 STOPPED = 0.3           # m/s
 HALF_LENGTH, HALF_WIDTH = 2.4, 1.0  # m; the ML car, from its centre
+CROSSING_SLACK = 5.0    # m short of the stop line that a crossing still counts as in the junction
+RUN_UP_REACH = 3.0      # m from the ML car's run-up that another junction's stop line is on it
 
 
 def gap_to_person(ego, x, y):
@@ -115,7 +117,14 @@ class Comparison(Suite):
         super().clear()
 
     def _beside_truck(self, truck_side):
-        """(stop line of a lane going straight with a lane beside it on this side, that lane's stop waypoint)."""
+        """(stop line of a lane going straight with a lane beside it on this side, that lane's stop waypoint): the
+        variation's approach of those, counted round, or the first."""
+        found = self._beside_truck_options(truck_side)
+        return found[(self.variation.approach if self.variation else 0) % len(found)]
+
+    def _beside_truck_options(self, truck_side):
+        """Every (stop line, lane beside it) that suits a hidden hazard, in a fixed order."""
+        found = []
         for stop, _ in sorted(self.controlled, key=lambda c: (round(c[0].transform.rotation.yaw / 10.0), c[0].lane_id)):
             beside = stop.get_right_lane() if truck_side == "right" else stop.get_left_lane()
             behind = stop.previous(APPROACH)
@@ -123,10 +132,14 @@ class Comparison(Suite):
                     or not behind or behind[0].is_junction):
                 continue
             if abs(locations_array(self.straight_path(stop, metres=40, every=5))[-1] - (stop.transform.location.x, stop.transform.location.y)).sum() > 15.0:
-                return stop, beside
-        raise RuntimeError(f"No lane at junction 189 goes straight with a lane on its {truck_side}.")
+                found.append((stop, beside))
+        if not found:
+            raise RuntimeError(f"No lane at junction 189 goes straight with a lane on its {truck_side}.")
+        return found
 
     def _park_truck(self, waypoint):
+        if self.variation is not None and not self.variation.hidden:
+            return  # nothing hides the hazard this time
         bp = self.world.get_blueprint_library().find(HIDER)
         for back in HIDER_BACKS:
             place = waypoint.previous(back)[0].transform
@@ -140,6 +153,17 @@ class Comparison(Suite):
     def _green_for(self, stop):
         red, green = self.carla.TrafficLightState.Red, self.carla.TrafficLightState.Green
         self.set_lights(stop.transform.rotation.yaw, green, green, red)
+        # Freezing one light freezes every light in the map, so one on the way here would stay as it was, red or not,
+        # and the car would wait at it for the whole run. Any on the run-up are made green.
+        run_up = [w.transform for back in range(0, int(APPROACH) + 1, 2) for w in stop.previous(float(back) + 0.5)[:1]]
+        controlled = {light.id for _, light in self.controlled}
+        for light in self.world.get_actors().filter("traffic.traffic_light"):
+            if light.id in controlled:
+                continue
+            # Heading is compared with the run-up where it passes, as the run-up may turn through that junction
+            if any(w.transform.location.distance(place.location) < RUN_UP_REACH and abs(yaw_difference(w.transform.rotation.yaw, place.rotation.yaw)) < 45.0
+                   for w in light.get_stop_waypoints() for place in run_up):
+                light.set_state(green)
 
     def run_pedestrian(self, lead, launch=True):
         stop, beside = self._beside_truck("right")
@@ -153,6 +177,7 @@ class Comparison(Suite):
         start = self.carla.Location(x=crossing[0] + right.x * walk, y=crossing[1] + right.y * walk, z=line.z + 1.0)
         my_index = int(np.argmin(np.hypot(my_path[:, 0] - crossing[0], my_path[:, 1] - crossing[1])))
         state = {"person": None, "launched_at": None, "closest": math.inf, "stopped": False, "speed_at_closest": None}
+        walk_speed = self.variation.walk_speed if self.variation else WALK_SPEED
 
         def build(ml):
             self._park_truck(beside)
@@ -169,9 +194,9 @@ class Comparison(Suite):
             nearest = int(np.argmin(np.hypot(my_path[:, 0] - tick.ego[0], my_path[:, 1] - tick.ego[1])))
             person = state["person"]
             if person is not None:
-                if state["launched_at"] is None and launch_now(my_index - nearest, CRUISE, walk, WALK_SPEED, lead):
+                if state["launched_at"] is None and launch_now(my_index - nearest, CRUISE, walk, walk_speed, lead):
                     state["launched_at"] = tick.t
-                    person.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=-right.x, y=-right.y), speed=WALK_SPEED))
+                    person.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=-right.x, y=-right.y), speed=walk_speed))
                     self.console.line("SCENARIO", f"Person steps out, ML car {my_index - nearest} m away, t={tick.t:.1f} s")
                 if person.id in tick.walkers:
                     gap = gap_to_person(tick.ego, *tick.walkers[person.id][:2])
@@ -191,24 +216,36 @@ class Comparison(Suite):
             state["person"].destroy()
         return result, state["closest"], state["stopped"], state["launched_at"] is not None or not launch
 
-    def run_turner(self, lead):
-        stop, beside = self._beside_truck("left")
-        self._green_for(stop)
-        my_path = locations_array(self.straight_path(stop.previous(APPROACH)[0], every=1))
-        found = None
+    def _turner_options(self, stop, my_path):
+        """Every (start, path, crossing) of an oncoming car whose left turn crosses the ML car's route in the junction."""
+        found = []
         for candidate, _ in self.controlled:
             if yaw_class(candidate.transform.rotation.yaw, stop.transform.rotation.yaw) != "oncoming" or not candidate.previous(TURNER_BACK):
                 continue
             begin = candidate.previous(TURNER_BACK)[0]
             their_points = self.straight_path(begin, every=1, turn=LEFT)
             crossing = paths_cross(my_path, locations_array(their_points))
-            if crossing is not None:
-                found = (begin, their_points, crossing)
+            # Only where it crosses in the junction: a path can also meet the ML car's route somewhere on the way there
+            if crossing is not None and crossing[0] >= APPROACH - CROSSING_SLACK:
+                found.append((begin, their_points, crossing))
+        return found
+
+    def run_turner(self, lead):
+        v = self.variation
+        approaches = self._beside_truck_options("left")
+        first = (v.approach if v else 0) % len(approaches)
+        for stop, beside in approaches[first:] + approaches[:first]:  # the variation's approach, or the next that has a turner
+            my_path = locations_array(self.straight_path(stop.previous(APPROACH)[0], every=1))
+            found = self._turner_options(stop, my_path)
+            if found:
                 break
-        if found is None:
-            raise RuntimeError("No oncoming left turn crosses the ML car's route.")
-        begin, their_points, (my_index, their_index) = found
-        route = [(p.x, p.y) for p in their_points]
+        else:
+            raise RuntimeError("No oncoming left turn crosses the ML car's route in the junction.")
+        self._green_for(stop)
+        begin, their_points, (my_index, their_index) = found[(v.approach if v else 0) % len(found)]
+        turner_speed = v.turner_speed if v else TURNER_SPEED
+        # Timed for its left turn either way; one that carries straight on is a car the ML car mustn't stop for
+        route = [(p.x, p.y) for p in (their_points if v is None or v.turner_turns else self.straight_path(begin, every=1))]
         state = {"car": None, "launched_at": None, "closest": math.inf, "stopped": False}
 
         def build(ml):
@@ -222,13 +259,13 @@ class Comparison(Suite):
             if car.id not in tick.others:
                 return False
             other = tick.others[car.id]
-            if state["launched_at"] is None and launch_now(my_index - nearest, max(tick.speed, 4.0), their_index, TURNER_SPEED, lead):
+            if state["launched_at"] is None and launch_now(my_index - nearest, max(tick.speed, 4.0), their_index, turner_speed, lead):
                 state["launched_at"] = tick.t
                 self.console.line("SCENARIO", f"Oncoming car sets off, ML car {my_index - nearest} m from the crossing, t={tick.t:.1f} s")
             if state["launched_at"] is None:
                 car.apply_control(self.carla.VehicleControl(hand_brake=True))
             else:
-                steer, throttle, brake = follow_path(other, route, TURNER_SPEED)
+                steer, throttle, brake = follow_path(other, route, turner_speed)
                 car.apply_control(self.carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
                 state["closest"] = min(state["closest"], rectangles_gap(outline(tick.ego[0], tick.ego[1], tick.ego[4]), outline(other[0], other[1], other[4])))
             state["stopped"] = state["stopped"] or (tick.speed < STOPPED and tick.t > 5.0 and nearest < my_index)
@@ -263,9 +300,9 @@ class Comparison(Suite):
                 "gate_brakes": result.brake_events, "stopped": bool(stopped), "seconds": result.duration, "collisions": result.collisions}
 
 
-def start_processor(mode, model, log_path, view=False):
+def start_processor(mode, model, log_path, view=False, extra=()):
     log = open(log_path, "w", encoding="utf-8", errors="replace")  # noqa: SIM115
-    process = subprocess.Popen([sys.executable, "-u", "scripts/central_gpu_processor.py", *processor_args(mode, model, view)], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+    process = subprocess.Popen([sys.executable, "-u", "scripts/central_gpu_processor.py", *processor_args(mode, model, view), *extra], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
     deadline = time.time() + PROCESSOR_TIMEOUT
     while time.time() < deadline and process.poll() is None:

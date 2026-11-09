@@ -1146,7 +1146,11 @@ def main():
                         "--detector camera the camera detections for scripts/rsu_camera_view.py; needs a detector")
     parser.add_argument("--no-draw", action="store_true", help="draw no boxes in the world, which cameras would see; "
                         "--detector camera never draws, as its own boxes would be in its next images")
+    parser.add_argument("--speed", type=float, default=1.0, help="simulated seconds per real second, for headless benches; 0 "
+                        "runs as fast as it can. Ditto's telemetry is on the wall clock, so above 1 the gate sees the ML car a little late")
     args = parser.parse_args()
+    if args.speed < 0:
+        parser.error("--speed must be 0 or more")
 
     # Without this, Ctrl+Break or a closed console skips the cleanup below, leaving the sensors
     # behind and CARLA's settings saying synchronous with no master.
@@ -1178,7 +1182,7 @@ def main():
                     perception.render()
                 # An unthrottled tick loop would run the simulation faster than real time,
                 # while telemetry and the agents' dead reckoning run on the wall clock.
-                next_tick += FIXED_DELTA
+                next_tick += FIXED_DELTA / args.speed if args.speed else 0.0
                 delay = next_tick - time.perf_counter()
                 if delay > 0:
                     time.sleep(delay)

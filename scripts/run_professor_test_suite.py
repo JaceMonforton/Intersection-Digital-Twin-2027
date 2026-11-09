@@ -285,17 +285,19 @@ def grade_cut_in(result, cut_in_happened):
                   stayed_in_lane=result.worst_off_lane <= OFF_LANE_LIMIT)
 
 
-def traffic_schedule(rng, until=T2_LIMIT):
+def traffic_schedule(rng, until=T2_LIMIT, first_wave=None, headway=None, gap=None):
     """The seconds at which oncoming cars set off: a steady wave, then gaps long enough to turn through and more waves."""
+    first_wave = T2_FIRST_WAVE if first_wave is None else first_wave
+    headway, gap = headway or T2_HEADWAY, gap or T2_GAP
     t, times = 0.0, []
-    while t < T2_FIRST_WAVE:
+    while t < first_wave:
         times.append(t)
-        t += rng.uniform(*T2_HEADWAY)
+        t += rng.uniform(*headway)
     while t < until:
-        t += rng.uniform(*T2_GAP)
+        t += rng.uniform(*gap)
         for _ in range(rng.randint(*T2_WAVE_CARS)):
             times.append(t)
-            t += rng.uniform(*T2_HEADWAY)
+            t += rng.uniform(*headway)
     return times
 
 
@@ -655,6 +657,7 @@ class Suite:
         self.seed = seed  # picks the oncoming traffic in test 2
         self.perception = perception  # what the ML car is told about the actors around it: see roadside_link.py
         self.traffic = traffic  # background autopilot cars in every test, on top of each test's own
+        self.variation = None  # a scenario_variation.Variation for the next run, or None for the fixed scenario
         self.receiver = RoadsideReceiver() if perception in ROADSIDE_MODES else None
         self.carla = carla
         self.client = client
@@ -984,7 +987,9 @@ class Suite:
         return grade_lights(result, state["stopped_at"] is not None, state["waited"], state["crossed"], state["up_to_speed"])
 
     def left_turn_lanes(self):
-        """(stop line with a left turn, the oncoming lanes), for the approach with a long straight view of them."""
+        """(stop line with a left turn, the oncoming lanes), for an approach with a long straight view of them: the
+        variation's, counted round, or the first."""
+        found = []
         for stop, _ in sorted(self.controlled, key=lambda c: (round(c[0].transform.rotation.yaw / 10.0), c[0].lane_id)):
             behind = stop.previous(T2_START_BACK)
             if not behind or behind[0].is_junction or LEFT not in LaneDriver(stop, TurnChooser(LEFT)).turns.values():
@@ -996,8 +1001,10 @@ class Suite:
                         and (o.transform.location.x - here.x) * ahead.x + (o.transform.location.y - here.y) * ahead.y > 0.0]
             far_back = [o.previous(T2_FEED_FROM) for o in oncoming]
             if oncoming and all(b and abs(yaw_difference(o.transform.rotation.yaw, b[0].transform.rotation.yaw)) < 3.0 for o, b in zip(oncoming, far_back)):
-                return stop, oncoming
-        raise RuntimeError("No left turn at junction 189 has a long straight view of oncoming traffic.")
+                found.append((stop, oncoming))
+        if not found:
+            raise RuntimeError("No left turn at junction 189 has a long straight view of oncoming traffic.")
+        return found[(self.variation.approach if self.variation else 0) % len(found)]
 
     def test_light_change(self):
         return self.test_left_turn(light_change=True)
@@ -1008,14 +1015,16 @@ class Suite:
         red, green, yellow = self.carla.TrafficLightState.Red, self.carla.TrafficLightState.Green, self.carla.TrafficLightState.Yellow
         self.set_lights(yaw, green, green, red)
         rng = random.Random(self.seed)
-        schedule = deque(traffic_schedule(rng))
+        v = self.variation
+        speed, headway = (v.oncoming_speed, v.headway) if v else (T2_ONCOMING, T2_HEADWAY)
+        schedule = deque(traffic_schedule(rng, first_wave=v.first_wave, headway=v.headway, gap=v.gap) if v else traffic_schedule(rng))
         starts = [o.previous(T2_FEED_FROM)[0] for o in oncoming]
         cars = []
         heading = math.radians(yaw)
         line = stop.transform.location
         state = {"turned": False, "turned_at": 0.0, "start_yaw": None, "closest": math.inf, "waited": 0.0, "released": 0,
                  "stopped": False, "go_ttc": None, "changed_at": None, "red": False, "stopping": set()}
-        self.console.line("SCENARIO", f"Oncoming traffic seed {self.seed}, {T2_ONCOMING:.0f} m/s")
+        self.console.line("SCENARIO", f"Oncoming traffic seed {self.seed}, {speed:.0f} m/s")
 
         def launch(start=None):
             start = start or rng.choice(starts)
@@ -1025,7 +1034,7 @@ class Suite:
             car = self.world.try_spawn_actor(bp, self.carla.Transform(self.carla.Location(x=tf.location.x, y=tf.location.y, z=tf.location.z + 0.5), tf.rotation))
             if car is None:
                 return False
-            car.enable_constant_velocity(self.carla.Vector3D(x=T2_ONCOMING))
+            car.enable_constant_velocity(self.carla.Vector3D(x=speed))
             cars.append(car)
             self.actors.append(car)
             return True
@@ -1035,7 +1044,7 @@ class Suite:
             metres = T2_FEED_FROM
             while metres > T2_PREFILL_TO:
                 launch(rng.choice(oncoming).previous(metres)[0])
-                metres -= T2_ONCOMING * rng.uniform(*T2_HEADWAY)
+                metres -= speed * rng.uniform(*headway)
 
         def on_tick(tick, result, driver):
             state["start_yaw"] = tick.ego[4] if state["start_yaw"] is None else state["start_yaw"]
