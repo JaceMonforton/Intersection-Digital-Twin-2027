@@ -192,15 +192,15 @@ class Planner:
         to_centre = math.hypot(x - self.junction[0], y - self.junction[1])
         inside = to_centre < INSIDE_JUNCTION
         futures = hypotheses(cars, walkers, self.junction, route)
-        best = None
+        scored = []
         for name, speeds, distances, braking in options(speed, model_target, inside):
             xy, headings = along_route(route, distances)
             collide, near, first = score(xy, headings, futures)
             progress = PROGRESS_COST * (1.0 - distances[-1] / (CLEAR_SPEED * HORIZON))
-            total = collide + near + progress + COMFORT_COST * braking ** 2
-            if best is None or total < best[0] - 1e-9:
-                best = (total, name, speeds, first)
-        _, name, speeds, first = best
+            scored.append((collide + near + progress + COMFORT_COST * braking ** 2, name, speeds, first, collide))
+        if scored[0][4] == 0.0:  # clearing is an escape: when the model's own speed is collision-free, it never overrides a wait
+            scored = [s for s in scored if s[1] != "clear"]
+        _, name, speeds, first, _ = min(scored, key=lambda s: s[0])
         target = float(np.interp(TARGET_HORIZON, times(), speeds))
         reason = f"{name}: {'a collision in ' + format(first, '.1f') + ' s otherwise' if first else 'clearest way on'}"
         if not self.has_roadside and to_centre < JUNCTION_REACH and not inside and target > BLIND_APPROACH:

@@ -36,6 +36,12 @@ def test_in_the_junction_it_clears_rather_than_stop_in_a_crossing_cars_path():
     assert plan.option == "clear" and plan.speed > 3.0
 
 
+def test_in_the_junction_it_doesnt_override_the_model_waiting_to_give_way():
+    far_off = (0.0, -60.0, 0.0, 8.0, 90.0)  # coming, but nowhere near within the horizon
+    plan = Planner(JUNCTION).plan((0.0, 0.0, 0.5, 0.0, 0.0), ROUTE_EAST, [far_off], [], 0.0)
+    assert plan.option != "clear" and plan.speed <= 0.5
+
+
 def test_outside_the_junction_clearing_isnt_an_option():
     crossing = (40.0, -12.0, 0.0, 8.0, 90.0)
     plan = Planner(JUNCTION).plan((40.0, 0.0, 3.0, 0.0, 0.0), [(40.0 + x, 0.0) for x in range(60)], [crossing], [], 0.5)
