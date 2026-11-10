@@ -82,7 +82,10 @@ class OnboardView:
 
         if not Path(model).exists():
             raise FileNotFoundError(f"{model} not found: train it with training/train_detection.py --data data/detection/roof.")
-        self.session = onnxruntime.InferenceSession(str(model), providers=["CPUExecutionProvider"])
+        available = onnxruntime.get_available_providers()  # on the CPU it takes about 0.5 s a sweep, which holds the clock
+        if "CUDAExecutionProvider" in available:
+            onnxruntime.preload_dlls()  # the pip-installed CUDA and cuDNN DLLs, which Windows doesn't find on its own
+        self.session = onnxruntime.InferenceSession(str(model), providers=[p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available])
         self.input_name = self.session.get_inputs()[0].name
         self.threshold = threshold
         bp = world.get_blueprint_library().find("sensor.lidar.ray_cast")

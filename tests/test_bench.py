@@ -21,11 +21,11 @@ def test_a_seed_always_gives_the_same_situation_and_seeds_differ():
 
 
 def test_the_variation_covers_easy_and_hard_situations():
-    turners = [draw("oncoming_turner", s) for s in range(5000, 5300)]
-    leads = [v.lead for v in turners]
-    assert min(leads) < -1.0 and max(leads) > 1.0 and any(abs(x) < 0.2 for x in leads)
-    assert 0.6 < sum(v.turner_turns for v in turners) / len(turners) < 0.95  # some carry straight on
-    assert any(not v.hidden for v in turners) and any(v.hidden for v in turners)
+    for scenario in ("red_light_runner", "hidden_pedestrian"):
+        leads = [draw(scenario, s).lead for s in range(5000, 5300)]
+        assert min(leads) < -1.0 and max(leads) > 1.0 and any(abs(x) < 0.2 for x in leads)
+    walkers = [draw("hidden_pedestrian", s) for s in range(5000, 5300)]
+    assert any(not v.hidden for v in walkers) and any(v.hidden for v in walkers)
     assert draw("hidden_pedestrian", 5000).as_row()["var_walk_speed"] == draw("hidden_pedestrian", 5000).walk_speed
 
 

@@ -52,7 +52,6 @@ from ml_driver import DrivingPolicy as Policy
 from ml_driver import (
     ModelDriver,
     actor_state,
-    brake_is_off,
     crossing_ttc,
     is_new_contact,
     smoothness,
@@ -272,7 +271,7 @@ def grade_lights(result, stopped, waited, went_on_green, reached_speed):
 def grade_left_turn(result, turned, faced_traffic, gave_way):
     return finish(result, faced_oncoming_traffic=faced_traffic, gave_way_to_traffic=gave_way, completed_the_turn=turned,
                   no_collision=not result.collisions, kept_a_safe_distance=result.min_gap is not None and result.min_gap >= T2_SAFE_GAP,
-                  safety_gate_stayed_off=result.brake_events == 0, no_red_light_violation=result.red_light_violations == 0)
+                  no_red_light_violation=result.red_light_violations == 0)
 
 
 def grade_blind_corner(result, heard_on_mqtt, stopped):
@@ -863,8 +862,8 @@ class Suite:
                     polls.append((time.perf_counter() - asked) * 1000.0)
                 except (requests.RequestException, ValueError):
                     gate = {}
-                # With only its own sight, the car has no roadside unit behind a safety gate to stop it
-                released = fresh and (self.perception == "sight" or brake_is_off(gate))
+                # In the simulation no config obeys the roadside gate, so all three drive by the same rules; it's still recorded
+                released = fresh
                 steer, throttle, brake = driver.controls(ego, not_green, seen_cars, seen_walkers, released)
                 ml.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
                 for series, value in zip(driven, (steer, throttle, brake, speed)):

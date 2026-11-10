@@ -60,9 +60,9 @@ def run_scenario(suite, name, lead):
             tests = {1: suite.test_lights, 2: suite.test_left_turn, 3: suite.test_blind_corner, 4: suite.test_cut_in, 5: suite.test_light_change}
             result, ran = tests[SUITE_TESTS[name]](), True
             passed = result.passed
-        elif name == "red_light_runner":
-            result, _, _, ran = suite.run_runner(lead)
-            passed = result.passed
+        elif name == "red_light_runner":  # judged on the car alone, as the gate no longer holds it
+            result, _, stopped, ran = suite.run_runner(lead)
+            passed = ran and not result.collisions
         else:
             hazard = {"hidden_pedestrian": lambda: suite.run_pedestrian(lead), "oncoming_turner": lambda: suite.run_turner(lead),
                       "clear_road": lambda: suite.run_pedestrian(lead, launch=False)}[name]
@@ -249,6 +249,12 @@ def run_config(config, args):
         client = carla.Client(CARLA_HOST, CARLA_PORT)
         client.set_timeout(30.0)
         suite = Comparison(carla, client, Policy(), console, seed=1, perception=mode, roof_view=not args.no_view)
+        if args.planner:
+            from planner import Planner
+            from roadside_link import ROADSIDE_MODES
+            from run_professor_test_suite import JUNCTION
+
+            suite.planner = Planner(JUNCTION, has_roadside=mode in ROADSIDE_MODES)
         try:
             rows = run_runs(suite, scenarios_from(args.scenarios), args.traffic, args.repeat, config)
         finally:
@@ -269,6 +275,7 @@ def main():
     parser.add_argument("--traffic", type=int, nargs="+", default=[0, 15], help="background car counts, each run in turn")
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--model", default=str(ROOT / "models" / "rsu_detector.candidate.onnx"))
+    parser.add_argument("--planner", action="store_true", help="planner.py chooses the ML car's speed, as in run_bench.py's +planner")
     parser.add_argument("--no-view", action="store_true", help="don't open each config's windows, which is quicker")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--report-only", action="store_true", help="rebuild the report from output/comparative_study_runs.json, running nothing")

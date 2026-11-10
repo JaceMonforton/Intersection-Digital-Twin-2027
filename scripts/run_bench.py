@@ -70,8 +70,7 @@ def summarise(rows, oracle_crashed=frozenset()):
             "collision_ci_pct": (round(100 * low, 1), round(100 * high, 1)),
             "passed": sum(r["passed"] for r in ran), "oracle_crashed": len(ran) - len(avoidable),
             "avoidable_runs": len(avoidable), "avoidable_collisions": avoidable_crashed,
-            "avoidable_ci_pct": (round(100 * a_low, 1), round(100 * a_high, 1)),
-            "stopped_for_nothing": sum(bool(r.get("stopped_for_nothing")) for r in ran)}
+            "avoidable_ci_pct": (round(100 * a_low, 1), round(100 * a_high, 1))}
 
 
 def write_report(split, directory=BENCH_DIR):
@@ -84,8 +83,8 @@ def write_report(split, directory=BENCH_DIR):
                         ("Each run is a different situation drawn from its seed. Collision rates come with a 95 % Wilson interval. "
                          "\"Oracle crashed\" counts seeds where even the teaching rule, driving with true positions, hit something; "
                          "\"avoidable\" leaves those out."), "",
-                        "| Config | Scenario | Ran | Collisions | Collision rate (95 % range) | Passed | Oracle crashed | Avoidable collisions (95 % range) | Stopped for nothing |",
-                        "| ------ | -------- | --- | ---------- | --------------------------- | ------ | -------------- | --------------------------------- | ------------------- |"]
+                        "| Config | Scenario | Ran | Collisions | Collision rate (95 % range) | Passed | Oracle crashed | Avoidable collisions (95 % range) |",
+                        "| ------ | -------- | --- | ---------- | --------------------------- | ------ | -------------- | --------------------------------- |"]
     for config, rows in every.items():
         for scenario in SCENARIOS:
             mine = [r for r in rows if r["scenario"] == scenario]
@@ -97,9 +96,8 @@ def write_report(split, directory=BENCH_DIR):
             avoid = "n/a" if config == "oracle" or not every["oracle"] else (
                 f"{s['avoidable_collisions']} of {s['avoidable_runs']} ({s['avoidable_ci_pct'][0]}-{s['avoidable_ci_pct'][1]} %)")
             lines.append(f"| {config} | {scenario} | {s['ran']} of {s['runs']} | {s['collisions']} | {rate} | {s['passed']} | "
-                         f"{s['oracle_crashed'] if config != 'oracle' and every['oracle'] else 'n/a'} | {avoid} | {s['stopped_for_nothing']} |")
-    lines += ["", ("- **Stopped for nothing** counts oncoming_turner runs where the oncoming car carried straight on and the ML car still "
-                   "stopped: giving way to a car that was never going to cross is a mistake too."), ""]
+                         f"{s['oracle_crashed'] if config != 'oracle' and every['oracle'] else 'n/a'} | {avoid} |")
+    lines.append("")
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"report_{split}.md").write_text("\n".join(lines), encoding="utf-8")
     if table:
@@ -160,7 +158,6 @@ def run_config(config, args):
                 if config == "oracle":
                     policy.inputs.clear()  # its lessons aren't kept here; record_hazards.py records those
                 row = {"config": config, "split": args.split, "seed": seed, **row, **variation.as_row()}
-                row["stopped_for_nothing"] = bool(name == "oncoming_turner" and not variation.turner_turns and row.get("stopped"))
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(row) + "\n")
                 suite.console.end_status()

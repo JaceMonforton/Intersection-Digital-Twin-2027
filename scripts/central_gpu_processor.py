@@ -801,8 +801,11 @@ class RoadsideDetector:
         import onnxruntime
 
         available = onnxruntime.get_available_providers()
-        providers = [p for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider",
-                                 "CPUExecutionProvider") if p in available]
+        if "CUDAExecutionProvider" in available:
+            onnxruntime.preload_dlls()  # the pip-installed CUDA and cuDNN DLLs, which Windows doesn't find on its own
+        # Not TensorRT: onnxruntime-gpu lists it without its libraries, and when it fails to load the session falls back
+        # straight to the CPU, past CUDA
+        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
         self.session = onnxruntime.InferenceSession(str(path), providers=providers)
         model_input = self.session.get_inputs()[0]
         if model_input.shape != [1, 2, GRID_SIZE, GRID_SIZE]:
@@ -826,6 +829,8 @@ class RoadsideCameras:
         if not Path(path).exists():
             raise FileNotFoundError(f"{path} not found: train it with training/train_camera.py.")
         available = onnxruntime.get_available_providers()
+        if "CUDAExecutionProvider" in available:
+            onnxruntime.preload_dlls()  # the pip-installed CUDA and cuDNN DLLs, which Windows doesn't find on its own
         self.session = onnxruntime.InferenceSession(str(path), providers=[p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available])
         self.input_name = self.session.get_inputs()[0].name
         self.center = (center.x, center.y, center.z)

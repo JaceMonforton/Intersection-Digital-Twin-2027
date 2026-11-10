@@ -165,6 +165,8 @@ class OnnxPredictor:
         import onnxruntime
 
         available = onnxruntime.get_available_providers()
+        if "CUDAExecutionProvider" in available:
+            onnxruntime.preload_dlls()  # the pip-installed CUDA and cuDNN DLLs, which Windows doesn't find on its own
         providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
         self.session = onnxruntime.InferenceSession(str(path), providers=providers)
         self.input_name = self.session.get_inputs()[0].name

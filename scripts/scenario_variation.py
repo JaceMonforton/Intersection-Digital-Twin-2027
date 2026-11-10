@@ -16,7 +16,7 @@ import random
 from dataclasses import asdict, dataclass
 
 SPLITS = {"train": range(1000, 5000), "tune": range(5000, 6000), "test": range(9000, 10000)}
-SCENARIOS = ("left_turn", "oncoming_turner", "hidden_pedestrian")
+SCENARIOS = ("left_turn", "red_light_runner", "hidden_pedestrian")
 
 
 @dataclass(frozen=True)
@@ -52,9 +52,8 @@ def draw(scenario, seed, traffic=None):
               "traffic": rng.randint(0, 20) if traffic is None else traffic}
     if scenario == "hidden_pedestrian":
         return Variation(**common, lead=rng.uniform(-1.5, 1.5), hidden=rng.random() < 0.8, walk_speed=rng.uniform(1.0, 2.2))
-    if scenario == "oncoming_turner":
-        return Variation(**common, lead=rng.uniform(-1.5, 1.5), hidden=rng.random() < 0.8, turner_speed=rng.uniform(5.0, 10.0),
-                         turner_turns=rng.random() < 0.8)
+    if scenario == "red_light_runner":
+        return Variation(**common, lead=rng.uniform(-1.5, 1.5))
     return Variation(**common, oncoming_speed=rng.uniform(9.0, 14.0), first_wave=rng.uniform(0.0, 30.0),
                      headway=(2.0, rng.uniform(4.0, 10.0)), gap=(rng.uniform(5.0, 11.0), 14.0))
 

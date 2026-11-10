@@ -80,10 +80,10 @@ def test_a_left_turn_with_no_oncoming_traffic_tested_nothing():
     assert not grade_left_turn(_turn(), True, False, True).passed
 
 
-def test_a_left_turn_must_give_way_keep_its_distance_and_not_need_the_gate():
+def test_a_left_turn_must_give_way_and_keep_its_distance():
     assert not grade_left_turn(_turn(), True, True, False).passed
     assert not grade_left_turn(_turn(min_gap=T2_SAFE_GAP - 0.1), True, True, True).passed
-    assert not grade_left_turn(_turn(brake_events=1), True, True, True).passed
+    assert grade_left_turn(_turn(brake_events=1), True, True, True).passed  # the gate is recorded, not obeyed, so it isn't graded
 
 
 def test_the_light_change_test_needs_the_light_to_really_change():
