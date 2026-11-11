@@ -48,7 +48,7 @@ from detection_features import (
     rasterize,
 )
 from model_panel import SafetySender
-from roadside_link import RoadsideSender
+from roadside_link import RoadsideSender, TickGate
 from waymo_predictor_node import (
     DEFAULT_MODEL as TRAJECTORY_MODEL,
 )
@@ -959,7 +959,7 @@ class CarlaPerception:
 
     def tick(self):
         """Advance the simulation one step and return the tracks detected in it."""
-        frame = self.world.tick()
+        frame = self.frame = self.world.tick()
         now = self.world.get_snapshot().timestamp.elapsed_seconds
         if self.camera:
             return self._camera(frame, now)
@@ -1153,6 +1153,8 @@ def main():
                         "--detector camera never draws, as its own boxes would be in its next images")
     parser.add_argument("--speed", type=float, default=1.0, help="simulated seconds per real second, for headless benches; 0 "
                         "runs as fast as it can. Ditto's telemetry is on the wall clock, so above 1 the gate sees the ML car a little late")
+    parser.add_argument("--lockstep", action="store_true", help="wait for the ML car's driver to act on each tick before the next, "
+                        "so a slow driver can't skip ticks; for benches")
     args = parser.parse_args()
     if args.speed < 0:
         parser.error("--speed must be 0 or more")
@@ -1177,14 +1179,18 @@ def main():
                 engine.step(time.time())
                 time.sleep(1.0 / HEADLESS_RATE)
         else:
+            # Before CarlaPerception, which takes over the clock and clears other runs' sensors: a second processor fails here first
+            gate = TickGate() if args.lockstep else None
             perception = CarlaPerception(args.junction, args.detector, args.model, args.lidar_view)
-            print(f"[CARLA] Master tick running at {1 / FIXED_DELTA:.0f} Hz.")
+            print(f"[CARLA] Master tick running at {1 / FIXED_DELTA:.0f} Hz{', in lockstep with the driver' if gate else ''}.")
             next_tick = time.perf_counter()
             while True:
                 tracks = perception.tick()
                 engine.step(time.time(), tracks)
                 if not (args.no_draw or args.detector == "camera"):
                     perception.render()
+                if gate is not None:
+                    gate.wait(perception.frame)
                 # An unthrottled tick loop would run the simulation faster than real time,
                 # while telemetry and the agents' dead reckoning run on the wall clock.
                 next_tick += FIXED_DELTA / args.speed if args.speed else 0.0

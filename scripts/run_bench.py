@@ -33,7 +33,8 @@ from study_names import CONFIGS
 
 BENCH_DIR = ROOT / "output" / "bench"
 PLANNED = "+planner"     # a config's name with this drives with planner.Planner choosing the speed
-BENCH_CONFIGS = ("oracle", *CONFIGS, *(f"{c}{PLANNED}" for c in CONFIGS))
+MONITORED = "+monitor"   # and with this, also with the car's own safety monitor, safety_monitor.py, after the planner
+BENCH_CONFIGS = ("oracle", *CONFIGS, *(f"{c}{PLANNED}" for c in CONFIGS), *(f"{c}{PLANNED}{MONITORED}" for c in CONFIGS))
 Z95 = 1.96
 
 
@@ -70,7 +71,9 @@ def summarise(rows, oracle_crashed=frozenset()):
             "collision_ci_pct": (round(100 * low, 1), round(100 * high, 1)),
             "passed": sum(r["passed"] for r in ran), "oracle_crashed": len(ran) - len(avoidable),
             "avoidable_runs": len(avoidable), "avoidable_collisions": avoidable_crashed,
-            "avoidable_ci_pct": (round(100 * a_low, 1), round(100 * a_high, 1))}
+            "avoidable_ci_pct": (round(100 * a_low, 1), round(100 * a_high, 1)),
+            "skipped_ticks": sum(r.get("skipped_ticks") or 0 for r in ran),
+            "monitor_acted": sum(rule["times"] for r in ran for rule in (r.get("monitor") or {}).values())}
 
 
 def write_report(split, directory=BENCH_DIR):
@@ -82,9 +85,10 @@ def write_report(split, directory=BENCH_DIR):
     table, lines = [], [f"# Bench: {split} seeds", "",
                         ("Each run is a different situation drawn from its seed. Collision rates come with a 95 % Wilson interval. "
                          "\"Oracle crashed\" counts seeds where even the teaching rule, driving with true positions, hit something; "
-                         "\"avoidable\" leaves those out."), "",
-                        "| Config | Scenario | Ran | Collisions | Collision rate (95 % range) | Passed | Oracle crashed | Avoidable collisions (95 % range) |",
-                        "| ------ | -------- | --- | ---------- | --------------------------- | ------ | -------------- | --------------------------------- |"]
+                         "\"avoidable\" leaves those out. Skipped ticks are ones the driver never saw, so 0 is what a run "
+                         "should have; \"monitor acted\" counts the times the car's own safety monitor held or slowed it."), "",
+                        "| Config | Scenario | Ran | Collisions | Collision rate (95 % range) | Passed | Oracle crashed | Avoidable collisions (95 % range) | Skipped ticks | Monitor acted |",
+                        "| ------ | -------- | --- | ---------- | --------------------------- | ------ | -------------- | --------------------------------- | ------------- | ------------- |"]
     for config, rows in every.items():
         for scenario in SCENARIOS:
             mine = [r for r in rows if r["scenario"] == scenario]
@@ -96,7 +100,7 @@ def write_report(split, directory=BENCH_DIR):
             avoid = "n/a" if config == "oracle" or not every["oracle"] else (
                 f"{s['avoidable_collisions']} of {s['avoidable_runs']} ({s['avoidable_ci_pct'][0]}-{s['avoidable_ci_pct'][1]} %)")
             lines.append(f"| {config} | {scenario} | {s['ran']} of {s['runs']} | {s['collisions']} | {rate} | {s['passed']} | "
-                         f"{s['oracle_crashed'] if config != 'oracle' and every['oracle'] else 'n/a'} | {avoid} |")
+                         f"{s['oracle_crashed'] if config != 'oracle' and every['oracle'] else 'n/a'} | {avoid} | {s['skipped_ticks']} | {s['monitor_acted']} |")
     lines.append("")
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"report_{split}.md").write_text("\n".join(lines), encoding="utf-8")
@@ -121,8 +125,8 @@ def run_config(config, args):
     from run_rsu_comparison import Comparison, start_processor, stop_processor
     from run_study import run_scenario
 
-    mode = "truth" if config == "oracle" else CONFIGS[config.removesuffix(PLANNED)]
-    path = runs_path(config, args.split)
+    mode = "truth" if config == "oracle" else CONFIGS[config.removesuffix(MONITORED).removesuffix(PLANNED)]
+    path = runs_path(config, args.split + ("_droplink" if args.drop_link else ""))  # kept out of the report, which is normal runs
     done = {(r["scenario"], r["seed"]) for r in load_runs(path)}
     todo = [(name, seed) for name in args.scenarios for seed in seeds(args.split, args.runs, args.start) if (name, seed) not in done]
     if not todo:
@@ -130,7 +134,7 @@ def run_config(config, args):
         return
     BENCH_DIR.mkdir(parents=True, exist_ok=True)
     process, log = start_processor(mode, args.model, OUTPUT_DIR / f"bench_processor_{config}.log", view=False,
-                                   extra=["--no-draw", "--speed", str(args.speed)])
+                                   extra=["--no-draw", "--lockstep", "--speed", str(args.speed)])
     try:
         client = carla.Client(CARLA_HOST, CARLA_PORT)
         client.set_timeout(30.0)
@@ -142,7 +146,8 @@ def run_config(config, args):
         suite = Comparison(carla, client, policy, Console(args.quiet), seed=1, perception=mode)
         if config == "oracle":
             policy.world = suite.world
-        if config.endswith(PLANNED):
+        suite.monitor, suite.link_drop = config.endswith(MONITORED), args.drop_link
+        if PLANNED in config:
             from planner import Planner
             from roadside_link import ROADSIDE_MODES
             from run_professor_test_suite import JUNCTION
@@ -157,7 +162,7 @@ def run_config(config, args):
                 row = run_scenario(suite, name, variation.lead)
                 if config == "oracle":
                     policy.inputs.clear()  # its lessons aren't kept here; record_hazards.py records those
-                row = {"config": config, "split": args.split, "seed": seed, **row, **variation.as_row()}
+                row = {"config": config, "split": args.split, "seed": seed, "link_drop": args.drop_link, **row, **variation.as_row()}
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(row) + "\n")
                 suite.console.end_status()
@@ -180,6 +185,9 @@ def main():
     parser.add_argument("--traffic", type=int, help="background cars in every run, instead of each seed's own")
     parser.add_argument("--speed", type=float, default=1.0, help="the processor's --speed: 0 runs as fast as CARLA can")
     parser.add_argument("--model", default=str(ROOT / "models" / "rsu_detector.candidate.onnx"))
+    parser.add_argument("--drop-link", type=lambda text: tuple(float(v) for v in text.split(",")), metavar="FROM,TO",
+                        help="cut the roadside link FROM to TO s into every run, to test what the car does without it; "
+                             "saved apart, as <config>_<split>_droplink.jsonl")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--report", action="store_true", help="rebuild the report from the saved runs, running nothing")
     args = parser.parse_args()
@@ -193,12 +201,13 @@ def main():
             # Each config gets its own process, as a Traffic Manager doesn't survive being reused after its processor changes
             common = ["--split", args.split, "--runs", str(args.runs), "--start", str(args.start), "--speed", str(args.speed),
                       "--model", args.model, "--scenarios", *args.scenarios, *(["--final"] if args.final else []),
-                      *(["--traffic", str(args.traffic)] if args.traffic is not None else []), *(["--quiet"] if args.quiet else [])]
+                      *(["--traffic", str(args.traffic)] if args.traffic is not None else []), *(["--quiet"] if args.quiet else []),
+                      *(["--drop-link", ",".join(str(v) for v in args.drop_link)] if args.drop_link else [])]
             for config in args.configs:
                 subprocess.call([sys.executable, "-u", __file__, *common, "--configs", config], cwd=ROOT)
         else:
             run_config(args.configs[0], args)
-    print("\n".join(write_report(args.split)))
+    print("\n".join(write_report(args.split + ("_droplink" if args.drop_link else ""))))
     return 0
 
 

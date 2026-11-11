@@ -12,6 +12,8 @@ from roadside_link import (
     RoadsideReceiver,
     RoadsideSender,
     RoadsideView,
+    TickAck,
+    TickGate,
     TruthView,
     visible_actors,
 )
@@ -151,3 +153,31 @@ def test_a_dead_roadside_link_still_counts_as_stale_when_the_car_can_see():
     assert view.see(None, {}, {}, 0.0) == ([(1.0, 1.0, 0.0, 0.0, 0.0)], [], False)
     view.close()
     assert view.roadside.closed and view.own.closed
+
+
+LOCKSTEP = ("127.0.0.1", 47898)
+
+
+def test_the_tick_gate_waits_for_the_driver_only_while_one_is_acking():
+    gate, ack = TickGate(LOCKSTEP, wait=0.3), TickAck(LOCKSTEP)
+    try:
+        started = time.monotonic()
+        gate.wait(1)  # no driver yet: setup ticks mustn't stall
+        assert time.monotonic() - started < 0.1 and gate.timeouts == 0
+        ack.send(1)
+        gate.wait(1)  # the driver has acted on frame 1, so the next tick may go
+        assert gate.engaged and gate.timeouts == 0
+        started = time.monotonic()
+        gate.wait(2)  # the driver is acking but hasn't done frame 2: wait, then give up and stop waiting
+        assert 0.25 < time.monotonic() - started < 1.0 and gate.timeouts == 1 and not gate.engaged
+        started = time.monotonic()
+        gate.wait(3)
+        assert time.monotonic() - started < 0.1 and gate.timeouts == 1
+        ack.send(4)
+        ack.release()  # the driver has left its loop: don't wait for it
+        started = time.monotonic()
+        gate.wait(5)
+        assert time.monotonic() - started < 0.1 and gate.timeouts == 1 and not gate.engaged and gate.acked == 4
+    finally:
+        gate.close()
+        ack.close()

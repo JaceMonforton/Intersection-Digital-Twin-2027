@@ -21,6 +21,7 @@ import csv
 import json
 import math
 import os
+import queue
 import random
 import shutil
 import signal
@@ -62,6 +63,7 @@ from roadside_link import (
     ROADSIDE_MODES,
     SEMANTIC_POINT,
     RoadsideReceiver,
+    TickAck,
     make_view,
 )
 from study_names import (
@@ -176,6 +178,8 @@ class StageResult:
     mqtt_latency_ms: float = None
     gate_poll_ms: float = None
     worst_off_lane: float = 0.0
+    skipped_ticks: int = 0  # ticks the driver never saw, because a loop took longer than one; above 0 the run isn't the one designed
+    monitor: dict = field(default_factory=dict)  # per rule of the car's own safety monitor: {"ticks": n, "times": n}
     distance: float = 0.0
     duration: float = 0.0
     smoothness: dict = field(default_factory=dict)
@@ -270,7 +274,7 @@ def grade_lights(result, stopped, waited, went_on_green, reached_speed):
 
 def grade_left_turn(result, turned, faced_traffic, gave_way):
     return finish(result, faced_oncoming_traffic=faced_traffic, gave_way_to_traffic=gave_way, completed_the_turn=turned,
-                  no_collision=not result.collisions, kept_a_safe_distance=result.min_gap is not None and result.min_gap >= T2_SAFE_GAP,
+                  no_collision=not result.collisions, kept_a_safe_distance=result.min_gap is None or result.min_gap >= T2_SAFE_GAP,  # None: no car it could have avoided came near
                   no_red_light_violation=result.red_light_violations == 0)
 
 
@@ -338,6 +342,19 @@ def along_and_across(ego, other):
     yaw = math.radians(ego[4])
     dx, dy = other[0] - ego[0], other[1] - ego[1]
     return dx * math.cos(yaw) + dy * math.sin(yaw), -dx * math.sin(yaw) + dy * math.cos(yaw)
+
+
+LANE_PARALLEL = 30.0  # deg off the ML car's heading, either way, that counts as travelling along its road
+OTHER_LANE = 2.5      # m to the side, centre to centre, that puts a parallel car in another lane
+
+
+def counts_toward_gap(ego, other):
+    """Whether other's distance from the ML car says anything about how it drove. A car in the next lane going either
+    way along the road, or one coming up from behind, passes as close in normal driving, and the ML car didn't choose it."""
+    ahead, across = along_and_across(ego, other)
+    turn = abs((other[4] - ego[4] + 180.0) % 360.0 - 180.0)
+    parallel = turn <= LANE_PARALLEL or turn >= 180.0 - LANE_PARALLEL
+    return not (parallel and abs(across) >= OTHER_LANE) and not (turn <= LANE_PARALLEL and ahead < 0.0)
 
 
 def follow_path(state, path, speed, look=6.0):
@@ -658,6 +675,8 @@ class Suite:
         self.traffic = traffic  # background autopilot cars in every test, on top of each test's own
         self.variation = None  # a scenario_variation.Variation for the next run, or None for the fixed scenario
         self.planner = None    # a planner.Planner the ML car plans its speed with, or None to drive on the model's alone
+        self.monitor = False   # whether the ML car drives with its own safety monitor, safety_monitor.py
+        self.link_drop = None  # (from, to) s into each run that the roadside link is cut, to test what the car does then
         self.receiver = RoadsideReceiver() if perception in ROADSIDE_MODES else None
         self.carla = carla
         self.client = client
@@ -670,6 +689,7 @@ class Suite:
         self.traffic_manager.set_synchronous_mode(True)
         self.mqtt = MqttWatch(console)
         self.safety = SafetyReceiver()
+        self.ack = TickAck()  # for a processor run with --lockstep
         self.hud = HudSender()
         self.world.wait_for_tick(10.0)
         # Only in sight, where the roof LiDAR is all the car has; in rsu and camera the roadside windows show more
@@ -813,6 +833,10 @@ class Suite:
         telemetry.source = self.perception
         driver = ModelDriver(self.policy, LaneDriver(start, TurnChooser(turn)), self.find_waypoint, rng, telemetry)
         driver.planner = self.planner
+        if self.monitor:
+            from safety_monitor import SafetyMonitor
+
+            driver.monitor = SafetyMonitor()
         hits = []
         sensor = self.world.spawn_actor(self.world.get_blueprint_library().find("sensor.other.collision"), carla.Transform(), attach_to=ml)
         sensor.listen(lambda event: hits.append((event.other_actor.id, event.other_actor.type_id, event.other_actor.attributes.get("role_name", ""))))
@@ -829,18 +853,31 @@ class Suite:
         driven = ([], [], [], [])
         lights = self.lights
         lights.runs, lights.suspects, lights.seen = [], {}, {}
-        started = now = None
+        started = now = frame = None
         last_position = None
         was_braking = False
         held_since = None
         polls = []
+        closest = None
         min_ttc = math.inf
         states, ttcs, engagements, entered = [], [], [], None
         self.mqtt.clear()
         done = False
+        # Every tick, not wait_for_tick's next one: in lockstep the processor ticks the moment it hears the ack, and a tick
+        # that arrives before wait_for_tick is called is missed, so both sides waited out the gate's timeout
+        ticks = queue.Queue()
+        listening = self.world.on_tick(ticks.put)
         try:
             while not done:
-                snapshot = self.world.wait_for_tick(TICK_TIMEOUT)
+                try:
+                    snapshot = ticks.get(timeout=TICK_TIMEOUT)
+                except queue.Empty:
+                    raise RuntimeError(f"no tick from CARLA within {TICK_TIMEOUT} s") from None
+                while not ticks.empty():  # a driver slower than the clock acts on the newest, counting the rest as skipped
+                    snapshot = ticks.get_nowait()
+                if started is not None:
+                    result.skipped_ticks += max(0, snapshot.frame - frame - 1)
+                frame = snapshot.frame
                 now = snapshot.timestamp.elapsed_seconds
                 started = now if started is None else started
                 t = now - started
@@ -850,7 +887,12 @@ class Suite:
                 walkers = {w.id: (w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
                            for w in self.world.get_actors().filter("walker.pedestrian.*")}
                 not_green = lights.not_green()
-                seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
+                if self.link_drop and self.link_drop[0] <= t < self.link_drop[1] and hasattr(view, "own"):
+                    seen_cars, seen_walkers, fresh = view.own.see(ego, others, walkers, now)  # the roadside unit's tracks never arrive
+                    link_up = False
+                else:
+                    seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
+                    link_up = getattr(view, "link_up", None)  # None with no roadside unit
                 seen_cars = self.believed(seen_cars)
                 if self.roof is not None:
                     self.roof.write(self.world, now, getattr(view, "last_sweep", None))
@@ -864,7 +906,7 @@ class Suite:
                     gate = {}
                 # In the simulation no config obeys the roadside gate, so all three drive by the same rules; it's still recorded
                 released = fresh
-                steer, throttle, brake = driver.controls(ego, not_green, seen_cars, seen_walkers, released)
+                steer, throttle, brake = driver.controls(ego, not_green, seen_cars, seen_walkers, released, link_up)
                 ml.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
                 for series, value in zip(driven, (steer, throttle, brake, speed)):
                     series.append(value)
@@ -873,10 +915,15 @@ class Suite:
                 ttc = safety.get("ttc")
                 if ttc is not None:
                     min_ttc = min(min_ttc, ttc)
-                gap = min((rectangles_gap(outline(ego[0], ego[1], ego[4]), outline(o[0], o[1], o[4]))
-                           for o in others.values() if math.hypot(o[0] - ego[0], o[1] - ego[1]) < 15.0), default=None)
-                if gap is not None:
-                    result.min_gap = gap if result.min_gap is None else min(result.min_gap, gap)
+                gap, nearest = min(((rectangles_gap(outline(ego[0], ego[1], ego[4]), outline(o[0], o[1], o[4])), o)
+                                    for o in others.values() if math.hypot(o[0] - ego[0], o[1] - ego[1]) < 15.0 and counts_toward_gap(ego, o)),
+                                   default=(None, None), key=lambda pair: math.inf if pair[0] is None else pair[0])
+                if gap is not None and (result.min_gap is None or gap < result.min_gap):
+                    result.min_gap = gap
+                    ahead, across = along_and_across(ego, nearest)
+                    turn = (nearest[4] - ego[4] + 180.0) % 360.0 - 180.0
+                    closest = (f"closest car {gap:.1f} m at t={t:.1f} s: {ahead:+.1f} m ahead, {across:+.1f} m right, "
+                               f"heading {turn:+.0f} deg, {math.hypot(nearest[2], nearest[3]):.1f} m/s, ML car {speed:.1f} m/s")
                 result.worst_off_lane = max(result.worst_off_lane, driver.off_lane)
                 if last_position is not None:
                     result.distance += math.hypot(ego[0] - last_position[0], ego[1] - last_position[1])
@@ -933,13 +980,20 @@ class Suite:
                 tick.held_for = 0.0 if held_since is None else t - held_since
                 tick.turn_yaw = ego[4]
                 done = on_tick(tick, result, driver)
+                self.ack.send(frame)  # after on_tick too, which moves the test's own actors
                 if t >= limit:
                     result.notes.append(f"ran out of time at {limit:.0f} s")
                     self.hud.event("Ran out of time")
                     done = True
         finally:
+            self.world.remove_on_tick(listening)
+            self.ack.release()  # first, so the processor doesn't wait out the clean-up below
             view.close()
             result.duration = round(now - started, 1) if started is not None else 0.0
+            if closest is not None:
+                result.notes.append(closest)
+            if driver.monitor is not None:
+                result.monitor = {rule: {"ticks": n, "times": driver.monitor.times[rule]} for rule, n in driver.monitor.ticks.items()}
             result.red_light_violations = len(lights.runs)
             result.min_ttc = None if math.isinf(min_ttc) else round(min_ttc, 3)
             lowest = min(ttcs, default=math.inf)
@@ -1265,6 +1319,7 @@ class Suite:
         self.release_lights()
         self.mqtt.stop()
         self.safety.close()
+        self.ack.close()
         if self.receiver is not None:
             self.receiver.close()
         if self.roof is not None:

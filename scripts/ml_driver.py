@@ -138,6 +138,7 @@ class ModelDriver:
         self.times_lost = 0
         self.planner = None    # a planner.Planner, which may lower the model's speed or have it clear the junction
         self.last_plan = None
+        self.monitor = None    # a safety_monitor.SafetyMonitor, which may hold or slow the car after the planner
 
     def _follow_route(self, x, y, yaw):
         self.off_lane = self.lane.advance_to(x, y)
@@ -153,8 +154,9 @@ class ModelDriver:
             self.lane = LaneDriver(waypoint, self.rng)
             self.off_lane = self.lane.advance_to(x, y)
 
-    def controls(self, ego, not_green, cars, walkers, brake_off):
-        """(steer, throttle, brake). The model runs either way, so its route stays current under the brake."""
+    def controls(self, ego, not_green, cars, walkers, brake_off, link_up=None):
+        """(steer, throttle, brake). The model runs either way, so its route stays current under the brake. link_up is
+        whether the roadside link is up, or None with no roadside unit; only the safety monitor reads it."""
         self._follow_route(ego[0], ego[1], ego[4])
         inputs = inputs_for(self.lane, ego, not_green, cars, walkers)
         output = self.policy(inputs)
@@ -164,6 +166,11 @@ class ModelDriver:
             self.last_plan = self.planner.plan(ego, self.lane.path_ahead(PLAN_LOOK), cars, walkers, float(output[1]))
             if self.last_plan.changed:
                 drive = np.array((output[0], self.last_plan.speed), dtype=np.float32)  # the model's steering, the planner's speed
+        if self.monitor is not None:
+            allowed = self.monitor.check(brake_off, link_up, float(drive[1]))
+            brake_off = allowed is not None
+            if brake_off and allowed != float(drive[1]):
+                drive = np.array((drive[0], allowed), dtype=np.float32)
         applied = self.controller.step(drive, math.hypot(ego[2], ego[3])) if brake_off else self.controller.hold()
         if self.telemetry is not None:
             self.telemetry.send(inputs, output, applied, brake_off, plan=self.last_plan)  # output stays the model's own

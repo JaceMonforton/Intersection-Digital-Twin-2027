@@ -80,7 +80,7 @@ def run_scenario(suite, name, lead):
     return {"scenario": name, "lead": lead if hazard or name == "red_light_runner" else None, "ran": bool(ran), "passed": bool(passed and ran),
             "collisions": len(r["collisions"]), "background_collisions": sum(c.get("role") == "background" for c in r["collisions"]),
             "brake_events": r["brake_events"], "false_brakes": r["false_brakes"], "true_min_ttc": r["true_min_ttc"],
-            "clearance_s": r["clearance_s"], "traffic_spawned": r["traffic"], "duration_s": r["duration"], "notes": "; ".join(r["notes"]),
+            "clearance_s": r["clearance_s"], "traffic_spawned": r["traffic"], "duration_s": r["duration"], "skipped_ticks": r["skipped_ticks"], "monitor": r["monitor"], "notes": "; ".join(r["notes"]),
             "failed_checks": ", ".join(check for check, ok in r["checks"].items() if not ok), "stopped": bool(stopped)}
 
 
@@ -243,7 +243,7 @@ def run_config(config, args):
     mode = CONFIGS[config]
     console = Console(args.quiet)
     console.line("SCENARIO", f"=== Config: {config} ===")
-    process, log = start_processor(mode, args.model, OUTPUT_DIR / f"study_processor_{config}.log", view=not args.no_view)
+    process, log = start_processor(mode, args.model, OUTPUT_DIR / f"study_processor_{config}.log", view=not args.no_view, extra=["--lockstep"])
     windows = [] if args.no_view else [spawn_window(["scripts/ml_car_view.py"], f"{config}_car_view"), spawn_window(VIEWS[mode], f"{config}_view")]
     try:
         client = carla.Client(CARLA_HOST, CARLA_PORT)

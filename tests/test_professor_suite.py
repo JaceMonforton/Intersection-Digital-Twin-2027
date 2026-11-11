@@ -19,6 +19,7 @@ from run_professor_test_suite import (
     TurnChooser,
     alert_banner,
     along_and_across,
+    counts_toward_gap,
     follow_path,
     grade_blind_corner,
     grade_cut_in,
@@ -83,6 +84,7 @@ def test_a_left_turn_with_no_oncoming_traffic_tested_nothing():
 def test_a_left_turn_must_give_way_and_keep_its_distance():
     assert not grade_left_turn(_turn(), True, True, False).passed
     assert not grade_left_turn(_turn(min_gap=T2_SAFE_GAP - 0.1), True, True, True).passed
+    assert grade_left_turn(_turn(min_gap=None), True, True, True).passed  # no car that counts ever came within range
     assert grade_left_turn(_turn(brake_events=1), True, True, True).passed  # the gate is recorded, not obeyed, so it isn't graded
 
 
@@ -327,3 +329,13 @@ def test_a_terminal_too_short_for_the_live_table_goes_without(monkeypatch):
     out = _Terminal()
     Console(stream=out).status(["1", "2", "3"])
     assert out.getvalue() == ""
+
+
+def test_only_cars_the_ml_car_could_have_avoided_count_toward_its_gap():
+    ego = (0.0, 0.0, 5.0, 0.0, 0.0)  # heading +x; CARLA's y is to the right
+    assert not counts_toward_gap(ego, (4.6, -3.4, 0.0, 0.0, 180.0))  # stopped in the opposite lane, as on seeds 5003 and 5007
+    assert not counts_toward_gap(ego, (0.0, 3.5, 5.0, 0.0, 5.0))     # alongside in the next lane, the same way
+    assert not counts_toward_gap(ego, (-5.0, 0.0, 8.0, 0.0, 0.0))    # coming up from behind
+    assert counts_toward_gap(ego, (6.0, 0.0, 0.0, 0.0, 0.0))         # the car ahead in its own lane
+    assert counts_toward_gap(ego, (6.0, 0.5, -9.0, 0.0, 180.0))      # oncoming in its path, as on a left turn
+    assert counts_toward_gap(ego, (4.2, -0.5, 0.0, 9.4, 121.0))      # crossing in front
