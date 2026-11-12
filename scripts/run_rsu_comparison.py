@@ -62,6 +62,7 @@ HIDER_BACKS = (3.0, 10.0)  # m from the stop line to the centre of each one
 CROSSING_AHEAD = 5.0    # m past the stop line that the person crosses, on the crossing, just in front of the containers
 HIDER_HALF_WIDTH = 1.3  # m
 HIDER_REACH = 7.0       # m from a container's centre to a stopped car that is really that container
+HIDER_MARGIN = 0.5      # m round a container's footprint that a track is still that container, whatever its speed
 CRUISE = 6.0            # m/s; what the car settles to here, for timing a hazard, since it may slow before one sets off
 WALK_SPEED = 1.6        # m/s
 TURNER_SPEED = 8.0      # m/s
@@ -103,13 +104,26 @@ def report_rows(results):
     return rows
 
 
+def in_footprint(x, y, cx, cy, yaw, half_x, half_y, margin=HIDER_MARGIN):
+    """Is (x, y) within margin of a box centred on (cx, cy), yaw degrees, half_x by half_y along its own axes?"""
+    c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+    dx, dy = x - cx, y - cy
+    return abs(c * dx + s * dy) <= half_x + margin and abs(-s * dx + c * dy) <= half_y + margin
+
+
 class Comparison(Suite):
     def believed(self, cars):
         """The detector reports a container as a parked car, which would slow only that version, so it's left out of what the
         driver is told, as a fixed roadside unit would learn its static background.
+        The centroid tracker gives a container a speed that jumps about, up to 19 m/s as more of it comes into view, so a
+        track inside a container's footprint is dropped whatever its speed: no real car can be there.
         shortcut: told where the containers are; a real unit needs background learning, and the safety gate still gets them."""
-        places = [a.get_location() for a in self.world.get_actors().filter(HIDER)]
-        return [c for c in cars if math.hypot(c[2], c[3]) > STOPPED or all(math.hypot(c[0] - p.x, c[1] - p.y) > HIDER_REACH for p in places)]
+        hiders = self.world.get_actors().filter(HIDER)
+        places = [a.get_location() for a in hiders]
+        footprints = [(a.get_transform(), a.bounding_box.extent) for a in hiders]
+        return [c for c in cars
+                if (math.hypot(c[2], c[3]) > STOPPED or all(math.hypot(c[0] - p.x, c[1] - p.y) > HIDER_REACH for p in places))
+                and not any(in_footprint(c[0], c[1], tf.location.x, tf.location.y, tf.rotation.yaw, e.x, e.y) for tf, e in footprints)]
 
     def clear(self):
         """Suite.clear only removes cars and people. Any containers still in the world have to go too, or they stay in the road."""

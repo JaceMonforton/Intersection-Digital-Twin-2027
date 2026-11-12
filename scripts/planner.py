@@ -6,7 +6,7 @@ car's path. It's rules, not AI, and the window says so whenever it changed the m
 
 Each tick:
   1. Every perceived car and person gets a few possible futures (Hypothesis), each with a weight: straight on; near
-     the junction a car may also turn across, and a person standing by the road may step out.
+     the junction a car may also turn across, a person standing by the road may step out, and a car ahead may brake hard.
   2. A handful of options for the ML car (OPTIONS) are rolled out along its route for HORIZON s.
   3. Each option is scored: collisions and near misses in each future, weighted; progress; comfort. The cheapest wins.
   4. Without a roadside unit to see round the corner, the car approaches the junction no faster than it could stop
@@ -22,7 +22,9 @@ import numpy as np
 
 HORIZON, STEP = 4.0, 0.2       # s rolled out, and between checks
 TARGET_HORIZON = 1.0           # s ahead that the speed handed to the controller is for, as the model's is
-ACCEL, COMFORT_BRAKE, HARD_BRAKE = 1.5, 3.0, 6.0  # m/s^2 the ML car can manage
+ACCEL, COMFORT_BRAKE, HARD_BRAKE = 1.5, 3.0, 6.0  # m/s^2 the ML car can manage; measured by training/measure_braking.py
+# The brakes take about 0.2 s to bite. Rolling that out made it clear the junction into the red-light runner more
+# often (4 collisions in 30 tune seeds against 1), so the roll-outs leave it out
 CLEAR_SPEED = 5.0              # m/s that clearing the junction aims for
 MAX_SPEED = 8.0                # m/s
 JUNCTION_REACH = 35.0          # m from the junction centre where cars may turn and people may cross
@@ -31,12 +33,14 @@ TURN_RADIUS = 11.0             # m, a car turning at this junction
 STEP_OUT_SPEED = 1.4           # m/s a person standing by the road might step out at
 STEP_OUT_REACH = 4.0           # m from the route that a standing person might step out from
 # Weights of the futures: what's most likely counts most, but a turn across or a step out still has to be planned for
-WEIGHTS = {"straight": 1.0, "turn_left": 0.5, "turn_right": 0.2, "step_out": 0.3, "standing": 1.0}
+WEIGHTS = {"straight": 1.0, "turn_left": 0.5, "turn_right": 0.2, "step_out": 0.3, "standing": 1.0, "braking": 0.3}
+LEAD_ANGLE = 45.0              # degrees: a car ahead heading within this of the ML car's way may brake hard in front of it
 # The ML car and others as two circles along their length, so a car's corner can hit and not just its centre
 CAR_CIRCLES, CAR_RADIUS = (-1.3, 1.3), 1.15
 WALKER_RADIUS = 0.4
 COLLISION_COST = 100.0         # per collision, times the future's weight, and more the sooner it is
-NEAR_MISS, NEAR_MISS_COST = 1.0, 8.0  # m of clearance under which a pass costs, per m short
+NEAR_MISS, NEAR_MISS_COST = 2.0, 8.0  # m of clearance under which a pass costs, per m short: over the suite's 1.5 m safe gap, as
+# waiting to turn at under it failed most left turns that failed
 PROGRESS_COST = 6.0            # for standing still the whole horizon, less for getting further
 COMFORT_COST = 0.15            # per (m/s^2)^2 of braking
 BLIND_APPROACH = 4.0           # m/s; with no roadside unit, no faster than this into the junction
@@ -76,6 +80,20 @@ def predicted_path(x, y, vx, vy, turning, at):
             angles)
 
 
+def is_lead(x, y, vx, vy, route):
+    """Is a car ahead of the start of the route and heading its way?"""
+    way = route[1] - route[0]
+    off = math.degrees(math.atan2(vy, vx) - math.atan2(way[1], way[0]))
+    return abs((off + 180) % 360 - 180) < LEAD_ANGLE and (x - route[0][0]) * way[0] + (y - route[0][1]) * way[1] > 0
+
+
+def braking_path(x, y, vx, vy, at):
+    """Straight on, braking at HARD_BRAKE to a stop."""
+    speed = math.hypot(vx, vy)
+    gone = np.minimum(speed * at - HARD_BRAKE * at ** 2 / 2, speed ** 2 / (2 * HARD_BRAKE))
+    return np.c_[x + vx / speed * gone, y + vy / speed * gone], np.full(len(at), math.atan2(vy, vx))
+
+
 def hypotheses(cars, walkers, junction, route):
     """The futures of every actor. cars are (x, y, vx, vy, yaw in degrees), walkers (x, y, vx, vy)."""
     at, out = times(), []
@@ -92,6 +110,8 @@ def hypotheses(cars, walkers, junction, route):
         for kind, turning in futures:
             path, yaws = predicted_path(x, y, vx, vy, turning, at)
             out.append(Hypothesis(kind, WEIGHTS[kind], path, yaws, CAR_RADIUS, CAR_CIRCLES))
+        if is_lead(x, y, vx, vy, route):
+            out.append(Hypothesis("braking", WEIGHTS["braking"], *braking_path(x, y, vx, vy, at), CAR_RADIUS, CAR_CIRCLES))
     for x, y, vx, vy in walkers:
         speed = math.hypot(vx, vy)
         if speed >= MOVING:
@@ -208,3 +228,4 @@ class Planner:
         if name == "model":
             return Plan(float(model_target), name, False, "the model's speed is clear")
         return Plan(target, name, abs(target - model_target) > 0.3, reason)
+

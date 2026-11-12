@@ -25,7 +25,9 @@ import numpy as np
 import requests
 from central_gpu_processor import ML_PAINT
 from driving_features import CROSSING_LOOK, SpeedController, encode_inputs
+from planner import INSIDE_JUNCTION
 from roadside_link import MODES, make_view
+from safety_monitor import stopping_helps
 from traffic_monitor import (
     GATE_URL,
     LOOK_AHEAD,
@@ -167,7 +169,9 @@ class ModelDriver:
             if self.last_plan.changed:
                 drive = np.array((output[0], self.last_plan.speed), dtype=np.float32)  # the model's steering, the planner's speed
         if self.monitor is not None:
-            allowed = self.monitor.check(brake_off, link_up, float(drive[1]))
+            inside = self.planner is not None and math.hypot(ego[0] - self.planner.junction[0], ego[1] - self.planner.junction[1]) < INSIDE_JUNCTION
+            conflict = stopping_helps(ego, self.lane.path_ahead(PLAN_LOOK), cars, walkers, float(drive[1]))
+            allowed = self.monitor.check(brake_off, link_up, float(drive[1]), inside, conflict)
             brake_off = allowed is not None
             if brake_off and allowed != float(drive[1]):
                 drive = np.array((drive[0], allowed), dtype=np.float32)

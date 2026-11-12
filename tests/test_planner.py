@@ -3,7 +3,16 @@ import math
 
 import numpy as np
 import pytest
-from planner import BLIND_APPROACH, Planner, hypotheses, predicted_path, times
+from planner import (
+    BLIND_APPROACH,
+    Planner,
+    along_route,
+    hypotheses,
+    predicted_path,
+    roll_out,
+    score,
+    times,
+)
 
 JUNCTION = (0.0, 0.0)
 ROUTE_EAST = [(float(x), 0.0) for x in range(60)]  # straight on along +x
@@ -73,3 +82,16 @@ def test_cars_near_the_junction_may_turn_and_people_by_the_road_may_step_out():
     assert all(len(h.path) == len(times()) for h in near)
     step = next(h for h in near if h.kind == "step_out")
     assert math.hypot(*(step.path[5] - step.path[0])) > 0.5  # it really walks towards the road
+
+
+def test_it_keeps_room_for_the_car_ahead_braking_hard():
+    lead = (12.0, 0.0, 5.0, 0.0, 0.0)  # 12 m ahead at the ML car's own speed
+    plan = far_planner().plan((0.0, 0.0, 5.0, 0.0, 0.0), ROUTE_EAST, [lead], [], 5.0)
+    assert plan.changed and plan.speed < 5.0
+    route = np.array(ROUTE_EAST)
+    kinds = [h.kind for h in hypotheses([lead, (30.0, 3.5, -5.0, 0.0, 180.0), (-12.0, 0.0, 5.0, 0.0, 0.0)], [], (500.0, 500.0), route)]
+    assert kinds.count("braking") == 1  # not the oncoming car, nor the one behind
+    xy, _ = along_route(route, roll_out(5.0, 5.0)[1])
+    assert xy[-1][0] == pytest.approx(20.0)
+    assert score(xy, np.zeros(len(xy)), [h for h in hypotheses([lead], [], (500.0, 500.0), route) if h.kind == "braking"])[2] is not None
+

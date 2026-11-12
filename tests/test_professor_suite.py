@@ -339,3 +339,15 @@ def test_only_cars_the_ml_car_could_have_avoided_count_toward_its_gap():
     assert counts_toward_gap(ego, (6.0, 0.0, 0.0, 0.0, 0.0))         # the car ahead in its own lane
     assert counts_toward_gap(ego, (6.0, 0.5, -9.0, 0.0, 180.0))      # oncoming in its path, as on a left turn
     assert counts_toward_gap(ego, (4.2, -0.5, 0.0, 9.4, 121.0))      # crossing in front
+
+
+def test_a_track_inside_a_containers_footprint_is_dropped_but_not_a_car_in_the_lane_beside_it():
+    from run_rsu_comparison import in_footprint
+
+    container = (-42.0, 54.0, 0.0, 1.3, 3.0)  # centre, yaw, and half sizes: its long side along y, as the suite places it
+    assert in_footprint(-42.3, 50.5, *container)  # where the tracker put it, however fast it said it was
+    assert not in_footprint(-45.1, 54.0, *container)  # a car in the ML car's lane, 3 m to the side
+    assert in_footprint(54.0, 42.0, 0.0, 0.0, 0.0, 1.0, 1.0) is False
+    turned = (0.0, 0.0, 90.0, 1.3, 3.0)  # turned a quarter, its long side now along x
+    assert in_footprint(3.0, 0.0, *turned) and not in_footprint(0.0, 3.0, *turned)
+
