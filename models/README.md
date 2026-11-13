@@ -39,7 +39,7 @@ README. It predicts the ML car's path, for both its line and the brake. Other ca
 
 ## `rsu_detector.onnx`
 
-Train it with `training/train_detection.py`. It saves `rsu_detector.candidate.onnx`, which nothing loads by itself, so a model only reaches the safety gate once it's been tested and renamed. `python run_simulation.py --roadside` uses the candidate directly. It hasn't been renamed, [for these reasons](../README.md#why-it-isnt-the-default), and its results are in the [main README](../README.md#roadside-detection-results).
+Train it with `training/train_detection.py`. It saves `rsu_detector.candidate.onnx`, which nothing loads by itself, so a model only reaches the safety gate once it's been tested and renamed. `python run_simulation.py --roadside` uses the candidate directly. It hasn't been renamed, [for these reasons](../README.md#why-it-isnt-the-default), and its results are in the [main README](../README.md#the-detectors).
 
 - **Input:** `float32 [1, 2, 480, 480]`: the merged sweep as a top-down grid of 0.25 m cells, covering 60 m each way from the junction centre, with rows along x and columns along y. Channel 0 is how many points landed in a cell and channel 1 is the height of the tallest, both from 0 to 1.
 - **Output:** `float32 [1, 9, 240, 240]`, at half that resolution: two heatmaps of actor centres (vehicle, then pedestrian), then at each centre its place in the cell (2), the log of its length, width and height in metres (3), and sin and cos of twice its yaw (2). Twice, because from above the front of a car looks like its back, so which way it faces has to come from its track.
