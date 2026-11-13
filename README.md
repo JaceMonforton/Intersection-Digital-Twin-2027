@@ -214,6 +214,33 @@ Six drives of 300 simulated seconds in traffic of 15 cars and 8 pedestrians, wit
 
 The target is 0.11 collisions per km, which is 1.25 times autopilot's rate in the same traffic. The one collision was an Audi hitting the ML car while it was stopped, on a drive with no left turns, where the two models behave identically. Its cause wasn't examined. Together that's 1 in 11.2 km, which is too little driving to show the target is met, and the 10-run pass test in `training/pass_test.py` hasn't been run on this model.
 
+### Defensive driving bench
+
+The three hazard scenarios (left turn across traffic, red-light runner, hidden pedestrian), each run on 50 seeds, with every seed a different situation from `scripts/scenario_variation.py`. Each config adds two layers after the model:
+
+- `scripts/planner.py` sets the speed by rolling out the model's speed and a few alternatives against predicted futures for everyone it sees. Those futures cover each car going straight or turning, the car ahead braking hard, and a person by the road stepping out. It keeps 2 m clear.
+- `scripts/safety_monitor.py` is fixed rules that can only slow the car. It stops the car when what it perceives is stale, caps its speed when the roadside link is down, and stops it when going on would hit someone who keeps their velocity.
+
+The processor runs with `--lockstep`, so the driver acts on every tick before the next one.
+
+"Avoidable" leaves out seeds where the oracle, the teaching rule driving with CARLA's true positions, crashed too. The final run used the held-back test seeds 9000–9049, once, with nothing tuned after it:
+
+| Config | Left turn | Red-light runner | Hidden pedestrian |
+| --- | :---: | :---: | :---: |
+| Oracle, collisions | 3 of 50 | 1 of 50 | 1 of 50 |
+| LiDAR + roadside, avoidable collisions | 0 of 47 | 3 of 49 | 1 of 49 |
+| Camera + roadside, avoidable collisions | 1 of 47 | 1 of 46 | 0 of 49 |
+| LiDAR only, avoidable collisions | 1 of 47 | 0 of 46 | 3 of 48 |
+
+That's 10 avoidable collisions in 428 runs, about 2 %. The 95 % range for each cell reaches 11 to 17 %, so this doesn't separate the configs. The 50 tune seeds gave 9 in 419. Left turns are the weak point: the car mostly doesn't crash on them, but it often fails to finish, passing 34 to 43 of 50 against the oracle's 42. Full tables are in [docs/results/defensive_bench_test.md](docs/results/defensive_bench_test.md) and [defensive_bench_tune.md](docs/results/defensive_bench_tune.md).
+
+Seven test runs are counted as not run because their hazard never started. In six of them, the red-light runner, the ML car was waiting at 0 m/s for a crossing car when the runner should have been launched. In the seventh, a hidden-pedestrian run, the time limit ran out first. The red-light ones fail on the same seeds across configs, so they come from the scenario setup, not from CARLA timing out. In the test runs, LiDAR only missed 1 or 2 ticks in most runs, 65 in all, against 4 for each of the others. The cause wasn't found.
+
+```
+python scripts/run_bench.py --configs oracle "lidar_and_rsu+planner+monitor" --runs 50 --speed 0 --quiet
+python scripts/run_bench.py --report      # rebuild the report from output/bench, running nothing
+```
+
 ---
 
 ## Roadside detection
@@ -579,6 +606,10 @@ scripts/
   run_rsu_comparison.py       The three-way hidden hazard comparison
   roadside_link.py            What the ML car is told: true positions, roadside tracks or own sight
   detection_features.py       The roadside detector's inputs, outputs and labels
+  run_bench.py                The many-seed bench and its report
+  scenario_variation.py       What each seed changes in a scenario
+  planner.py                  Chooses the ML car's speed from roll-outs against predicted futures
+  safety_monitor.py           The ML car's own fixed rules, which can only slow it
   ml_driver.py                Drives the ML car from the model, and its driving report
   driving_features.py         The model's inputs and outputs, and the PID controller
   model_panel.py              The window's cards, and the live values sent to it
@@ -679,7 +710,7 @@ These are the targets from the project report, against what has been measured so
 - **The roadside detector only knows one junction and one sensor layout.** It covers 60 m from the centre, it would need retraining for anything else, and it has never seen real LiDAR data. Past that reach the safety gate has no track of the ML car and doesn't protect it, and the processor logs a warning.
 - **Oncoming turners still hit the roadside car,** in 2 of 5 runs, since a turn can't be predicted before it starts. See [the comparison](#results).
 - **Pedestrians where the sensors see little are at risk.** 2 m past the stop line, where a person gets 0 to 3 LiDAR points and none were recorded, the car using roadside tracks alone hit them in 4 of 5 runs. On the marked crossing it was none in 5. That spot hasn't been retested with the car's own LiDAR added.
-- **The comparison tells the car where its containers are.** A stopped car close to one is dropped from what the car is told, because the detector calls containers cars and the car would queue behind them forever. A real unit would have to learn its background. The safety gate still receives those tracks.
+- **The comparison tells the car where its containers are.** A stopped car close to one is dropped from what the car is told, because the detector calls containers cars and the car would queue behind them forever. A real unit would have to learn its background. Any track inside a container's footprint, plus 0.5 m, is dropped too, because the tracker gives the containers jittery speeds of up to 19 m/s, and those got past the stopped-car filter and stalled the car. The safety gate still receives those tracks.
 - **The link from the roadside unit is local UDP,** with no loss handling or signing. A real one needs a V2X radio. If its tracks go stale the car brakes.
 - **The simulation is built around 10 Hz.** The models, the speed controller and the LiDAR sweeps all assume a 0.1 s tick, so a faster tick isn't a one-line change, and every result here would need measuring again.
 - **The five tests can run well below 10 Hz.** `--roadside --lidar-view` runs held about 2 to 3 ticks per second. The LiDAR feed costs about 2%, so it isn't the cause, and the ML car window's cameras are the main suspect, but that hasn't been measured. Other setups haven't been timed during the tests.
