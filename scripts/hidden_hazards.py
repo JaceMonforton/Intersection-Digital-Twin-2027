@@ -1,44 +1,26 @@
 """
-Does the roadside unit help? Runs the same hidden hazards with three versions of the ML car, and compares them.
+The hidden hazards, each hidden from the ML car by two stacked shipping containers until late (a LiDAR sees legs and
+wheels under a lorry, so a lorry doesn't hide anything):
 
-    truth   told about every actor by CARLA: the best the roadside unit could possibly do
-    rsu     told what the roadside unit's detector found and what its own roof LiDAR hits, with the safety gate on the detector
-    sight   knows only what a LiDAR on its own roof hits, with no roadside unit and so no safety gate
+    run_runner      a speeding car from behind a truck runs its red light (the suite's test_blind_corner)
+    run_pedestrian  a person steps out from behind the containers onto the marked crossing
+    run_turner      an oncoming car turns left across the ML car, hidden by the containers (for training/record_hazards.py)
 
-The hazards, each hidden from the car by two stacked shipping containers until late (LiDAR sees legs under a lorry):
-
-    runner      a speeding car from behind the containers runs its red light (the suite's test 3)
-    pedestrian  a person steps out from behind the containers onto the marked crossing
-    turner      an oncoming car turns left across the ML car, hidden by the containers
-    clear       the same containers but no hazard, to catch stops for nothing
-
-Needs CARLA and the Docker stack running, with the entities provisioned. It starts and stops the processor itself,
-so nothing else may be using CARLA. Results go to output/rsu_comparison.json and .md, and each version's tick by tick
-telemetry to output/rsu_telemetry_<version>.csv.
-    python scripts/run_rsu_comparison.py --model models/rsu_detector.candidate.onnx --repeat 5
+HiddenHazards extends the suite with these, and with what the car is told about the containers themselves.
+start_processor and stop_processor run central_gpu_processor.py for one config. run_bench.py uses all of this.
 """
-import argparse
-import json
 import math
 import os
-import shutil
 import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-from roadside_link import MODES
-from run_professor_test_suite import (
+from scenario_suite import (
     APPROACH,
-    CARLA_HOST,
-    CARLA_PORT,
-    OUTPUT_DIR,
     T3_LEAD,
-    Console,
-    Policy,
     Suite,
     along_and_across,
     follow_path,
@@ -54,7 +36,6 @@ from study_names import processor_args
 from waymo_predictor_node import LEFT, STRAIGHT, yaw_difference
 
 ROOT = Path(__file__).resolve().parent.parent
-SCENARIOS = ("runner", "pedestrian", "turner", "clear")
 PROCESSOR_TIMEOUT = 180.0
 # Shipping containers, solid to the ground, as a lorry or a bus stands high on its wheels and a LiDAR sees a person's legs underneath
 HIDER = "static.prop.container"
@@ -81,29 +62,6 @@ def gap_to_person(ego, x, y):
     return max(abs(ahead) - HALF_LENGTH, abs(side) - HALF_WIDTH, 0.0)
 
 
-def summarise(runs):
-    """Totals for one version on one scenario, from its runs."""
-    gaps = [r["closest_m"] for r in runs if r["closest_m"] is not None]
-    return {"runs": len(runs), "ran": sum(r["ran"] for r in runs), "collisions": sum(bool(r["collided"]) for r in runs),
-            "closest_mean_m": round(float(np.mean(gaps)), 2) if gaps else None,
-            "closest_worst_m": round(float(np.min(gaps)), 2) if gaps else None,
-            "gate_brakes": sum(r["gate_brakes"] for r in runs), "stopped": sum(bool(r["stopped"]) for r in runs),
-            "seconds_mean": round(float(np.mean([r["seconds"] for r in runs])), 1) if runs else None}
-
-
-def report_rows(results):
-    """Markdown table rows, a row for each scenario and version."""
-    rows = ["| Hazard | Version | Ran | Collisions | Closest (mean) | Closest (worst) | Safety brakes | Stopped |",
-            "| ------ | ------- | --- | ---------- | -------------- | --------------- | ------------- | ------- |"]
-    for scenario, versions in results.items():
-        for mode, runs in versions.items():
-            s = summarise(runs)
-            closest = "n/a" if s["closest_mean_m"] is None else f"{s['closest_mean_m']:.2f} m"
-            worst = "n/a" if s["closest_worst_m"] is None else f"{s['closest_worst_m']:.2f} m"
-            rows.append(f"| {scenario} | {mode} | {s['ran']} of {s['runs']} | {s['collisions']} | {closest} | {worst} | {s['gate_brakes']} | {s['stopped']} |")
-    return rows
-
-
 def in_footprint(x, y, cx, cy, yaw, half_x, half_y, margin=HIDER_MARGIN):
     """Is (x, y) within margin of a box centred on (cx, cy), yaw degrees, half_x by half_y along its own axes?"""
     c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
@@ -111,7 +69,7 @@ def in_footprint(x, y, cx, cy, yaw, half_x, half_y, margin=HIDER_MARGIN):
     return abs(c * dx + s * dy) <= half_x + margin and abs(-s * dx + c * dy) <= half_y + margin
 
 
-class Comparison(Suite):
+class HiddenHazards(Suite):
     def believed(self, cars):
         """The detector reports a container as a parked car, which would slow only that version, so it's left out of what the
         driver is told, as a fixed roadside unit would learn its static background.
@@ -297,22 +255,6 @@ class Comparison(Suite):
         gap = result.hazard_gap if result.hazard_gap is not None else math.inf
         return result, gap, result.brake_at is not None or bool(result.stopping_margin), gap != math.inf
 
-    def scenario(self, name, lead):
-        try:
-            if name == "runner":
-                result, closest, stopped, ran = self.run_runner(lead)
-            elif name == "pedestrian":
-                result, closest, stopped, ran = self.run_pedestrian(lead)
-            elif name == "turner":
-                result, closest, stopped, ran = self.run_turner(lead)
-            else:
-                result, closest, stopped, ran = self.run_pedestrian(lead, launch=False)
-        except RuntimeError as error:
-            self.console.line("ALERT", f"{name} couldn't run: {error}")
-            return {"ran": False, "collided": 0, "closest_m": None, "gate_brakes": 0, "stopped": False, "seconds": 0.0, "error": str(error)}
-        return {"ran": bool(ran), "lead": lead, "collided": len(result.collisions), "closest_m": None if math.isinf(closest) else round(float(closest), 2),
-                "gate_brakes": result.brake_events, "stopped": bool(stopped), "seconds": result.duration, "collisions": result.collisions}
-
 
 def start_processor(mode, model, log_path, view=False, extra=()):
     log = open(log_path, "w", encoding="utf-8", errors="replace")  # noqa: SIM115
@@ -336,57 +278,3 @@ def stop_processor(process, log):
     log.close()
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default=str(ROOT / "models" / "rsu_detector.candidate.onnx"))
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=["truth", "rsu", "sight"], help="camera is compared in scripts/run_study.py")
-    parser.add_argument("--quiet", action="store_true")
-    args = parser.parse_args()
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    results_path = OUTPUT_DIR / "rsu_comparison.json"
-    if len(args.modes) > 1:
-        # Each version gets its own process, as a Traffic Manager doesn't survive being reused after its processor changes
-        results_path.unlink(missing_ok=True)
-        rest = [a for a in sys.argv[1:] if a not in args.modes and a != "--modes"]
-        return max(subprocess.call([sys.executable, "-u", __file__, *rest, "--modes", mode], cwd=ROOT) for mode in args.modes)
-
-    import carla
-
-    console = Console(args.quiet)
-    earlier = json.loads(results_path.read_text(encoding="utf-8"))["runs"] if results_path.exists() else {}
-    results = {name: earlier.get(name, {}) for name in args.scenarios}  # the other versions' runs, measured separately
-    for mode in args.modes:
-        console.line("SCENARIO", f"=== Version: {mode} ===")
-        process, log = start_processor(mode, args.model, OUTPUT_DIR / f"rsu_processor_{mode}.log")
-        try:
-            client = carla.Client(CARLA_HOST, CARLA_PORT)
-            client.set_timeout(30.0)
-            suite = Comparison(carla, client, Policy(), console, seed=1, perception=mode)
-            try:
-                for name in args.scenarios:
-                    runs = []
-                    for repeat in range(args.repeat):
-                        run = suite.scenario(name, LEADS[repeat % len(LEADS)])
-                        console.line("SCENARIO", f"{mode} {name} {repeat + 1}/{args.repeat}: {run}")
-                        runs.append(run)
-                    results[name][mode] = runs
-            finally:
-                suite.close()
-            shutil.copy(OUTPUT_DIR / "live_telemetry.csv", OUTPUT_DIR / f"rsu_telemetry_{mode}.csv")
-        finally:
-            stop_processor(process, log)
-        time.sleep(3.0)
-        results_path.write_text(json.dumps({"generated": datetime.now(timezone.utc).isoformat(), "model": args.model, "repeat": args.repeat,
-                                                                    "summary": {n: {m: summarise(r) for m, r in v.items()} for n, v in results.items()},
-                                                                    "runs": results}, indent=2), encoding="utf-8")
-    rows = report_rows(results)
-    (OUTPUT_DIR / "rsu_comparison.md").write_text("\n".join(["# Roadside unit comparison", "", f"{args.repeat} runs of each. Every figure is measured.", "", *rows, ""]), encoding="utf-8")
-    console.plain("\n" + "\n".join(rows) + "\n")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

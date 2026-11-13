@@ -1,47 +1,22 @@
 """
-The comparative study's configs, scenarios and windows, shared by run_simulation.py, the test suite and run_study.py.
-No imports beyond the standard library, so the launcher can check its flags before it starts anything.
+The configs and their windows, shared by run_simulation.py, run_bench.py and the suite. No imports beyond the
+standard library, so the launcher can check its flags before it starts anything.
 
     lidar_and_rsu   the car's own roof LiDAR detector, fused with the roadside LiDAR detector's tracks (perception fused)
     camera_and_rsu  the car's own roof LiDAR detector, fused with the roadside camera detector's   (perception fused_camera)
     lidar_only      only the car's own roof LiDAR detector, with no roadside unit                   (perception onboard)
 
-Every config perceives with trained detectors, as a real car would; see onboard_perception.py. The older modes, where
-the car's own LiDAR only filtered CARLA's true positions (rsu, camera, sight), are still there by name for comparison.
+Every config perceives with trained detectors, as a real car would (see onboard_perception.py), and drives with the
+planner and the car's own safety monitor.
 """
 CONFIGS = {"lidar_and_rsu": "fused", "camera_and_rsu": "fused_camera", "lidar_only": "onboard"}
-CONFIG_HELP = {
-    "lidar_and_rsu": "the car's own roof LiDAR detector fused with the roadside LiDAR detector's tracks, with the safety gate on the roadside detector",
-    "camera_and_rsu": "the car's own roof LiDAR detector fused with the roadside camera detector's tracks, with the gate on the cameras",
-    "lidar_only": "only the car's own roof LiDAR detector: no roadside unit, so no safety gate",
-}
-SUITE_TESTS = {"traffic_light": 1, "left_turn": 2, "blind_corner": 3, "cut_in": 4, "yellow_light": 5}
-# red_light_runner is blind_corner's speeding car with its timing varied between repeats, as run_rsu_comparison.py runs it
-HAZARDS = ("red_light_runner", "hidden_pedestrian", "oncoming_turner", "clear_road")
-SCENARIOS = (*SUITE_TESTS, *HAZARDS)
 # The window that goes with each config, besides the ML car's own split screen
-VIEWS = {"rsu": ["scripts/lidar_view.py"], "camera": ["scripts/rsu_camera_view.py"], "sight": ["scripts/lidar_view.py", "--feed", "roof"],
-         "fused": ["scripts/lidar_view.py"], "fused_camera": ["scripts/rsu_camera_view.py"]}
-# shortcut: onboard has no window yet, since the roof window reads the semantic LiDAR's format; add one for the detector's sweeps
+# shortcut: lidar_only has no window yet; add one that reads the roof detector's sweeps
+VIEWS = {"fused": ["scripts/lidar_view.py"], "fused_camera": ["scripts/rsu_camera_view.py"]}
 
 
 def processor_args(perception, model, view=True):
-    """central_gpu_processor.py's arguments for a config. The safety gate runs on what the config's roadside unit sees,
-    and in sight, where there's no roadside unit, on ground truth, which that car ignores."""
-    lidar, camera = ["--detector", "onnx", "--model", str(model)], ["--detector", "camera"]
-    detector = {"rsu": lidar, "fused": lidar, "camera": camera, "fused_camera": camera}.get(perception, ["--detector", "groundtruth"])
-    return [*detector, *(["--lidar-view"] if view and perception in ("rsu", "camera", "fused", "fused_camera") else [])]
-
-
-def add_config_flags(parser):
-    """The configs as flags that each set perception. Returns the group, so other ways of setting it can join it."""
-    group = parser.add_mutually_exclusive_group()
-    for flag, mode in CONFIGS.items():
-        group.add_argument(f"--{flag}", dest="perception", action="store_const", const=mode, help=CONFIG_HELP[flag])
-    return group
-
-
-def scenarios_from(names):
-    """--scenario's names, with all expanded, in the study's order and without repeats."""
-    chosen = set(SCENARIOS if "all" in names else names)
-    return [name for name in SCENARIOS if name in chosen]
+    """central_gpu_processor.py's arguments for a config. The safety gate runs on what the config's roadside unit
+    sees, and with no roadside unit on ground truth, which that car ignores."""
+    detector = {"fused": ["--detector", "onnx", "--model", str(model)], "fused_camera": ["--detector", "camera"]}
+    return [*detector.get(perception, ["--detector", "groundtruth"]), *(["--lidar-view"] if view and perception in VIEWS else [])]

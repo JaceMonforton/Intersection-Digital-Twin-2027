@@ -1,4 +1,4 @@
-"""Scoring and reporting of the five-test suite. No CARLA needed."""
+"""Scoring and the live console of the scenario suite. No CARLA needed."""
 import io
 import math
 import os
@@ -9,7 +9,7 @@ import pytest
 
 pytest.importorskip("paho")
 
-from run_professor_test_suite import (
+from scenario_suite import (
     T2_FIRST_WAVE,
     T2_GAP,
     T2_HEADWAY,
@@ -22,23 +22,17 @@ from run_professor_test_suite import (
     counts_toward_gap,
     follow_path,
     grade_blind_corner,
-    grade_cut_in,
     grade_left_turn,
     grade_light_change,
-    grade_lights,
     latency_ms,
     launch_now,
     live_table,
-    matrix_rows,
     next_car_text,
     paths_cross,
-    results_table,
-    round_rows,
     shown,
     stopping_distance,
     straight_back,
     traffic_schedule,
-    write_summary,
     yaw_class,
 )
 from waymo_predictor_node import LEFT, STRAIGHT
@@ -46,22 +40,6 @@ from waymo_predictor_node import LEFT, STRAIGHT
 
 def result(**fields):
     return StageResult(1, "A test", **fields)
-
-
-def test_a_clean_stop_passes():
-    assert grade_lights(result(stopping_margin=3.0), True, True, True, True).passed
-
-
-@pytest.mark.parametrize("fields, flags", (
-    ({"stopping_margin": -1.0}, (True, True, True, True)),  # past the line
-    ({"stopping_margin": None}, (False, False, False, False)),  # never stopped
-    ({"stopping_margin": 3.0, "red_light_violations": 1}, (True, True, True, True)),
-    ({"stopping_margin": 3.0, "collisions": [{"t": 1}]}, (True, True, True, True)),
-    ({"stopping_margin": 3.0}, (True, True, False, True)),  # didn't go on green
-    ({"stopping_margin": 3.0}, (True, True, True, False)),  # never got back up to speed
-))
-def test_any_failure_fails_the_light_test(fields, flags):
-    assert not grade_lights(result(**fields), *flags).passed
 
 
 def _turn(**fields):
@@ -129,12 +107,6 @@ def test_the_blind_corner_needs_the_gate_mqtt_a_stop_and_no_crash():
     assert not grade_blind_corner(result(brake_at=2.0, collisions=[{"t": 1}]), True, True).passed
 
 
-def test_a_cut_in_that_never_happened_cant_pass():
-    assert grade_cut_in(result(), True).passed
-    assert not grade_cut_in(result(), False).passed
-    assert not grade_cut_in(result(worst_off_lane=1.5), True).passed
-
-
 def test_no_checks_means_no_pass():
     assert not StageResult(1, "Couldn't run").passed
 
@@ -164,41 +136,6 @@ def test_directions(yaw, kind):
 def _record(passed=True):
     return {"test": 1, "name": "A test", "passed": passed, "duration": 12.0, "collisions": [], "red_light_violations": 0, "stopping_margin": 2.5,
             "min_gap": None, "mqtt_latency_ms": None, "gate_poll_ms": 12.0, "checks": {"no_collision": passed}, "notes": []}
-
-
-def test_the_matrix_shows_failures_and_missing_values_plainly():
-    row = matrix_rows([_record(False)])[0]
-    assert "**FAIL**" in row
-    assert "2.50 m" in row
-    assert "n/a" in row
-
-
-def test_a_round_only_meets_the_target_under_the_limit():
-    rounds = {"Good": {"km": 5.0, "collisions_per_km": 0.1, "red_lights_per_km": 0.0},
-              "Bad": {"km": 5.0, "collisions_per_km": 0.5, "red_lights_per_km": 0.0},
-              "Unmeasured": {}}
-    rows = round_rows(rounds)
-    assert rows[0].endswith("| yes |")
-    assert rows[1].endswith("| no |")
-    assert rows[2].endswith("| no |")
-
-
-def test_the_summary_compares_smoothness_when_it_has_it(tmp_path):
-    path = tmp_path / "summary.md"
-    write_summary(path, [_record()], {}, "a note", {"model": {"jerk_p95": 8.0}, "autopilot": {"jerk_p95": 68.0}})
-    text = path.read_text(encoding="utf-8")
-    assert "Jerk, 95th percentile" in text
-    assert "8.000" in text
-    assert "too little driving to show the target is met" in text
-
-
-def test_the_summary_counts_passes_and_names_what_failed(tmp_path):
-    path = tmp_path / "summary.md"
-    write_summary(path, [_record(True), {**_record(False), "test": 2}], {}, "a note")
-    text = path.read_text(encoding="utf-8")
-    assert "1 of 2 passed" in text
-    assert "failed: no collision" in text
-    assert "isn't AI" in text
 
 
 class Lane:
@@ -311,13 +248,6 @@ def test_the_live_table_lines_up_and_shows_missing_values():
     assert "n/a km/h" in rows[3]
 
 
-def test_the_results_table_has_one_row_per_test():
-    rows = results_table([_record(True), {**_record(False), "test": 2, "name": "A longer name"}])
-    assert len({len(row) for row in rows}) == 1
-    assert len(rows) == 6
-    assert "PASS" in rows[3] and "FAIL" in rows[4]
-
-
 def test_the_set_off_note_says_when_no_car_was_due():
     assert next_car_text(math.inf) == "no car due"
     assert next_car_text(None) == "no car due"
@@ -342,7 +272,7 @@ def test_only_cars_the_ml_car_could_have_avoided_count_toward_its_gap():
 
 
 def test_a_track_inside_a_containers_footprint_is_dropped_but_not_a_car_in_the_lane_beside_it():
-    from run_rsu_comparison import in_footprint
+    from hidden_hazards import in_footprint
 
     container = (-42.0, 54.0, 0.0, 1.3, 3.0)  # centre, yaw, and half sizes: its long side along y, as the suite places it
     assert in_footprint(-42.3, 50.5, *container)  # where the tracker put it, however fast it said it was

@@ -69,45 +69,39 @@ The detectors run on the GPU when `onnxruntime-gpu` with cuDNN 9 is installed, a
 python run_simulation.py
 ```
 
-This starts whatever isn't already running (Docker, the Ditto stack, CARLA), runs the three hazard scenarios on each of the three configs in turn with 15 background cars, writes the results, then shuts down only what it started. It starts and stops the processor once per config, and opens the ML car's window and that config's sensor window. A first CARLA launch can take several minutes.
+This starts whatever isn't already running (Docker, the Ditto stack, CARLA), runs every config once on every scenario, writes the results, then shuts down only what it started. Each run opens the ML car's window and its config's sensor window. A first CARLA launch can take several minutes.
 
 **Only run one copy at a time.** A second one on the same CARLA disturbs the first, because it re-provisions the twins and changes the world's settings.
 
 | Scenario | What happens | Passes with |
 | -------- | ------------ | ----------- |
-| `left_turn` | The ML car turns left across oncoming traffic | The turn finished with no collision |
-| `red_light_runner` | A speeding car, hidden behind a truck, runs its red light across the ML car's path | No collision, and the car stopped in time |
+| `left_turn` | The ML car turns left across oncoming traffic | The turn finished with no collision, at least 1.5 m from other cars |
+| `red_light_runner` | A speeding car, hidden behind a truck, runs its red light across the ML car's path | No collision |
 | `hidden_pedestrian` | A person steps out from behind stacked shipping containers | No collision |
 
+Choose with tags. Giving no config runs all three, and the same for scenarios:
+
 ```powershell
-python run_simulation.py --planner                  # the same, with the planner choosing the ML car's speed
-python run_simulation.py --lidar_only               # one config
-python run_simulation.py --camera_and_rsu --scenario hidden_pedestrian
-python run_simulation.py --lidar_and_rsu --scenario all    # every scenario, the five tests included, on one config
-python run_simulation.py --run_study_matrix --traffic 0 15 --repeat 5   # the whole comparative study, for hours
-python run_simulation.py --free-drive               # normal driving in traffic, on CARLA's true positions
+python run_simulation.py --lidar_only                       # one config, every scenario
+python run_simulation.py --left_turn --hidden_pedestrian    # every config, two scenarios
+python run_simulation.py --camera_and_rsu --red_light_runner
 ```
 
 | Option | What it does |
 | ------ | ------------ |
-| `--lidar_and_rsu`, `--camera_and_rsu`, `--lidar_only` | Runs only that [config](#perception-configs) |
-| `--scenario ...` | Runs these by name instead: the three above, the five tests (`traffic_light`, `left_turn`, `blind_corner`, `cut_in`, `yellow_light`), `oncoming_turner` or `clear_road`, or `all` |
-| `--planner` | The [planner](#how-the-ml-car-drives) chooses the ML car's speed. Only with the default run or `--run_study_matrix` |
-| `--run_study_matrix` | Every scenario on every config, at each `--traffic` load, `--repeat` times |
-| `--traffic 0 15`, `--repeat 5` | Background cars, and runs of each scenario |
-| `--free-drive` | Normal driving in traffic instead. `--seconds` sets how long (300 simulated seconds by default, 0 until Ctrl+C), and `--traffic` and `--walkers` the traffic (15 and 8) |
+| `--lidar_and_rsu`, `--camera_and_rsu`, `--lidar_only` | Run these [configs](#perception-configs) |
+| `--left_turn`, `--red_light_runner`, `--hidden_pedestrian` | Run these scenarios |
+| `--seed 3` | Which seeded situation each scenario gets, from the tune split; 0, the first, by default |
 | `--quiet` | Leaves out the live table of values |
-| `--no-view` | Doesn't open the windows, which is quicker |
-| `--seed 1` | Spawns traffic the same way each run |
+| `--no-view` | Doesn't open the windows |
 | `--leave-running` | Keeps CARLA and Docker up, for faster repeat runs |
 | `--carla-exe <path>` | Points at `CarlaUE4.exe`, if it isn't found automatically. Setting `CARLA_EXE` does the same |
 
-The study writes its runs to `output/comparative_study_runs.json` and its report to `output/comparative_study_report.csv` and `_summary.md`. Logs go to `output/logs/`.
+It runs `scripts/run_bench.py` with one seed of each scenario, in real time. The runs and a report go to `output/run`, replaced each time. To measure rather than watch, run [the bench](#defensive-driving-bench) itself on many seeds.
 
 While a scenario runs, the terminal shows events as they happen above one table of live values:
 
 ```text
-[SCENARIO] === [TEST 2/5] UNPROTECTED LEFT TURN & GAP ACCEPTANCE ===
 +-------------------------------------------------------------+
 | [TEST 2/5] UNPROTECTED LEFT TURN & GAP ACCEPTANCE   t=3.6 s |
 +-------------------------------------------------------------+
@@ -118,23 +112,6 @@ While a scenario runs, the terminal shows events as they happen above one table 
 | Brake pedal              0 % | Closest car            n/a m |
 | Off lane              0.49 m | MQTT               connected |
 +-------------------------------------------------------------+
-```
-
-### The five tests
-
-The suite in `scripts/run_professor_test_suite.py` also has five fixed tests, run with `--scenario` or directly with the simulation already up. `--repeat` saves to `output/repeat_results.json` instead of the reports.
-
-| Test | What must happen |
-| ---- | ---------------- |
-| 1. Traffic light | Stops before a red line, waits, pulls away on green and gets back up to speed |
-| 2. Left turn across traffic | Pulls into the junction, gives way to oncoming cars, and finishes the turn in a gap with no collision, at least 1.5 m from other cars |
-| 3. Blind corner | A speeding car from behind a truck runs its red light; the car stops with no collision, and the safety gate's brake reaches MQTT |
-| 4. Cut-in | A car moves into the ML car's lane and slows; no collision and no leaving the lane |
-| 5. Light change during a left turn | While the car waits inside the junction the light goes yellow; it finishes the turn once no oncoming car is still coming |
-
-```powershell
-python scripts/run_professor_test_suite.py --only 2
-python scripts/run_professor_test_suite.py --only 2 5 --repeat 20 --seed 500
 ```
 
 <details>
@@ -161,18 +138,11 @@ python scripts/central_gpu_processor.py
 python scripts/physical_ml_subscriber.py --driver sim
 ```
 
-**4. Start the predictor, the traffic and the windows.** Traffic needs `--asynch`, so that it follows the processor's clock. `lidar_view.py` and `rsu_camera_view.py` show the roadside sensors, with a processor started with `--lidar-view`.
+**4. Start the predictor and the windows.** `lidar_view.py` and `rsu_camera_view.py` show the roadside sensors, with a processor started with `--lidar-view`.
 
 ```powershell
 python scripts/waymo_predictor_node.py
-python scripts/test_traffic.py --asynch --near-view --safe -n 15 -w 8 --tm-port 8000 --car-lights-on
 python scripts/ml_car_view.py
-```
-
-**5. Let the model drive the ML car** in traffic, with its report at the end. Unlike the scenarios, this driver obeys the safety gate. `--perception` chooses what it's told: `truth` by default, or `rsu`, `onboard`, `fused` or `fused_camera`, each needing the processor's matching detector.
-
-```powershell
-python scripts/ml_driver.py --perception rsu
 ```
 
 **To mirror your own vehicles instead,** start an agent for each Thing. Each one opens a chase-camera window and spawns a CARLA vehicle named after the Thing, which is how the processor recognises it. These twins hold still while the brake is on, and `human_vehicle` has no safety gate.
@@ -258,14 +228,12 @@ flowchart LR
     S -->|"Ditto and MQTT"| B["Safety gate"]
 ```
 
-Older modes are still there by name for comparison: `truth` (CARLA's true positions, used by `--free-drive` and the [five tests' results](#the-five-tests-on-true-positions)), and `rsu`, `camera` and `sight`, where the car's own LiDAR only filtered the true positions.
-
 ### How the ML car drives
 
 Each tick goes through four layers, and only the first is a trained model:
 
 1. **The driving model** takes 76 numbers: its speed, route, any stop line that isn't green, the road ahead, nearby cars and pedestrians, and on a left turn, the time-to-collision with the first car due to reach its route. It outputs steering and a target speed 1 s ahead.
-2. **The planner** (`scripts/planner.py`, with `--planner`) can lower that speed. It rolls out the model's speed and a few alternatives (ease off, stop, hard stop, and inside the junction, clear it) for 4 s against predicted futures for everyone it sees. Those futures are each car going straight or turning, the car ahead braking hard, and a person by the road stepping out. It scores collisions, coming within 2 m, progress and comfort. It only clears the junction as an escape, never over the model's choice to wait.
+2. **The planner** (`scripts/planner.py`) can lower that speed. It rolls out the model's speed and a few alternatives (ease off, stop, hard stop, and inside the junction, clear it) for 4 s against predicted futures for everyone it sees. Those futures are each car going straight or turning, the car ahead braking hard, and a person by the road stepping out. It scores collisions, coming within 2 m, progress and comfort. It only clears the junction as an escape, never over the model's choice to wait.
 3. **The safety monitor** (`scripts/safety_monitor.py`) is a few fixed rules that can only slow the car. It holds the car stopped when what it perceives is stale, caps its speed when the roadside link is down, and stops it when going on would hit someone keeping their velocity and stopping now wouldn't.
 4. **A fixed PID controller,** which isn't AI, turns the speed into pedals, and the car moves with real CARLA physics.
 
@@ -325,7 +293,7 @@ It reads the sweeps through shared memory, so it can't hold up the clock, and th
 <summary><b>Repository layout</b></summary>
 
 ```
-run_simulation.py    Starts everything and runs the study, a scenario, or normal driving
+run_simulation.py    Starts everything and runs the chosen configs on the chosen scenarios
 docker/              Ditto stack: docker-compose.yml, mosquitto.conf, nginx.conf
 config/              Ditto policies, Things and connections, and the CARLA 0.9.16 client
 models/              Where trained models go, and the contract they must meet
@@ -350,37 +318,33 @@ training/
   make_charts.py              Draws this page's charts from docs/results
   convert_waymo.py, train_trajectory.py    Trains the trajectory model
 scripts/
-  run_study.py                The comparative study: every scenario on every config
-  run_bench.py                The many-seed bench and its report
-  scenario_variation.py       What each seed changes in a scenario
-  study_names.py              The configs, scenarios and windows, shared by the launcher and the study
-  run_professor_test_suite.py The scenarios and five tests, and their reports
-  run_rsu_comparison.py       The hidden hazards behind containers, which the suite reuses
+  run_bench.py                Runs the configs on seeded scenarios, and the report
+  scenario_variation.py       What each seed changes in a scenario, and the seed splits
+  study_names.py              The configs and their windows, shared by the launcher and the bench
+  scenario_suite.py           Places the ML car, runs a stage tick by tick and scores it; the left turn and red-light runner
+  hidden_hazards.py           The hazards hidden behind containers, and starting the processor for a config
   roadside_link.py            What the ML car is told, and the link from the roadside unit
   onboard_perception.py       The car's own roof LiDAR detector, and its fusion with the roadside unit
   roof_features.py            The roof detector's inputs and frame
   detection_features.py       The roadside LiDAR detector's inputs, outputs and labels
   camera_features.py          The roadside camera detector's inputs, outputs and geometry
-  ml_driver.py                Drives the ML car from the model, and its driving report
-  driving_features.py         The model's inputs and outputs, and the PID controller
+  ml_driver.py                Drives the ML car from the model
+  driving_features.py         The model's inputs and outputs, the PID controller, and car outlines
   planner.py                  Chooses the ML car's speed from roll-outs against predicted futures
   safety_monitor.py           The ML car's own fixed rules, which can only slow it
   model_panel.py              The window's cards, and the live values sent to it
   central_gpu_processor.py    Simulation clock, roadside sensors and detectors, metrics, brake trigger
   waymo_predictor_node.py     History buffer, 3 s path prediction, drawn lines
   physical_ml_subscriber.py   Safety gate that cuts the motors (runs on the vehicle)
-  traffic_monitor.py          The ML car in normal traffic, its lane and route logic, and the traffic report
+  traffic_monitor.py          The ML car in normal traffic, for the training recordings and the pass test
   ml_car_view.py              Split-screen window following the ML car
   lidar_view.py               Top-down window of what the roadside LiDARs see
   rsu_camera_view.py          Window of the two roadside cameras and their detector's boxes
-  traffic_left_turn.py, left_turn_scenario.py   Early scripted left turns that tested the brake alone
   setup_entities.py           Provisions Ditto from config/
-  ditto_carla_agent.py        Mirrors one Thing into CARLA, with a chase camera
-  test_carla_connection.py    CARLA connection check
+  ditto_carla_agent.py        Mirrors one Thing into CARLA, with a chase camera, for physical vehicles
   test_traffic.py             Spawns the autopilot cars and pedestrians
 tests/               Unit tests and the end-to-end latency benchmark
 hardware/            KUKSA to Ditto publisher, for physical vehicles
-bridge/              Older standalone Ditto to CARLA sync
 docs/images/         The pictures on this page
 docs/results/        The measurements behind the results on this page
 ```
@@ -423,7 +387,7 @@ Every result is scored from CARLA's true positions on what was measured, with no
 
 ### Defensive driving bench
 
-The current measurement. `scripts/run_bench.py` runs the three scenarios on 50 seeds each, every seed a different situation from `scripts/scenario_variation.py`, with the [planner and safety monitor](#how-the-ml-car-drives) on each config. "Avoidable" leaves out seeds where the oracle, the hazard rule of `training/record_hazards.py` driving with CARLA's true positions, crashed too.
+`scripts/run_bench.py` runs the three scenarios on 50 seeds each, every seed a different situation from `scripts/scenario_variation.py`, with the [planner and safety monitor](#how-the-ml-car-drives) on each config. "Avoidable" leaves out seeds where the oracle, the hazard rule of `training/record_hazards.py` driving with CARLA's true positions, crashed too.
 
 The final run used the held-back test seeds 9000–9049, once, with nothing tuned after it:
 
@@ -441,18 +405,6 @@ The final run used the held-back test seeds 9000–9049, once, with nothing tune
 - **`lidar_only` missed ticks.** It missed 1 or 2 in most test runs, 65 in all, against 4 for each of the others. The cause wasn't found.
 
 Full tables: [test seeds](docs/results/defensive_bench_test.md) and [tune seeds](docs/results/defensive_bench_tune.md).
-
-### Comparative study, before the planner
-
-`python run_simulation.py --run_study_matrix` ran all nine scenarios (the five tests, the red-light runner, the hidden pedestrian, an oncoming turner and a clear road) 5 times on each config, with 0 and then 15 background cars: 270 runs, with the model alone choosing the speed. Each config is scored out of 100 with weights fixed before any results were seen: 50 for no collision, 30 for passing, 10 for no false alarm and 10 for TTC margin.
-
-| Config | Score | Collision rate | Pass rate | False alarms per run |
-| ------ | :---: | :---: | :---: | :---: |
-| `lidar_and_rsu` | **76.2** | 10.1 % | 75.3 % | 0.16 |
-| `camera_and_rsu` | 73.3 | 13.5 % | 75.3 % | 0.26 |
-| `lidar_only` | 55.5 | 38.9 % | 50.0 % | 0.00 |
-
-The hidden hazards are where the configs differ. With no traffic, `lidar_only` hit the blind-corner runner and the hidden pedestrian in all 5 runs, and `camera_and_rsu` still hit the pedestrian in all 5, while `lidar_and_rsu` avoided the runner every time and hit the pedestrian in 2. It's 5 runs per cell, with fixed timings, so these rates are rough, and they aren't directly comparable with the bench's seeded situations. Full tables: [docs/results/comparative_study_summary.md](docs/results/comparative_study_summary.md).
 
 ### The detectors
 
@@ -484,29 +436,15 @@ Of those false pedestrian tracks, 60% are within 3 m of a real actor. Pedestrian
 
 #### Why it isn't the default
 
-The roadside LiDAR detector keeps the name `rsu_detector.candidate.onnx`, which only the configs load. Renaming it to `rsu_detector.onnx` would put the safety gate on it in every run, `--free-drive` included, where the car is on true positions: a combination that hasn't been measured. Its targets were also narrowly missed, and in the earlier comparison it didn't beat the car's own sight against an oncoming turner. To adopt it anyway:
+The roadside LiDAR detector keeps the name `rsu_detector.candidate.onnx`, which only the configs load. Renaming it to `rsu_detector.onnx` would make the processor load it by default, putting the safety gate on it in every run, the training recordings on true positions included: a combination that hasn't been measured. Its targets were also narrowly missed, and in the earlier comparison it didn't beat the car's own sight against an oncoming turner. To adopt it anyway:
 
 ```powershell
 copy models\rsu_detector.candidate.onnx models\rsu_detector.onnx
 ```
 
-### The five tests on true positions
-
-With CARLA's true positions, before the three configs were added, and not rerun since:
-
-| Test | Runs passed | Closest gap, final run |
-| ---- | :---: | :---: |
-| 1. Traffic light | 5 of 5 | n/a |
-| 2. Left turn across traffic | 20 of 20 | 3.70 m |
-| 3. Blind corner | 5 of 5 | 8.78 m |
-| 4. Cut-in | 5 of 5 | 3.55 m |
-| 5. Light change during a left turn | 20 of 20 | 3.64 m |
-
-A harder set of left turns, with gaps close to the safe limit, passed 40 of 40 with no collisions, and a closest approach of 3.54 m. 60 of 60 still allows a failure rate of up to about 1 in 20 (95% confidence), all on one approach to one junction with oncoming cars scripted at 12 m/s.
-
 ### Normal driving
 
-Six drives of 300 simulated seconds in traffic of 15 cars and 8 pedestrians, on true positions, with the safety brake ignored so that these are the model's own mistakes:
+The driving model alone, before the planner: six drives with `scripts/traffic_monitor.py` of 300 simulated seconds in traffic of 15 cars and 8 pedestrians, on true positions, with the safety brake ignored so that these are the model's own mistakes:
 
 | | Distance | Collisions | Red lights | Times it lost its lane |
 | - | :---: | :---: | :---: | :---: |
@@ -567,10 +505,10 @@ python training\record_left_turns.py --runs 20 --model-share 1.0 --light-change-
 python training\train_left_turns.py
 ```
 
-**5. Check it,** with the tests, then the pass test against autopilot. Run the pass test once with the brake ignored to measure the model alone, and once with it active. It needs `test_traffic.py` running.
+**5. Check it** on the left-turn scenario, then with the pass test against autopilot. Run the pass test once with the brake ignored to measure the model alone, and once with it active. It needs `test_traffic.py` running.
 
 ```powershell
-python scripts\run_professor_test_suite.py --only 2 5 --repeat 20
+python scripts\run_bench.py --scenarios left_turn --runs 20
 python training\pass_test.py --ignore-brake
 python training\pass_test.py
 ```
@@ -640,11 +578,8 @@ Each of these needs CARLA to itself, and starts and stops its own processor. Res
 
 ```powershell
 # The defensive driving bench: carries on where it left off if stopped, about 26 s per run
-python scripts/run_bench.py --configs oracle "lidar_and_rsu+planner+monitor" --runs 50 --speed 0 --quiet
+python scripts/run_bench.py --configs oracle lidar_and_rsu camera_and_rsu lidar_only --runs 50 --speed 0 --quiet
 python scripts/run_bench.py --report      # rebuild the report from output/bench, running nothing
-
-# The comparative study, for hours
-python run_simulation.py --run_study_matrix --traffic 0 15 --repeat 5
 
 # The roadside tracks, with a processor running the roadside LiDAR detector
 python training/eval_tracking.py --seconds 180 --seed 11 --output output/rsu_tracking.json
@@ -670,7 +605,7 @@ The bench's test seeds (9000–9999) have had their one `--final` run. Tune on t
 | Detector-based perception: roof LiDAR, roadside LiDARs, roadside cameras | **Working in simulation,** in three configs. Trained and tested on this one junction |
 | Planner and onboard safety monitor | **Working in simulation.** About 2 % avoidable collisions on the held-back bench seeds; left turns often don't finish |
 | Path prediction | **Working.** The ML car uses a [model trained on Waymo data](#trajectory-model), falling back to road-following without it. Other cars follow the road |
-| ML car window and sensor windows | **Working**, showing the model's real inputs and outputs |
+| ML car window and sensor windows | **Working**, showing the model's real inputs and outputs. `lidar_only` has no sensor window yet |
 | Physical vehicles (Rosmaster R2, KUKSA) | **Written, not yet run on hardware.** The motor drivers and KUKSA publisher have never run |
 | Fully autonomous physical vehicle (Autoware) | **Not started.** Planned last |
 | Lab-to-CARLA coordinate mapping, SkyEye view, Kafka logging, AI recommendations | **Not started** |
@@ -682,7 +617,7 @@ These are the targets from the project report, against what has been measured so
 | Requirement | Target | Measured so far |
 | ----------- | ------ | --------------- |
 | End-to-end latency (REQ-SYS-002) | At most 100 ms, sensor to CARLA rendering | About 60 ms (p95) from Ditto write to simulated motor cut, on one machine. The sensor-to-rendering path isn't measured |
-| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) | 10.0 Hz simulation tick, at real-time speed with 15 cars. With the roadside detector and both windows open, the tests fell to about 2 to 3 Hz |
+| Update rate (REQ-SYS-003) | At least 10 Hz (target 20 Hz) | 10.0 Hz simulation tick, at real-time speed with 15 cars. With the roadside detector and both windows open, runs fell to about 2 to 3 Hz |
 | Safety metrics (REQ-SYS-011) | TTC and headway; flag TTC under 1.5 s | TTC, PET and DRAC done, and the 1.5 s flag works. Headway isn't implemented |
 | Telemetry payload (REQ-SYS-001) | Full state vector, JSON over MQTT/HTTP | Position and velocity only |
 | Position and heading accuracy (REQ-SYS-004, 005) | Within 5 cm and 2 degrees | Not measured; needs physical vehicles |
@@ -706,7 +641,7 @@ These are the targets from the project report, against what has been measured so
 - **The detectors only know one junction and one sensor layout.** The roadside grid covers 60 m from the centre, they'd need retraining for anything else, and none has seen real sensor data.
 - **The roadside cameras are weak at range,** and see under 54% of pedestrians.
 - **The suite tells the car where its containers are.** The LiDAR detector calls the containers that hide the hazards cars, and the tracker gives them jittery speeds, so any track inside a container's footprint (plus 0.5 m), or stopped close to one, is dropped from what the car is told. A real unit would have to learn its background. The safety gate still receives those tracks.
-- **CARLA's AI walkers are invisible.** `sensor.lidar.ray_cast` passes straight through walkers moved by `controller.ai.walker`, and they report zero speed, so neither the detectors nor the brake see them in free driving. The scenarios and recordings use walkers moved by `apply_control`.
+- **CARLA's AI walkers are invisible.** `sensor.lidar.ray_cast` passes straight through walkers moved by `controller.ai.walker`, and they report zero speed, so neither the detectors nor the brake see them in normal traffic. The scenarios and recordings use walkers moved by `apply_control`.
 - **The link from the roadside unit is local UDP,** with no loss handling or signing. A real one needs a V2X radio.
 
 **The safety brake**
@@ -730,7 +665,6 @@ These are the targets from the project report, against what has been measured so
 - **No trained models are in the repo.** They're all trained locally, and the trajectory model stays out of git until the Waymo licence is checked. See [models/README.md](models/README.md).
 - **The vehicle can't tell if the processor has died.** The gate fails safe if the broker link drops, but a crashed processor simply stops sending hazards.
 - **A silent Wi-Fi drop took 3.8 s to detect** in testing, which is longer than the 1.5 s brake window. Lowering `MQTT_KEEPALIVE` shortens it.
-- **`bridge/ditto_carla_sync.py` is out of date.** It still points at `org.ovin:my-vehicle` on `192.168.0.100`.
 
 ---
 
@@ -745,7 +679,7 @@ CI runs both on every push and pull request to `main`, on Ubuntu with no CARLA o
 
 | Test file | Needs |
 | --------- | ----- |
-| `test_safety_logic.py`, `test_left_turn.py`, `test_ml_driving.py`, `test_traffic_monitor.py`, `test_driving_features.py`, `test_ml_driver.py`, `test_model_panel.py`, `test_pass_test.py`, `test_professor_suite.py`, `test_record_driving.py`, `test_record_corrections.py`, `test_record_left_turns.py`, `test_lidar_coverage.py`, `test_detection_features.py`, `test_roadside_link.py`, `test_lidar_view.py`, `test_planner.py`, `test_safety_monitor.py`, `test_measure_braking.py`, `test_bench.py`, `test_study.py`, `test_camera_features.py`, `test_roof_features.py` | Nothing running. Some need `paho` or `pygame`, and skip themselves without them |
+| `test_safety_logic.py`, `test_geometry.py`, `test_ml_driving.py`, `test_traffic_monitor.py`, `test_driving_features.py`, `test_ml_driver.py`, `test_model_panel.py`, `test_pass_test.py`, `test_scenario_suite.py`, `test_record_driving.py`, `test_record_corrections.py`, `test_record_left_turns.py`, `test_lidar_coverage.py`, `test_detection_features.py`, `test_roadside_link.py`, `test_lidar_view.py`, `test_planner.py`, `test_safety_monitor.py`, `test_measure_braking.py`, `test_bench.py`, `test_camera_features.py`, `test_roof_features.py` | Nothing running. Some need `paho` or `pygame`, and skip themselves without them |
 | `test_onboard_perception.py`, `test_record_hazards.py` | Nothing running, and `paho`; skip themselves without it |
 | `test_agent_brake.py`, `test_ml_car_view.py` | The `carla` and `pygame` packages; skip themselves without them |
 | `test_training_data.py`, `test_train_driving.py`, `test_detection_training.py` | Nothing running. Their model tests need PyTorch, and skip themselves without it |
@@ -793,7 +727,7 @@ The client and server versions must match. The wheel in `config/` is for CARLA 0
 <details>
 <summary><b>Other scripts conflict with the processor</b></summary>
 
-Only one process may tick the world. `scripts/test_traffic.py` ticks unless you pass `--asynch`, and `scripts/test_carla_connection.py` always does, so stop the processor first or use `test_traffic.py --asynch`.
+Only one process may tick the world. `scripts/test_traffic.py` ticks unless you pass `--asynch`, so use `--asynch` while the processor runs.
 
 </details>
 

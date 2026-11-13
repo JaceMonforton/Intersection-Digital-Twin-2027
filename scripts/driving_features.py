@@ -9,6 +9,7 @@ CARLA's convention, where positive is to the right.
 The model chooses the steering and how fast to be going a moment from now. A small fixed controller here
 turns that speed into throttle and brake, as cruise control would, and is not part of the model.
 """
+import itertools
 import math
 
 import numpy as np
@@ -180,3 +181,45 @@ class SpeedController:
             self.throttle = min(self.throttle + THROTTLE_RATE, wanted)
             self.brake = 0.0
         return self.steer, self.throttle, self.brake
+
+
+VEHICLE_LENGTH = 4.8      # m, Tesla Model 3
+VEHICLE_WIDTH = 2.1       # m
+
+
+def outline(x, y, yaw_deg):
+    """The four corners of a vehicle seen from above."""
+    yaw = math.radians(yaw_deg)
+    c, s = math.cos(yaw), math.sin(yaw)
+    half_l, half_w = VEHICLE_LENGTH / 2, VEHICLE_WIDTH / 2
+    return [(x + c * lx - s * ly, y + s * lx + c * ly)
+            for lx, ly in ((half_l, half_w), (half_l, -half_w), (-half_l, -half_w), (-half_l, half_w))]
+
+
+def rectangles_overlap(a, b):
+    """Separating axis test: two rectangles are apart if some edge's normal separates them."""
+    for rect in (a, b):
+        for (x1, y1), (x2, y2) in itertools.pairwise(rect):
+            nx, ny = y2 - y1, x1 - x2
+            pa = [nx * x + ny * y for x, y in a]
+            pb = [nx * x + ny * y for x, y in b]
+            if max(pa) < min(pb) or max(pb) < min(pa):
+                return False
+    return True
+
+
+def point_to_segment(p, a, b):
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy))
+
+
+def rectangles_gap(a, b):
+    """Metres between two rectangles' nearest edges; 0 if they overlap."""
+    if rectangles_overlap(a, b):
+        return 0.0
+    return min(point_to_segment(p, *edge)
+               for corners, other in ((a, b), (b, a))
+               for p in corners
+               for edge in itertools.pairwise([*other, other[0]]))

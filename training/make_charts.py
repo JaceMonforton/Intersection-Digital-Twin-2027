@@ -47,6 +47,7 @@ def legend(x, y, names):
     return "".join(parts)
 
 
+
 def training_chart(history):
     """Training and validation loss by epoch, with the epoch that was kept marked."""
     width, height, left, right, top, bottom = 720, 340, 56, 96, 74, 46
@@ -79,43 +80,6 @@ def training_chart(history):
     return svg(width, height, "".join(body), f"Line chart of detector training and validation loss over {len(history)} epochs. The lowest validation loss, {best['validation']:.2f}, was at epoch {best['epoch']}.")
 
 
-def comparison_chart(summary, modes, titles):
-    """How close each hidden hazard came, by version of the car, as bars with collisions written beside them."""
-    scenarios = [s for s in summary if any(summary[s].get(m, {}).get("closest_mean_m") is not None for m in modes)]
-    band, gap, bar, left, right, top = 58, 22, 16, 150, 170, 84
-    height = top + (band + gap) * len(scenarios) + 34
-    width = 760
-    plot_w = width - left - right
-    largest = max(summary[s][m]["closest_mean_m"] or 0 for s in scenarios for m in modes if m in summary[s])
-    ceiling, step = nice_top(max(largest, 0.5))
-    body = [text(24, 30, "How close each hidden hazard came", "title", 16, weight=600),
-            text(24, 50, "Mean closest distance to the hazard, in metres. Further is safer. 0 m is contact."),
-            legend(left, 72, [titles[m] for m in modes])]
-    for tick in range(int(ceiling / step) + 1):
-        x = left + plot_w * tick * step / ceiling
-        body.append(f'<line class="grid" x1="{x:.1f}" x2="{x:.1f}" y1="{top}" y2="{height - 28}" stroke-width="1"/>')
-        body.append(text(x, height - 10, f"{tick * step:g} m", anchor="middle", size=12))
-    for row, scenario in enumerate(scenarios):
-        y = top + 6 + row * (band + gap)
-        body.append(text(left - 12, y + band / 2, titles.get(scenario, scenario), "title", 13, anchor="end", weight=500))
-        for index, mode in enumerate(modes):
-            result = summary[scenario].get(mode)
-            if result is None:
-                continue
-            value = result["closest_mean_m"] or 0.0
-            bar_y = y + index * (bar + 2)
-            w = plot_w * value / ceiling
-            if w >= 4:
-                body.append(f'<path class="s{index + 1}" stroke="none" d="M{left},{bar_y} h{w - 4:.1f} a4,4 0 0 1 4,4 v{bar - 8} a4,4 0 0 1 -4,4 h-{w - 4:.1f} z"/>')
-            else:
-                body.append(f'<rect class="s{index + 1}" stroke="none" x="{left}" y="{bar_y}" width="{max(w, 2):.1f}" height="{bar}"/>')
-            hits = result["collisions"]
-            label = f"{value:.2f} m" + (f", {hits} of {result['runs']} hit" if hits else "")
-            body.append(text(left + w + 6, bar_y + 12, label, size=12))
-    return svg(width, height, "".join(body), "Bar chart of the mean closest distance to each hidden hazard, for each version of the car. " +
-               " ".join(f"{titles.get(s, s)}: " + ", ".join(f"{titles[m]} {summary[s][m]['closest_mean_m']} metres" for m in modes if m in summary[s]) + "." for s in scenarios))
-
-
 def main():
     wrote = []
     history_path = ROOT / "models" / "rsu_detector.candidate.history.json"
@@ -125,13 +89,6 @@ def main():
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUT_DIR / "rsu_training.svg").write_text(training_chart(json.loads(history_path.read_text())), encoding="utf-8")
         wrote.append("rsu_training.svg")
-    comparison_path = RESULTS_DIR / "rsu_comparison.json"
-    if comparison_path.exists():
-        data = json.loads(comparison_path.read_text())
-        titles = {"truth": "True positions", "rsu": "Roadside unit", "sight": "Own sight only", "runner": "Red-light runner", "pedestrian": "Hidden pedestrian", "turner": "Oncoming turner", "clear": "Clear road"}
-        modes = [m for m in ("sight", "rsu", "truth") if any(m in v for v in data["summary"].values())]
-        (OUT_DIR / "rsu_comparison.svg").write_text(comparison_chart(data["summary"], modes, titles), encoding="utf-8")
-        wrote.append("rsu_comparison.svg")
     print("Wrote", ", ".join(wrote) if wrote else "nothing: no results yet")
 
 

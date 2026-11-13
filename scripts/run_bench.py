@@ -1,40 +1,41 @@
 """
-The many-seed bench: each scenario run on many seeds, each seed a different situation (scenario_variation.py), so that
-a result means something. Two runs can't tell a safe car from a lucky one; 300 runs with no collision put the
-collision rate under 1 % with 95 % confidence.
+The bench: each scenario run on many seeds, each seed a different situation (scenario_variation.py), so that a result
+means something. Two runs can't tell a safe car from a lucky one; 300 runs with no collision put the collision rate
+under 1 % with 95 % confidence.
 
-    python scripts/run_bench.py --configs lidar_and_rsu --runs 50            # 50 tune seeds of each scenario
-    python scripts/run_bench.py --configs oracle lidar_and_rsu lidar_only --runs 50 --speed 0
+Every config (study_names.CONFIGS) drives with the planner choosing the speed and the car's own safety monitor after
+it. oracle is the teaching rule of training/record_hazards.py driving with CARLA's true positions of everything. When
+even it collides on a seed, the report counts that seed as one nobody here avoided and gives the rates both with and
+without those seeds, rather than counting it against the car. It's a strong driver, not a perfect one, so "the oracle
+crashed" is evidence that a seed is very hard, not proof that it's impossible.
+
+    python scripts/run_bench.py --configs oracle lidar_and_rsu camera_and_rsu lidar_only --runs 50 --speed 0 --quiet
     python scripts/run_bench.py --report                                     # rebuild the report, running nothing
-    python scripts/run_bench.py --configs lidar_and_rsu --split test --final --runs 300   # the final measurement, once
-
-oracle is the teaching rule of training/record_hazards.py driving with CARLA's true positions of everything. When even
-it collides on a seed, the report counts that seed as one nobody here avoided and gives the rates both with and
-without those seeds, rather than counting it against the car. It's a strong driver, not a perfect one, so "the
-oracle crashed" is evidence that a seed is very hard, not proof that it's impossible.
+    python scripts/run_bench.py --configs lidar_and_rsu --split test --final --runs 50   # the final measurement, once
 
 Needs CARLA and the Docker stack running with the entities provisioned, and nothing else using CARLA: it starts and
 stops the processor itself, once per config. Runs are saved after each one to output/bench/<config>_<split>.jsonl,
-so a stopped bench carries on where it left off; the report goes to output/bench/report.md and report.csv.
+so a stopped bench carries on where it left off; the report goes to output/bench/report_<split>.md and .csv.
+run_simulation.py runs it with --view, one seed of each scenario, into output/run.
 """
 import argparse
 import csv
 import json
 import math
+import os
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import asdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "training"))
 from scenario_variation import SCENARIOS, SPLITS, draw, seeds
-from study_names import CONFIGS
+from study_names import CONFIGS, VIEWS
 
 BENCH_DIR = ROOT / "output" / "bench"
-PLANNED = "+planner"     # a config's name with this drives with planner.Planner choosing the speed
-MONITORED = "+monitor"   # and with this, also with the car's own safety monitor, safety_monitor.py, after the planner
-BENCH_CONFIGS = ("oracle", *CONFIGS, *(f"{c}{PLANNED}" for c in CONFIGS), *(f"{c}{PLANNED}{MONITORED}" for c in CONFIGS))
+BENCH_CONFIGS = ("oracle", *CONFIGS)
 Z95 = 1.96
 
 
@@ -48,8 +49,8 @@ def wilson(hits, runs, z=Z95):
     return max(0.0, middle - half), min(1.0, middle + half)
 
 
-def runs_path(config, split):
-    return BENCH_DIR / f"{config}_{split}.jsonl"
+def runs_path(config, split, directory=None):
+    return (directory or BENCH_DIR) / f"{config}_{split}.jsonl"
 
 
 def load_runs(path):
@@ -76,8 +77,9 @@ def summarise(rows, oracle_crashed=frozenset()):
             "monitor_acted": sum(rule["times"] for r in ran for rule in (r.get("monitor") or {}).values())}
 
 
-def write_report(split, directory=BENCH_DIR):
-    every = {config: load_runs(runs_path(config, split)) for config in BENCH_CONFIGS}
+def write_report(split, directory=None):
+    directory = directory or BENCH_DIR
+    every = {config: load_runs(runs_path(config, split, directory)) for config in BENCH_CONFIGS}
     oracle_crashed = defaultdict(set)
     for r in every["oracle"]:
         if r["ran"] and r["collisions"]:
@@ -112,29 +114,67 @@ def write_report(split, directory=BENCH_DIR):
     return lines
 
 
+def run_scenario(suite, name, lead):
+    """One run of a scenario, as a flat row of what was measured. Each passes with no collision; the red-light runner
+    is judged on the car alone, as the gate doesn't hold it in the simulation."""
+    stopped = False
+    try:
+        if name == "left_turn":
+            result, ran = suite.test_left_turn(), True
+            passed = result.passed
+        else:
+            result, _, stopped, ran = suite.run_runner(lead) if name == "red_light_runner" else suite.run_pedestrian(lead)
+            passed = ran and not result.collisions
+    except RuntimeError as error:
+        suite.console.line("ALERT", f"{name} couldn't run: {error}")
+        return {"scenario": name, "ran": False, "passed": False, "error": str(error)}
+    r = asdict(result)
+    if suite.perception == "onboard":  # no roadside unit, so its processor's ground-truth gate isn't an intervention
+        r["brake_events"] = r["false_brakes"] = 0
+    return {"scenario": name, "lead": None if name == "left_turn" else lead, "ran": bool(ran), "passed": bool(passed and ran),
+            "collisions": len(r["collisions"]), "background_collisions": sum(c.get("role") == "background" for c in r["collisions"]),
+            "brake_events": r["brake_events"], "false_brakes": r["false_brakes"], "true_min_ttc": r["true_min_ttc"],
+            "clearance_s": r["clearance_s"], "traffic_spawned": r["traffic"], "duration_s": r["duration"], "skipped_ticks": r["skipped_ticks"],
+            "monitor": r["monitor"], "notes": "; ".join(r["notes"]),
+            "failed_checks": ", ".join(check for check, ok in r["checks"].items() if not ok), "stopped": bool(stopped)}
+
+
+def spawn_window(script_args, log_path):
+    """A display beside the run. It only watches, so it may fail without stopping anything."""
+    log = open(log_path, "w", encoding="utf-8", errors="replace")  # noqa: SIM115
+    process = subprocess.Popen([sys.executable, "-u", *script_args], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+    return process, log
+
+
 def run_config(config, args):
     """Every seed for one config, with its own processor, saving each run as it finishes."""
     import carla
-    from run_professor_test_suite import (
+    from hidden_hazards import HiddenHazards, start_processor, stop_processor
+    from ml_driver import DrivingPolicy as Policy
+    from scenario_suite import (
         CARLA_HOST,
         CARLA_PORT,
+        JUNCTION,
         OUTPUT_DIR,
         Console,
-        Policy,
     )
-    from run_rsu_comparison import Comparison, start_processor, stop_processor
-    from run_study import run_scenario
 
-    mode = "truth" if config == "oracle" else CONFIGS[config.removesuffix(MONITORED).removesuffix(PLANNED)]
-    path = runs_path(config, args.split + ("_droplink" if args.drop_link else ""))  # kept out of the report, which is normal runs
+    mode = "truth" if config == "oracle" else CONFIGS[config]
+    path = runs_path(config, args.split + ("_droplink" if args.drop_link else ""), args.out)  # kept out of the report, which is normal runs
     done = {(r["scenario"], r["seed"]) for r in load_runs(path)}
     todo = [(name, seed) for name in args.scenarios for seed in seeds(args.split, args.runs, args.start) if (name, seed) not in done]
     if not todo:
         print(f"[BENCH] {config}: every run is already done.", flush=True)
         return
-    BENCH_DIR.mkdir(parents=True, exist_ok=True)
-    process, log = start_processor(mode, args.model, OUTPUT_DIR / f"bench_processor_{config}.log", view=False,
+    args.out.mkdir(parents=True, exist_ok=True)
+    process, log = start_processor(mode, args.model, OUTPUT_DIR / f"bench_processor_{config}.log", view=args.view,
                                    extra=["--no-draw", "--lockstep", "--speed", str(args.speed)])
+    windows = []
+    if args.view:
+        windows.append(spawn_window(["scripts/ml_car_view.py"], OUTPUT_DIR / f"bench_{config}_car_view.log"))
+        if mode in VIEWS:
+            windows.append(spawn_window(VIEWS[mode], OUTPUT_DIR / f"bench_{config}_sensor_view.log"))
     try:
         client = carla.Client(CARLA_HOST, CARLA_PORT)
         client.set_timeout(30.0)
@@ -143,16 +183,15 @@ def run_config(config, args):
             policy = HazardTeacher(Policy())
         else:
             policy = Policy()
-        suite = Comparison(carla, client, policy, Console(args.quiet), seed=1, perception=mode)
+        suite = HiddenHazards(carla, client, policy, Console(args.quiet), seed=1, perception=mode)
+        suite.link_drop = args.drop_link
         if config == "oracle":
             policy.world = suite.world
-        suite.monitor, suite.link_drop = config.endswith(MONITORED), args.drop_link
-        if PLANNED in config:
+        else:
             from planner import Planner
             from roadside_link import ROADSIDE_MODES
-            from run_professor_test_suite import JUNCTION
 
-            suite.planner = Planner(JUNCTION, has_roadside=mode in ROADSIDE_MODES)
+            suite.planner, suite.monitor = Planner(JUNCTION, has_roadside=mode in ROADSIDE_MODES), True
         try:
             for index, (name, seed) in enumerate(todo, 1):
                 variation = draw(name, seed, args.traffic)
@@ -166,17 +205,19 @@ def run_config(config, args):
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(row) + "\n")
                 suite.console.end_status()
-                print(f"[BENCH] {config} {name} seed {seed} ({index}/{len(todo)}): "
-                      f"{'COLLISION' if row.get('collisions') else 'no collision'}{'' if row['ran'] else ' (did not run)'}", flush=True)
+                verdict = "did not run" if not row["ran"] else "COLLISION" if row.get("collisions") else "PASS" if row["passed"] else "FAIL, no collision"
+                print(f"[BENCH] {config} {name} seed {seed} ({index}/{len(todo)}): {verdict}", flush=True)
         finally:
             suite.close()
     finally:
+        for window in windows:
+            stop_processor(*window)
         stop_processor(process, log)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--configs", nargs="+", choices=BENCH_CONFIGS, default=["lidar_and_rsu"])
+    parser.add_argument("--configs", nargs="+", choices=BENCH_CONFIGS, default=list(CONFIGS))
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--split", choices=SPLITS, default="tune")
     parser.add_argument("--final", action="store_true", help="needed to run the test split, which is only for the final measurement")
@@ -188,6 +229,8 @@ def main():
     parser.add_argument("--drop-link", type=lambda text: tuple(float(v) for v in text.split(",")), metavar="FROM,TO",
                         help="cut the roadside link FROM to TO s into every run, to test what the car does without it; "
                              "saved apart, as <config>_<split>_droplink.jsonl")
+    parser.add_argument("--out", type=Path, default=BENCH_DIR, help="where the runs and the report go")
+    parser.add_argument("--view", action="store_true", help="open the ML car's window and the config's sensor window")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--report", action="store_true", help="rebuild the report from the saved runs, running nothing")
     args = parser.parse_args()
@@ -200,14 +243,22 @@ def main():
         if len(args.configs) > 1:
             # Each config gets its own process, as a Traffic Manager doesn't survive being reused after its processor changes
             common = ["--split", args.split, "--runs", str(args.runs), "--start", str(args.start), "--speed", str(args.speed),
-                      "--model", args.model, "--scenarios", *args.scenarios, *(["--final"] if args.final else []),
+                      "--model", args.model, "--scenarios", *args.scenarios, "--out", str(args.out), *(["--final"] if args.final else []),
                       *(["--traffic", str(args.traffic)] if args.traffic is not None else []), *(["--quiet"] if args.quiet else []),
+                      *(["--view"] if args.view else []),
                       *(["--drop-link", ",".join(str(v) for v in args.drop_link)] if args.drop_link else [])]
-            for config in args.configs:
-                subprocess.call([sys.executable, "-u", __file__, *common, "--configs", config], cwd=ROOT)
+            child = {**os.environ, "BENCH_CHILD": "1"}  # only this process prints the report
+            failed = [config for config in args.configs
+                      if subprocess.call([sys.executable, "-u", __file__, *common, "--configs", config], cwd=ROOT, env=child) != 0]
         else:
             run_config(args.configs[0], args)
-    print("\n".join(write_report(args.split + ("_droplink" if args.drop_link else ""))))
+            failed = []
+    report = write_report(args.split + ("_droplink" if args.drop_link else ""), args.out)
+    if not os.environ.get("BENCH_CHILD"):
+        print("\n".join(report))
+    if not args.report and failed:
+        print(f"[BENCH] These configs stopped with an error, so their runs may be missing: {', '.join(failed)}", flush=True)
+        return 1
     return 0
 
 

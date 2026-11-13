@@ -1,9 +1,0 @@
-{
- "mode": "truth",
- "seconds": 300,
- "driver_alive_at_end": false,
- "brakes": 1,
- "reasons": [
-  "TTC 1.48 s with carla:1854"
- ]
-}

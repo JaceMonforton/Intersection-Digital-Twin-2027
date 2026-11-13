@@ -23,11 +23,11 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-import run_professor_test_suite as suite_module
+import scenario_suite as suite_module
 from driving_features import OUTPUT_SIZE, decode_inputs
 from ml_driver import DrivingPolicy
 from record_driving import CONVERTED_DIR
-from run_professor_test_suite import Console, Suite
+from scenario_suite import Console, Suite
 from waymo_predictor_node import LEFT
 
 # --- Configuration ---
