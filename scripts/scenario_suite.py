@@ -1,22 +1,12 @@
 """
-The five-test demonstration around Town 10's junction 189, with the ML car driven by the trained model.
+The scenarios' machinery around Town 10's junction 189, with the ML car driven by the trained model: Suite places the
+ML car, runs a stage tick by tick and scores it from CARLA's true positions. Its two built-in stages are the left turn
+across oncoming traffic (test_left_turn) and the blind-corner red-light runner (test_blind_corner); hidden_hazards.py
+adds the hidden pedestrian and the oncoming turner, and run_bench.py runs them on many seeds.
 
-    TEST 1  Stopping at a red light, waiting, pulling away on green, holding speed
-    TEST 2  Turning left across oncoming traffic
-    TEST 3  A speeding car from behind a truck runs its red light: the safety gate must stop the ML car
-    TEST 4  A car in the next lane cuts in front of the ML car
-    TEST 5  The light turns yellow while the ML car waits inside the junction to turn left: it finishes the
-            turn once no oncoming car is still coming
-
-Each test runs once and is scored on what was measured, with no retries, so a failure stays a failure.
-Other cars are CARLA's autopilot. Between tests the brake is released and every car is removed. The brake
-release here stands in for an operator and only ever happens inside CARLA.
-
-If the simulation isn't running this starts it through run_simulation.py.
-    python scripts/run_professor_test_suite.py
-    python scripts/run_professor_test_suite.py --only 3 --quiet
+Other cars are CARLA's autopilot. Between stages the brake is released and every car is removed. The brake release
+here stands in for an operator and only ever happens inside CARLA.
 """
-import argparse
 import csv
 import json
 import math
@@ -24,15 +14,13 @@ import os
 import queue
 import random
 import shutil
-import signal
 import socket
-import subprocess
 import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -42,14 +30,9 @@ from central_gpu_processor import (
     TRAFFIC_MANAGER_PORT,
     Track,
     approaching_from_behind,
-    find_junction,
-    lidar_to_model_frame,
     time_to_collision,
 )
-from detection_features import labels_for
-from driving_features import STOP_LINE_RANGE
-from left_turn_scenario import outline, rectangles_gap
-from ml_driver import DrivingPolicy as Policy
+from driving_features import STOP_LINE_RANGE, outline, rectangles_gap
 from ml_driver import (
     ModelDriver,
     actor_state,
@@ -59,19 +42,10 @@ from ml_driver import (
 )
 from model_panel import SUITE_ADDRESS, SafetyReceiver, TelemetrySender
 from roadside_link import (
-    MODES,
     ROADSIDE_MODES,
-    SEMANTIC_POINT,
     RoadsideReceiver,
     TickAck,
     make_view,
-)
-from study_names import (
-    CONFIGS,
-    SCENARIOS,
-    add_config_flags,
-    processor_args,
-    scenarios_from,
 )
 from traffic_monitor import (
     GATE_URL,
@@ -104,10 +78,6 @@ TRUCK = "vehicle.carlamotors.carlacola"
 MOVING = 0.5                  # m/s
 ASSUMED_BRAKING = 6.0         # m/s^2, for the stopping distance in the alert
 
-T1_WAIT = 6.0                 # s to wait at the red
-T1_LIMIT = 90.0
-T1_CRUISE = 4.5               # m/s that counts as back up to speed
-T1_RECOVER = 20.0             # s to get back up to speed after the green
 T2_LIMIT = 150.0
 T2_ONCOMING = 12.0            # m/s
 T2_TURNED = 60.0              # degrees of heading change
@@ -135,15 +105,6 @@ T3_REST = 6.0                 # s after stopping before scoring
 T3_AFTER = 15.0               # s after the launch that the hazard has passed
 T3_TRUCK_BACK = (10.0, 14.0, 18.0, 22.0)  # m before the speeding car's stop line to try parking the truck
 T3_TRUCK_SIDE = (4.0, 3.5, 5.0, -4.0)     # m to the right of its lane
-T4_LIMIT = 60.0
-T4_STRAIGHT = 70.0            # m of straight two-lane road needed
-T4_REAL_CUT_AHEAD = 20.0      # m ahead of the ML car that counts as cutting in front of it
-T4_IN_LANE = 1.2              # m to the side of the ML car that counts as in its lane
-T4_SPEED = 7.0                # m/s, the scripted cut-in car before it moves over
-T4_THEN = 3.0                 # m/s, the cut-in car after it has moved over, so the ML car must slow
-T4_CUT_AHEAD = 6.0            # m ahead of the ML car, centre to centre, that it moves over
-T4_MERGE = 8.0                # m further on that its path joins the ML car's lane
-T4_RUN = 25.0                 # s after the cut-in before scoring
 OFF_LANE_LIMIT = 1.0          # m; normal driving stays within about 0.6 m
 JUNCTION_ID = 189
 TRAFFIC_CLEARANCE = 30.0      # m from the ML car's start that no background car is spawned within
@@ -219,57 +180,11 @@ def false_brakes(engagements, states, collisions, safe=FALSE_SAFE_TTC, before=FA
     return count
 
 
-def roof_sweep_to_model_frame(raw, sensor_location, sensor_yaw, center):
-    """A semantic LiDAR sweep (x, y, z, cos, id, tag per point, in the sensor's frame) to the roadside model's frame
-    that lidar_view.py draws in: centred on the junction, y left. Only the sensor's yaw counts, as the car stays level."""
-    points = np.frombuffer(raw[:len(raw) - len(raw) % SEMANTIC_POINT.size], np.float32).reshape(-1, 6)[:, :3]
-    mount = (sensor_location.x - center.x, sensor_location.y - center.y, sensor_location.z - center.z)
-    return lidar_to_model_frame(points, mount, yaw=sensor_yaw)
-
-
-class RoofFeed:
-    """The ML car's own roof LiDAR and CARLA's true boxes, for scripts/lidar_view.py --feed roof. Only a display, so
-    anything going wrong here stops the feed, never the test."""
-
-    def __init__(self, world, carla):
-        from lidar_view import ROOF_FEED, SweepFeed
-
-        self.feed = SweepFeed.create(ROOF_FEED)
-        self.center = find_junction(world, JUNCTION_ID).bounding_box.location
-        self.carla = carla
-        self.written = None  # the frame of the last sweep written, so a stalled LiDAR shows as stalled
-
-    def write(self, world, now, sweep):
-        if self.feed is None or sweep is None or sweep[0] == self.written:
-            return
-        try:
-            frame, transform, raw = sweep
-            self.written = frame
-            points = roof_sweep_to_model_frame(raw, transform.location, transform.rotation.yaw, self.center)
-            actors = [a for pattern in ("vehicle.*", "walker.pedestrian.*") for a in world.get_actors().filter(pattern)]
-            mount = (transform.location.x - self.center.x, -(transform.location.y - self.center.y))
-            self.feed.write(frame, now, [mount, mount], [points, None], (), labels_for(actors, world.get_snapshot(), self.center))
-        except (RuntimeError, ValueError, OSError) as error:
-            print(f"[LIDAR] Stopped publishing the roof LiDAR: {error}", flush=True)
-            self.close()
-
-    def close(self):
-        if self.feed is not None:
-            self.feed.destroy()
-            self.feed = None
-
-
 def finish(result, **checks):
     """Fills in the checks and the result. A test passes only if every check does."""
     result.checks = {name: bool(value) for name, value in checks.items()}
     result.passed = bool(result.checks) and all(result.checks.values())
     return result
-
-
-def grade_lights(result, stopped, waited, went_on_green, reached_speed):
-    return finish(result, stopped_before_the_line=stopped and (result.stopping_margin or -1.0) >= 0.0, waited_at_red=waited,
-                  no_red_light_violation=result.red_light_violations == 0, pulled_away_on_green=went_on_green,
-                  back_up_to_speed=reached_speed, no_collision=not result.collisions)
 
 
 def grade_left_turn(result, turned, faced_traffic, gave_way):
@@ -281,11 +196,6 @@ def grade_left_turn(result, turned, faced_traffic, gave_way):
 def grade_blind_corner(result, heard_on_mqtt, stopped):
     return finish(result, safety_gate_fired=result.brake_at is not None, command_seen_on_mqtt=heard_on_mqtt,
                   car_stopped=stopped, no_collision=not result.collisions)
-
-
-def grade_cut_in(result, cut_in_happened):
-    return finish(result, cut_in_happened=cut_in_happened, no_collision=not result.collisions,
-                  stayed_in_lane=result.worst_off_lane <= OFF_LANE_LIMIT)
 
 
 def traffic_schedule(rng, until=T2_LIMIT, first_wave=None, headway=None, gap=None):
@@ -423,83 +333,6 @@ def live_table(title, t, pairs):
     clock = f"t={t:.1f} s"
     room = len(body[0]) - 4 - len(clock) - 1
     return [rule, f"| {title[:room]:<{room}} {clock} |", rule, *body, rule]
-
-
-def results_table(results):
-    """Lines of a table with one row per test."""
-    header = ("Test", "Result", "Time", "Collisions", "Red lights", "Stop margin", "Closest gap", "MQTT")
-    rows = [(f"{r['test']}. {r['name']}", "PASS" if r["passed"] else "FAIL", f"{shown(r['duration'], 1)} s", str(len(r["collisions"])), str(r["red_light_violations"]),
-             f"{shown(r['stopping_margin'])} m", f"{shown(r['min_gap'])} m", f"{shown(r['mqtt_latency_ms'], 0)} ms") for r in results]
-    widths = [max(len(row[i]) for row in (header, *rows)) for i in range(len(header))]
-
-    def row_text(row):
-        return "| " + " | ".join(f"{cell:<{width}}" if i < 2 else f"{cell:>{width}}" for i, (cell, width) in enumerate(zip(row, widths))) + " |"
-
-    rule = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
-    return [rule, row_text(header), rule, *map(row_text, rows), rule]
-
-
-def matrix_rows(results):
-    rows = []
-    for r in results:
-        rows.append(f"| {r['test']}. {r['name']} | {'PASS' if r['passed'] else '**FAIL**'} | {len(r['collisions'])} | "
-                    f"{r['red_light_violations']} | {shown(r['stopping_margin'])} m | {shown(r['min_gap'])} m | "
-                    f"{shown(r['mqtt_latency_ms'], 0)} ms | {shown(r['gate_poll_ms'], 0)} ms |")
-    return rows
-
-
-def smoothness_rows(smooth):
-    names = {"steer_change_rms": "Steering change per tick (rms)", "pedal_switches_per_min": "Throttle/brake switches per minute",
-             "jerk_p95": "Jerk, 95th percentile (m/s3)", "harsh_stops_per_min": "Decelerations over 6 m/s2 per minute",
-             "hardest_brake": "Hardest one-tick deceleration (m/s2)"}
-    return [f"| {label} | {shown(smooth['model'].get(key), 3)} | {shown(smooth['autopilot'].get(key), 3)} |" for key, label in names.items()]
-
-
-def round_rows(rounds, limit=0.11):
-    rows = []
-    for name, data in rounds.items():
-        collisions, reds = data.get("collisions_per_km"), data.get("red_lights_per_km")
-        met = collisions is not None and reds is not None and collisions <= limit and reds <= limit
-        rows.append(f"| {name} | {data.get('what', '')} | {shown(data.get('km'), 1)} | {shown(collisions)} | {shown(reds)} | "
-                    f"{'yes' if met else 'no'} |")
-    return rows
-
-
-def write_summary(path, results, rounds, smooth_note, smooth=None):
-    passed = sum(r["passed"] for r in results)
-    lines = [
-        "# Professor Demo Summary", "",
-        f"Generated {datetime.now():%Y-%m-%d %H:%M}. Every figure is measured. Each test ran once, with no retries.", "",
-        f"## Scenario tests: {passed} of {len(results)} passed", "",
-        "| Test | Result | Collisions | Red light violations | Stopping margin | Closest gap | MQTT latency | Gate read latency |",
-        "|---|---|---|---|---|---|---|---|",
-        *matrix_rows(results), "",
-    ]
-    for r in results:
-        failed = [name.replace("_", " ") for name, ok in r["checks"].items() if not ok]
-        if failed or r["notes"]:
-            lines.append(f"- **Test {r['test']}:** " + "; ".join(([f"failed: {', '.join(failed)}"] if failed else []) + r["notes"]))
-    lines += ["", "## Driving in traffic, against the 0.11 per km target", "",
-              ("Measured with the safety brake ignored, so these are the model's own mistakes. Autopilot's rate in the same traffic "
-               "was about 0.09 per km, and the target is 1.25 times that."), "",
-              "| Round | What changed | km | Collisions per km | Red lights per km | Within target so far |", "|---|---|---|---|---|---|",
-              *round_rows(rounds), "",
-              ("The last two rounds use the same general driver, so together that's 1 collision in 11.2 km, in which the ML car was stopped when "
-               "an Audi hit it on a drive with no left turns; the cause wasn't examined. That's too little driving to show the target is met, "
-               "and the approved 10-run pass test against autopilot hasn't been run on this model."), "",
-              *(["## Smoothness over those drives", "", "| Measure | Model | Autopilot |", "|---|---|---|", *smoothness_rows(smooth), ""] if smooth else []),
-              "## How to read this", "",
-              "- The model chooses steering and target speed. A fixed PID controller works the pedals, and it isn't AI.",
-              "- It learned by copying CARLA's autopilot, and sees positions from CARLA rather than cameras or LiDAR.",
-              "- Top speed is about 20 km/h, because that's how autopilot drove in the recordings.",
-              "- The brake release between hazards stands in for an operator, in CARLA only.",
-              "- The hazard cars in tests 2, 3 and 4 are scripted rather than autopilot, since autopilot wouldn't hold a set speed or make the cut-in reliably. The speeding car in test 3 measured about 8.5 m/s, not its set 10 m/s.",
-              "- Left turns: the recordings had none across moving traffic, so a fixed rule taught them, on runs where the rule or the model was driving. The rule isn't used when driving. The model is two networks: the general driver, frozen, plus a correction learned from those lessons that only acts on a left route.",
-              "- On a left turn the model is given the time-to-collision with the first car due to reach its route. That assumes each car keeps its speed and heading, so it wouldn't foresee a car turning across the route.",
-              "- Tests 2 and 5 were also repeated on this model with varied traffic: 20 of 20 each, with tests 1, 3 and 4 at 5 of 5 each, and 40 of 40 left turns in harder traffic near the safe limit. That doesn't prove it passes every time: 60 of 60 still allows a failure rate of up to about 1 in 20 (95% confidence). All of this is one approach to one junction, with oncoming cars scripted at 12 m/s.",
-              "- The cut-in in test 4 is at the model's normal speed of about 20 km/h, so it isn't high-speed.",
-              f"- {smooth_note}", ""]
-    Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
 class TurnChooser:
@@ -669,7 +502,7 @@ class Tick:
 
 
 class Suite:
-    def __init__(self, carla, client, policy, console, seed=0, perception="truth", traffic=0, roof_view=False):
+    def __init__(self, carla, client, policy, console, seed=0, perception="truth", traffic=0):
         self.seed = seed  # picks the oncoming traffic in test 2
         self.perception = perception  # what the ML car is told about the actors around it: see roadside_link.py
         self.traffic = traffic  # background autopilot cars in every test, on top of each test's own
@@ -693,7 +526,6 @@ class Suite:
         self.hud = HudSender()
         self.world.wait_for_tick(10.0)
         # Only in sight, where the roof LiDAR is all the car has; in rsu and camera the roadside windows show more
-        self.roof = RoofFeed(self.world, carla) if roof_view and perception == "sight" else None
         self.lights = RedLightWatch(carla, self.world)
         self.controlled = []  # (stop waypoint, light) of each lane at the junction
         for light in self.world.get_actors().filter("traffic.traffic_light"):
@@ -894,8 +726,6 @@ class Suite:
                     seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
                     link_up = getattr(view, "link_up", None)  # None with no roadside unit
                 seen_cars = self.believed(seen_cars)
-                if self.roof is not None:
-                    self.roof.write(self.world, now, getattr(view, "last_sweep", None))
                 telemetry.fresh = fresh
 
                 asked = time.perf_counter()
@@ -1005,41 +835,6 @@ class Suite:
             self.csv_file.flush()
         return result
 
-    # --- the tests ---
-    def test_lights(self):
-        stop = self.lane_with_turn(STRAIGHT)
-        yaw = stop.transform.rotation.yaw
-        red, green = self.carla.TrafficLightState.Red, self.carla.TrafficLightState.Green
-        self.set_lights(yaw, red, red, red)
-        line = stop.transform.location
-        state = {"stopped_at": None, "green_at": None, "crossed": False, "up_to_speed": False, "waited": False}
-
-        def past_line(ego):
-            heading = math.radians(yaw)
-            return (ego[0] - line.x) * math.cos(heading) + (ego[1] - line.y) * math.sin(heading)
-
-        def on_tick(tick, result, driver):
-            if state["stopped_at"] is None and tick.speed < 0.1 and tick.t > 3.0 and past_line(tick.ego) > -STOP_LINE_RANGE:
-                state["stopped_at"] = tick.t
-                result.stopping_margin = round(-past_line(tick.ego), 2)
-                self.console.line("SCENARIO", f"Stopped {result.stopping_margin:.1f} m before the line, t={tick.t:.1f} s")
-                self.hud.event(f"Stopped {result.stopping_margin:.1f} m before the red line")
-            if state["stopped_at"] is not None and state["green_at"] is None and tick.t - state["stopped_at"] >= T1_WAIT:
-                state["waited"] = True
-                state["green_at"] = tick.t
-                self.set_lights(yaw, green, red, red)
-                self.console.line("SCENARIO", f"Light turns GREEN, t={tick.t:.1f} s")
-                self.hud.event("Light turns green")
-            if state["green_at"] is not None and past_line(tick.ego) > 0.0:
-                state["crossed"] = True
-            if state["crossed"] and tick.speed >= T1_CRUISE:
-                state["up_to_speed"] = True
-            if state["up_to_speed"] and tick.t - state["green_at"] > 8.0:
-                return True
-            return state["green_at"] is not None and tick.t - state["green_at"] > T1_RECOVER
-
-        result = self.run_stage(1, "Traffic light and speed compliance", "[TEST 1/5] TRAFFIC LIGHT & SPEED COMPLIANCE", stop, STRAIGHT, T1_LIMIT, on_tick)
-        return grade_lights(result, state["stopped_at"] is not None, state["waited"], state["crossed"], state["up_to_speed"])
 
     def left_turn_lanes(self):
         """(stop line with a left turn, the oncoming lanes), for an approach with a long straight view of them: the
@@ -1061,8 +856,6 @@ class Suite:
             raise RuntimeError("No left turn at junction 189 has a long straight view of oncoming traffic.")
         return found[(self.variation.approach if self.variation else 0) % len(found)]
 
-    def test_light_change(self):
-        return self.test_left_turn(light_change=True)
 
     def test_left_turn(self, light_change=False):
         stop, oncoming = self.left_turn_lanes()
@@ -1254,65 +1047,6 @@ class Suite:
         result.hazard_gap = None if math.isinf(state["closest_runner"]) else state["closest_runner"]
         return grade_blind_corner(result, state["heard"], state["stopped_at"] is not None)
 
-    def test_cut_in(self):
-        pair = self._two_lane_start()
-        start, adjacent, _ = pair
-        stop = start.next(APPROACH)[0]
-        yaw = stop.transform.rotation.yaw
-        green = self.carla.TrafficLightState.Green
-        self.set_lights(yaw, green, green, green)
-        own_lane = [(w.transform.location.x, w.transform.location.y) for w in walk_lane(adjacent, T4_STRAIGHT + 40.0)]
-        state = {"cutter": None, "cut_at": None, "in_my_lane": False, "path": own_lane, "speed": T4_SPEED}
-
-        def build(ml):
-            state["cutter"] = self.spawn_car("vehicle.audi.tt", adjacent)
-
-        def on_tick(tick, result, driver):
-            cutter = state["cutter"]
-            if cutter.id not in tick.others:
-                return False
-            other = tick.others[cutter.id]
-            steer, throttle, brake = follow_path(other, state["path"], state["speed"])
-            cutter.apply_control(self.carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
-            ahead, side_on = along_and_across(tick.ego, other)
-            if state["cut_at"] is None and ahead >= T4_CUT_AHEAD and tick.speed > 3.0:
-                state["cut_at"] = tick.t
-                route = driver.lane.path_ahead(T4_STRAIGHT)
-                state["path"] = route[max(0, int(ahead + T4_MERGE)):]
-                self.console.line("SCENARIO", f"Car starts cutting in {ahead:.1f} m ahead, t={tick.t:.1f} s")
-                self.hud.event(f"Car cuts in {ahead:.1f} m ahead")
-            if state["cut_at"] is not None and 0.0 < ahead < T4_REAL_CUT_AHEAD and abs(side_on) < T4_IN_LANE and not state["in_my_lane"]:
-                state["in_my_lane"] = True
-                state["speed"] = T4_THEN
-                result.min_gap = None  # from here on: being side by side at the start isn't a close call
-                self.console.line("SCENARIO", f"Car is in the ML car's lane, {ahead:.1f} m ahead, and slowing, t={tick.t:.1f} s")
-                self.hud.event(f"Car in the lane, {ahead:.1f} m ahead, slowing")
-            return state["cut_at"] is not None and tick.t - state["cut_at"] > T4_RUN
-
-        result = self.run_stage(4, "Cut-in and recovery", "[TEST 4/5] CUT-IN & RECOVERY", stop, STRAIGHT, T4_LIMIT, on_tick, build, start=start)
-        return grade_cut_in(result, state["in_my_lane"])
-
-    def _two_lane_start(self):
-        """(ML car's start, the lane beside it, does a car there move right to reach the ML car?), on a straight
-        stretch with two lanes the same way, as near junction 189 as possible."""
-        options = []
-        for wp in self.map.generate_waypoints(5.0):
-            if wp.is_junction or wp.lane_type != self.carla.LaneType.Driving:
-                continue
-            for adjacent, moves_right in ((wp.get_left_lane(), True), (wp.get_right_lane(), False)):
-                if adjacent is None or adjacent.lane_type != self.carla.LaneType.Driving or adjacent.lane_id * wp.lane_id <= 0:
-                    continue
-                ahead = wp.next(T4_STRAIGHT)
-                if not ahead or ahead[0].is_junction or abs(yaw_difference(wp.transform.rotation.yaw, ahead[0].transform.rotation.yaw)) > 3.0:
-                    continue
-                if any(step.is_junction for step in wp.next_until_lane_end(5.0)[:int(T4_STRAIGHT / 5.0)]):
-                    continue
-                location = wp.transform.location
-                options.append((math.hypot(location.x - JUNCTION[0], location.y - JUNCTION[1]), id(wp), wp, adjacent, moves_right))
-        if not options:
-            raise RuntimeError("No straight road with two lanes the same way was found.")
-        _, _, wp, adjacent, moves_right = min(options, key=lambda o: o[:2])
-        return wp, adjacent, moves_right
 
     def close(self):
         self.clear()
@@ -1322,132 +1056,11 @@ class Suite:
         self.ack.close()
         if self.receiver is not None:
             self.receiver.close()
-        if self.roof is not None:
-            self.roof.close()
         self.csv_file.close()
 
 
 # ---------------------------------------------------------------------------
 # Running the suite
 # ---------------------------------------------------------------------------
-def simulation_running():
-    # CARLA ticks by itself without the processor, so a tick alone doesn't show that the processor is up
-    probe = ("import carla, sys; c = carla.Client('localhost', 2000); c.set_timeout(8.0); w = c.get_world(); "
-             "w.wait_for_tick(8.0); sys.exit(not w.get_settings().synchronous_mode)")
-    try:
-        return subprocess.run([sys.executable, "-c", probe], capture_output=True, timeout=20, check=False).returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
 
 
-def _raise_keyboard_interrupt(signum, frame):
-    raise KeyboardInterrupt
-
-
-def load_rounds():
-    path = OUTPUT_DIR / "driving_rounds.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-
-
-def run_tests(carla, client, chosen, console, seed=0, repeat=1, perception="truth", traffic=0, roof_view=False):
-    suite = Suite(carla, client, Policy(), console, seed, perception, traffic, roof_view)
-    tests = {1: suite.test_lights, 2: suite.test_left_turn, 3: suite.test_blind_corner, 4: suite.test_cut_in, 5: suite.test_light_change}
-    results = []
-    try:
-        for number in [n for _ in range(repeat) for n in chosen]:
-            suite.seed += 1
-            try:
-                result = tests[number]()
-            except RuntimeError as error:
-                result = StageResult(number, tests[number].__name__.replace("test_", "").replace("_", " "))
-                result.notes.append(f"couldn't run: {error}")
-                console.line("ALERT", f"Test {number} couldn't run: {error}")
-            results.append(asdict(result))
-            console.end_status()
-            failed = [name.replace("_", " ") for name, ok in result.checks.items() if not ok]
-            console.line("ALERT" if not result.passed else "SCENARIO", f"TEST {number}: {'PASS' if result.passed else 'FAIL'}"
-                         + (f", failed: {', '.join(failed)}" if failed else "") + "".join(f" | {note}" for note in result.notes))
-            suite.hud.event(f"TEST {number}: {'PASS' if result.passed else 'FAIL'}")
-            for _ in range(20):
-                suite.world.wait_for_tick(TICK_TIMEOUT)
-    finally:
-        suite.close()
-    return results
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--only", type=int, nargs="*", choices=(1, 2, 3, 4, 5), help="which tests to run; all five if left out")
-    parser.add_argument("--quiet", action="store_true", help="leave out the live table of values")
-    parser.add_argument("--seed", type=int, help="picks test 2's traffic; different each time if left out")
-    parser.add_argument("--repeat", type=int, default=1, help="run the tests this many times, saving only to output/repeat_results.json")
-    configs = add_config_flags(parser)
-    configs.add_argument("--perception", choices=MODES, help="what the ML car is told about other actors (truth if no config is given); "
-                         "rsu needs the processor running with --detector onnx, camera with --detector camera")
-    parser.set_defaults(perception="truth")
-    parser.add_argument("--traffic", type=int, default=0, metavar="N", help="background autopilot cars in every test, on top of each test's own")
-    parser.add_argument("--scenario", nargs="+", choices=("all", *SCENARIOS),
-                        help="run these by name, including the hidden hazards, saving to output/scenario_results_<perception>.json")
-    parser.add_argument("--roof-view", action="store_true", help="with --lidar_only, publish the roof LiDAR for scripts/lidar_view.py --feed roof")
-    parser.add_argument("--attached", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
-    if args.traffic < 0:
-        parser.error("--traffic must be 0 or more")
-    for name in ("SIGBREAK", "SIGTERM"):
-        if hasattr(signal, name):
-            signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
-
-    if not args.attached and not simulation_running():
-        print("[SCENARIO] The simulation isn't running, so starting everything through run_simulation.py.", flush=True)
-        config = next((flag for flag, mode in CONFIGS.items() if mode == args.perception), None)
-        if config is None and args.perception != "truth":
-            sys.exit(f"[SCENARIO] Start the processor first: python scripts/central_gpu_processor.py {' '.join(processor_args(args.perception, 'models/rsu_detector.candidate.onnx', False))}")
-        forward = [*(["--quiet"] if args.quiet else []), *([f"--{config}"] if config else []), "--traffic", str(args.traffic),
-                   *(["--scenario", *args.scenario] if args.scenario else [])]
-        return subprocess.run([sys.executable, str(ROOT / "run_simulation.py"), *forward], cwd=ROOT, check=False).returncode
-
-    import carla
-
-    client = carla.Client(CARLA_HOST, CARLA_PORT)
-    client.set_timeout(30.0)
-    console = Console(args.quiet)
-    if args.scenario:
-        from run_study import run_attached
-
-        runs = run_attached(carla, client, scenarios_from(args.scenario), args.perception, args.traffic, args.repeat, console, args.roof_view)
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        (OUTPUT_DIR / f"scenario_results_{args.perception}.json").write_text(json.dumps(runs, indent=2), encoding="utf-8")
-        passed = sum(r["passed"] for r in runs if r["ran"])
-        console.line("SCENARIO", f"Finished with {args.perception}: {passed} of {sum(r['ran'] for r in runs)} runs passed.")
-        return 0 if passed == sum(r["ran"] for r in runs) else 2
-    chosen = args.only or [1, 2, 3, 4, 5]
-    results = run_tests(carla, client, chosen, console, int(time.time()) if args.seed is None else args.seed, args.repeat, args.perception,
-                        args.traffic, args.roof_view)
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    if args.perception != "truth":  # these don't replace the suite's own results, which are for true positions
-        (OUTPUT_DIR / f"suite_results_{args.perception}.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-        passed = sum(r["passed"] for r in results)
-        console.plain("\n" + "\n".join(results_table(results)) + "\n")
-        console.line("SCENARIO", f"Finished with {args.perception}: {passed} of {len(results)} tests passed.")
-        return 0 if passed == len(results) else 2
-    if args.repeat > 1:
-        (OUTPUT_DIR / "repeat_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-        for number in chosen:
-            mine = [r for r in results if r["test"] == number]
-            console.line("SCENARIO", f"Test {number}: passed {sum(r['passed'] for r in mine)} of {len(mine)}")
-        return 0 if all(r["passed"] for r in results) else 2
-    (OUTPUT_DIR / "PROFESSOR_TEST_SUITE_RESULTS.json").write_text(json.dumps({
-        "generated": datetime.now(timezone.utc).isoformat(), "control_mode": CONTROL_MODE, "tests": results}, indent=2), encoding="utf-8")
-    smooth_path = OUTPUT_DIR / "smoothness.json"
-    write_summary(OUTPUT_DIR / "PROFESSOR_DEMO_SUMMARY.md", results, load_rounds(),
-                  "Stops end with a short snap in the last moment, from CARLA's low-speed wheel physics rather than the model.",
-                  json.loads(smooth_path.read_text(encoding="utf-8")) if smooth_path.exists() else None)
-    passed = sum(r["passed"] for r in results)
-    console.plain("\n" + "\n".join(results_table(results)) + "\n")
-    console.line("SCENARIO", f"Finished: {passed} of {len(results)} tests passed. See {OUTPUT_DIR / 'PROFESSOR_DEMO_SUMMARY.md'}")
-    return 0 if passed == len(results) else 2
-
-
-if __name__ == "__main__":
-    sys.exit(main())

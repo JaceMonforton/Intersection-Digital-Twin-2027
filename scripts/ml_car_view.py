@@ -4,7 +4,7 @@ what the driving model is seeing and deciding, from its real inputs and outputs 
 
 It attaches to the running simulation and waits for vehicle_ml to appear, and it picks the car up
 again whenever a new stage respawns it. Closing the window only closes the view. run_simulation.py
-opens it automatically.
+opens it for every run.
 
 Usage:
     python scripts/ml_car_view.py

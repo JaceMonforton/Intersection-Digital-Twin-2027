@@ -26,13 +26,13 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-import run_professor_test_suite as suite_module
+import scenario_suite as suite_module
 from driving_features import OUTPUT_SIZE, decode_inputs
+from hidden_hazards import LEADS, HiddenHazards
 from ml_driver import DrivingPolicy
 from record_driving import CONVERTED_DIR
 from record_left_turns import teacher_target
-from run_professor_test_suite import Console
-from run_rsu_comparison import LEADS, Comparison
+from scenario_suite import Console
 from waymo_predictor_node import LEFT, world_to_ego
 
 # --- Configuration ---
@@ -182,7 +182,7 @@ def main():
     client = carla.Client("localhost", 2000)
     client.set_timeout(30.0)
     teacher = HazardTeacher(DrivingPolicy(args.model) if args.model else DrivingPolicy())
-    suite = Comparison(carla, client, teacher, Console(quiet=True), perception="truth")
+    suite = HiddenHazards(carla, client, teacher, Console(quiet=True), perception="truth")
     teacher.world = suite.world
     rng = random.Random(args.seed)
     stamp = time.strftime("%Y%m%d_%H%M%S")

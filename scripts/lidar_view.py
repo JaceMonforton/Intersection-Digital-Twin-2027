@@ -5,9 +5,8 @@ The processor hands over each LiDAR's own sweep, the detector's boxes and CARLA'
 this window can't hold up the clock or the safety gate, and needs neither carla nor the model. The true boxes are only
 for comparing by eye: nothing else reads them from here. Everything shown is measured, and goes red or says so if it stops.
 
-    python run_simulation.py --roadside --lidar-view
-    python scripts/lidar_view.py         # alongside a processor started with --detector onnx --lidar-view
-    python scripts/lidar_view.py --feed roof   # the ML car's own roof LiDAR, in lidar_only: run_simulation.py --lidar_only
+    python run_simulation.py --lidar_and_rsu   # opens it
+    python scripts/lidar_view.py               # alongside a processor started with --detector onnx --lidar-view
 
 Press 1 or 2 to hide a LiDAR's points, which shows what the other one covers. It only changes this window.
 AI-driven pedestrians (controller.ai.walker) stay as dim true boxes, because LiDAR rays pass straight through them.
@@ -35,7 +34,6 @@ from detection_features import (
 )
 
 FEED_NAME = "intersection_lidar_view"
-ROOF_FEED = "intersection_roof_view"  # the ML car's own roof LiDAR, written by the test suite in lidar_only
 LIDARS = 2
 MAX_POINTS = 60000      # per LiDAR; each makes 30,000 a sweep
 MAX_DETECTIONS = 300
@@ -188,12 +186,10 @@ class SweepRate:
 
 
 class Window:
-    def __init__(self, pygame, roof=False):
-        """roof shows the ML car's own roof LiDAR instead, which has no detector: its boxes are only CARLA's true ones."""
+    def __init__(self, pygame):
         self.pygame = pygame
-        self.roof = roof
-        self.title = "ML car's own roof LiDAR" if roof else "Roadside LiDARs"
-        self.names = ("on the roof",) if roof else ("A", "B")
+        self.title = "Roadside LiDARs"
+        self.names = ("A", "B")
         pygame.init()
         self.size = min(MAX_WINDOW, pygame.display.Info().current_h - 120)
         self.screen = pygame.display.set_mode((self.size + PANEL_WIDTH, self.size))
@@ -208,7 +204,7 @@ class Window:
         self.rates = [SweepRate() for _ in range(LIDARS)]
 
     def poll(self, now):
-        self.feed = self.feed or SweepFeed.attach(ROOF_FEED if self.roof else FEED_NAME)
+        self.feed = self.feed or SweepFeed.attach(FEED_NAME)
         state = self.feed.read() if self.feed else None
         if state is not None:
             self.state, self.updated = state, now
@@ -221,11 +217,7 @@ class Window:
         self.pygame.draw.rect(self.screen, PANEL, (self.size, 0, PANEL_WIDTH, self.size))
         self.cursor = 22
         self._line(self.title, self.large, TITLE, 36)
-        if self.state is None and self.roof:
-            self._line("Waiting for the test suite.", colour=BAD)
-            self._line("It needs --perception sight")
-            self._line("and --roof-view.")
-        elif self.state is None:
+        if self.state is None:
             self._line("Waiting for the processor.", colour=BAD)
             self._line("It needs --detector onnx")
             self._line("and --lidar-view.")
@@ -280,18 +272,17 @@ class Window:
         true_boxes, seen = state["true_boxes"], self.seen_counts >= MIN_POINTS
         for label, kind in (("Vehicles", VEHICLE), ("People", PEDESTRIAN)):
             of_kind = true_boxes[:, 7] == kind
-            if not self.roof:
-                self._line(f"{label}: {int((state['detections'][:, 8] == kind).sum())} detected,", gap=20)
-            self._line(f"{label + ': ' if self.roof else ''}{int((of_kind & seen).sum())} hit by LiDAR, {int(of_kind.sum())} in CARLA", gap=28, indent=0 if self.roof else 12)
+            self._line(f"{label}: {int((state['detections'][:, 8] == kind).sum())} detected,", gap=20)
+            self._line(f"{int((of_kind & seen).sum())} hit by LiDAR, {int(of_kind.sum())} in CARLA", gap=28, indent=12)
         self.cursor += 8
         self._line("Key", self.medium, TITLE, 28)
         key = ((TRUE_SEEN, "CARLA's true box"), (TRUE_UNSEEN, f"True box, under {MIN_POINTS} LiDAR points"))
-        for colour, words in key + (() if self.roof else ((DETECTED_CAR, "Detected vehicle"), (DETECTED_PERSON, "Detected person"))):
+        for colour, words in key + ((DETECTED_CAR, "Detected vehicle"), (DETECTED_PERSON, "Detected person")):
             self.pygame.draw.rect(self.screen, colour, (self.size + 24, self.cursor + 4, 16, 12), 2)
             self._line(words, indent=26)
         self.cursor += 6
         self._line("Dim points are the road, bright are above it.")
-        self._line("Esc closes." if self.roof else "1 or 2 hides a LiDAR. Esc closes.")
+        self._line("1 or 2 hides a LiDAR. Esc closes.")
         self.cursor = self.size - 34
         waited = now - self.updated
         if waited > STOPPED_AFTER:
@@ -324,18 +315,12 @@ def _raise_keyboard_interrupt(signum, frame):
 
 
 def main():
-    import argparse
-
     import pygame
 
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--feed", choices=("roadside", "roof"), default="roadside",
-                        help="roof: the ML car's own roof LiDAR, from the suite run with --perception sight --roof-view")
-    args = parser.parse_args()
     for name in ("SIGBREAK", "SIGTERM"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
-    window = Window(pygame, roof=args.feed == "roof")
+    window = Window(pygame)
     try:
         window.run()
     except KeyboardInterrupt:

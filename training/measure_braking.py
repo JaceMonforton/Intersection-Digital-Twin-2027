@@ -101,7 +101,7 @@ def run_once(carla, world, ticks, point, speed, how):
 def main():
     argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     import carla
-    from run_rsu_comparison import start_processor, stop_processor
+    from hidden_hazards import start_processor, stop_processor
 
     process, log = start_processor("truth", ROOT / "models" / "rsu_detector.candidate.onnx", ROOT / "output" / "braking_processor.log")
     try:

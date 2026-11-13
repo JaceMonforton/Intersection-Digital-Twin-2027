@@ -6,7 +6,7 @@ refuses to run without the model file. The car brakes fully when the processor e
 The brake latches, so after a short hold this script releases it, standing in for an operator, and the
 model drives on. If the hazard is still there, the processor brakes again.
 
-Normally started by run_simulation.py. Needs the processor and test_traffic.py running.
+Used by the training recordings (training/record_driving.py and the others). Needs the processor and test_traffic.py running.
     python scripts/traffic_monitor.py --duration 60
 """
 import argparse
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import requests
 from central_gpu_processor import ML_PAINT
-from left_turn_scenario import outline, rectangles_gap
+from driving_features import outline, rectangles_gap
 from waymo_predictor_node import (
     LANE_MAX_HEADING,
     LEFT,
