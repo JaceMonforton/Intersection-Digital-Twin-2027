@@ -318,7 +318,7 @@ def main():
     parser.add_argument("--leave-running", action="store_true", help="keep CARLA and Docker up afterwards")
     args = parser.parse_args()
     if args.perception != "truth" and args.free_drive:
-        parser.error("the roadside configs only work with the tests; use the commands under Roadside detection in README.md to drive with it")
+        parser.error("the roadside configs only work with the tests; use the commands under Run the pieces yourself in README.md to drive with it")
     if args.free_drive and (args.scenario or args.run_study_matrix):
         parser.error("--free-drive can't be combined with --scenario or --run_study_matrix")
     if args.lidar_view and args.perception != "rsu":
