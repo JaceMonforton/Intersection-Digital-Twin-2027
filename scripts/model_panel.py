@@ -49,7 +49,8 @@ WALKER = (204, 158, 88)
 BAR_BACK = (46, 48, 54)
 
 ROUTE_NAMES = {LEFT: "LEFT", RIGHT: "RIGHT"}
-SOURCE_NAMES = {"truth": "TRUE POSITIONS", "rsu": "ROADSIDE UNIT", "sight": "OWN SIGHT", "camera": "ROADSIDE CAMERA"}
+SOURCE_NAMES = {"truth": "TRUE POSITIONS", "rsu": "ROADSIDE UNIT", "sight": "OWN SIGHT", "camera": "ROADSIDE CAMERA",
+                "onboard": "OWN LIDAR DETECTOR", "fused": "OWN LIDAR + ROADSIDE", "fused_camera": "OWN LIDAR + ROADSIDE CAMERA"}
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +65,12 @@ class TelemetrySender:
         self.source = None  # which view of the world the model is being given: see roadside_link.py
         self.fresh = True   # whether that view is up to date
 
-    def send(self, inputs, output, applied, model_driving):
+    def send(self, inputs, output, applied, model_driving, plan=None):
+        """output is always the model's own; plan is the planner's choice, where there's a planner."""
         message = {"inputs": [round(float(v), 3) for v in inputs], "output": [float(v) for v in output],
                    "applied": [float(v) for v in applied], "model_driving": bool(model_driving),
-                   "source": self.source, "fresh": self.fresh}
+                   "source": self.source, "fresh": self.fresh,
+                   "plan": None if plan is None else {"speed": float(plan.speed), "option": plan.option, "changed": bool(plan.changed), "reason": plan.reason}}
         try:
             self.socket.sendto(json.dumps(message).encode(), self.address)
         except OSError:
@@ -189,6 +192,9 @@ def control_status(telemetry):
         return "NO ROADSIDE DATA: BRAKING", False
     if not telemetry["model_driving"]:
         return "SAFETY BRAKE OVERRIDE", False
+    plan = telemetry.get("plan")
+    if plan and plan.get("changed"):  # rules, not the model, chose this speed, and the window must say so
+        return f"PLANNER: {plan['option'].replace('_', ' ').upper()}", False
     source = SOURCE_NAMES.get(telemetry.get("source"))
     return (f"MODEL DRIVING: {source}" if source else "MODEL DRIVING"), True
 
@@ -284,8 +290,12 @@ class ModelPanel:
         pygame.draw.rect(surface, ACCENT, (x + width // 2 if steer > 0.0 else x + width // 2 - extent, y + 26, extent, BAR_HEIGHT))
         pygame.draw.line(surface, TEXT, (x + width // 2, y + 23), (x + width // 2, y + 26 + BAR_HEIGHT + 2), 1)
 
+        plan = telemetry.get("plan")
+        planned = plan.get("changed") if plan else False
         shown = f"{target * 3.6:.1f} km/h" if math.isfinite(target) else "invalid"
-        self._row(surface, card, y + 50, "Target speed", shown)
+        if planned:
+            shown += f", planner {plan['speed'] * 3.6:.1f}"
+        self._row(surface, card, y + 50, "Model's target speed", shown)
         pygame.draw.rect(surface, BAR_BACK, (x, y + 76, width, BAR_HEIGHT), border_radius=4)
         filled = max(0.0, min(1.0, target / TARGET_BAR_FULL)) if math.isfinite(target) else 0.0
         pygame.draw.rect(surface, ACCENT, (x, y + 76, int(filled * width), BAR_HEIGHT), border_radius=4)
@@ -298,7 +308,9 @@ class ModelPanel:
         pygame.draw.rect(surface, BAR_BACK, (x + half + 16, y + 122, half, BAR_HEIGHT), border_radius=4)
         pygame.draw.rect(surface, ALERT, (x + half + 16, y + 122, int(brake * half), BAR_HEIGHT), border_radius=4)
 
-        if telemetry["model_driving"]:
+        if planned:
+            self._text(surface, f"Planner, not the model: {plan['reason']}"[:90], x, y + 146, self.small, ALERT)
+        elif telemetry["model_driving"]:
             self._text(surface, "A fixed controller sets these pedals to reach the target.", x, y + 146, self.small, DIM)
         else:
             self._text(surface, "What the model wants: the safety brake is overriding it.", x, y + 146, self.small, ALERT)

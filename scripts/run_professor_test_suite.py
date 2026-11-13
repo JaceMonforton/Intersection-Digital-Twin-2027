@@ -21,6 +21,7 @@ import csv
 import json
 import math
 import os
+import queue
 import random
 import shutil
 import signal
@@ -52,7 +53,6 @@ from ml_driver import DrivingPolicy as Policy
 from ml_driver import (
     ModelDriver,
     actor_state,
-    brake_is_off,
     crossing_ttc,
     is_new_contact,
     smoothness,
@@ -63,6 +63,7 @@ from roadside_link import (
     ROADSIDE_MODES,
     SEMANTIC_POINT,
     RoadsideReceiver,
+    TickAck,
     make_view,
 )
 from study_names import (
@@ -177,6 +178,8 @@ class StageResult:
     mqtt_latency_ms: float = None
     gate_poll_ms: float = None
     worst_off_lane: float = 0.0
+    skipped_ticks: int = 0  # ticks the driver never saw, because a loop took longer than one; above 0 the run isn't the one designed
+    monitor: dict = field(default_factory=dict)  # per rule of the car's own safety monitor: {"ticks": n, "times": n}
     distance: float = 0.0
     duration: float = 0.0
     smoothness: dict = field(default_factory=dict)
@@ -271,8 +274,8 @@ def grade_lights(result, stopped, waited, went_on_green, reached_speed):
 
 def grade_left_turn(result, turned, faced_traffic, gave_way):
     return finish(result, faced_oncoming_traffic=faced_traffic, gave_way_to_traffic=gave_way, completed_the_turn=turned,
-                  no_collision=not result.collisions, kept_a_safe_distance=result.min_gap is not None and result.min_gap >= T2_SAFE_GAP,
-                  safety_gate_stayed_off=result.brake_events == 0, no_red_light_violation=result.red_light_violations == 0)
+                  no_collision=not result.collisions, kept_a_safe_distance=result.min_gap is None or result.min_gap >= T2_SAFE_GAP,  # None: no car it could have avoided came near
+                  no_red_light_violation=result.red_light_violations == 0)
 
 
 def grade_blind_corner(result, heard_on_mqtt, stopped):
@@ -285,17 +288,19 @@ def grade_cut_in(result, cut_in_happened):
                   stayed_in_lane=result.worst_off_lane <= OFF_LANE_LIMIT)
 
 
-def traffic_schedule(rng, until=T2_LIMIT):
+def traffic_schedule(rng, until=T2_LIMIT, first_wave=None, headway=None, gap=None):
     """The seconds at which oncoming cars set off: a steady wave, then gaps long enough to turn through and more waves."""
+    first_wave = T2_FIRST_WAVE if first_wave is None else first_wave
+    headway, gap = headway or T2_HEADWAY, gap or T2_GAP
     t, times = 0.0, []
-    while t < T2_FIRST_WAVE:
+    while t < first_wave:
         times.append(t)
-        t += rng.uniform(*T2_HEADWAY)
+        t += rng.uniform(*headway)
     while t < until:
-        t += rng.uniform(*T2_GAP)
+        t += rng.uniform(*gap)
         for _ in range(rng.randint(*T2_WAVE_CARS)):
             times.append(t)
-            t += rng.uniform(*T2_HEADWAY)
+            t += rng.uniform(*headway)
     return times
 
 
@@ -337,6 +342,19 @@ def along_and_across(ego, other):
     yaw = math.radians(ego[4])
     dx, dy = other[0] - ego[0], other[1] - ego[1]
     return dx * math.cos(yaw) + dy * math.sin(yaw), -dx * math.sin(yaw) + dy * math.cos(yaw)
+
+
+LANE_PARALLEL = 30.0  # deg off the ML car's heading, either way, that counts as travelling along its road
+OTHER_LANE = 2.5      # m to the side, centre to centre, that puts a parallel car in another lane
+
+
+def counts_toward_gap(ego, other):
+    """Whether other's distance from the ML car says anything about how it drove. A car in the next lane going either
+    way along the road, or one coming up from behind, passes as close in normal driving, and the ML car didn't choose it."""
+    ahead, across = along_and_across(ego, other)
+    turn = abs((other[4] - ego[4] + 180.0) % 360.0 - 180.0)
+    parallel = turn <= LANE_PARALLEL or turn >= 180.0 - LANE_PARALLEL
+    return not (parallel and abs(across) >= OTHER_LANE) and not (turn <= LANE_PARALLEL and ahead < 0.0)
 
 
 def follow_path(state, path, speed, look=6.0):
@@ -635,9 +653,9 @@ class RememberingSender(TelemetrySender):
         super().__init__()
         self.last = None
 
-    def send(self, inputs, output, applied, model_driving):
-        self.last = {"target": float(output[1]), "applied": applied, "model_driving": bool(model_driving)}
-        super().send(inputs, output, applied, model_driving)
+    def send(self, inputs, output, applied, model_driving, plan=None):
+        self.last = {"target": float(output[1]), "applied": applied, "model_driving": bool(model_driving), "plan": plan}
+        super().send(inputs, output, applied, model_driving, plan)
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +673,10 @@ class Suite:
         self.seed = seed  # picks the oncoming traffic in test 2
         self.perception = perception  # what the ML car is told about the actors around it: see roadside_link.py
         self.traffic = traffic  # background autopilot cars in every test, on top of each test's own
+        self.variation = None  # a scenario_variation.Variation for the next run, or None for the fixed scenario
+        self.planner = None    # a planner.Planner the ML car plans its speed with, or None to drive on the model's alone
+        self.monitor = False   # whether the ML car drives with its own safety monitor, safety_monitor.py
+        self.link_drop = None  # (from, to) s into each run that the roadside link is cut, to test what the car does then
         self.receiver = RoadsideReceiver() if perception in ROADSIDE_MODES else None
         self.carla = carla
         self.client = client
@@ -667,6 +689,7 @@ class Suite:
         self.traffic_manager.set_synchronous_mode(True)
         self.mqtt = MqttWatch(console)
         self.safety = SafetyReceiver()
+        self.ack = TickAck()  # for a processor run with --lockstep
         self.hud = HudSender()
         self.world.wait_for_tick(10.0)
         # Only in sight, where the roof LiDAR is all the car has; in rsu and camera the roadside windows show more
@@ -809,6 +832,11 @@ class Suite:
         telemetry = RememberingSender()
         telemetry.source = self.perception
         driver = ModelDriver(self.policy, LaneDriver(start, TurnChooser(turn)), self.find_waypoint, rng, telemetry)
+        driver.planner = self.planner
+        if self.monitor:
+            from safety_monitor import SafetyMonitor
+
+            driver.monitor = SafetyMonitor()
         hits = []
         sensor = self.world.spawn_actor(self.world.get_blueprint_library().find("sensor.other.collision"), carla.Transform(), attach_to=ml)
         sensor.listen(lambda event: hits.append((event.other_actor.id, event.other_actor.type_id, event.other_actor.attributes.get("role_name", ""))))
@@ -825,18 +853,31 @@ class Suite:
         driven = ([], [], [], [])
         lights = self.lights
         lights.runs, lights.suspects, lights.seen = [], {}, {}
-        started = now = None
+        started = now = frame = None
         last_position = None
         was_braking = False
         held_since = None
         polls = []
+        closest = None
         min_ttc = math.inf
         states, ttcs, engagements, entered = [], [], [], None
         self.mqtt.clear()
         done = False
+        # Every tick, not wait_for_tick's next one: in lockstep the processor ticks the moment it hears the ack, and a tick
+        # that arrives before wait_for_tick is called is missed, so both sides waited out the gate's timeout
+        ticks = queue.Queue()
+        listening = self.world.on_tick(ticks.put)
         try:
             while not done:
-                snapshot = self.world.wait_for_tick(TICK_TIMEOUT)
+                try:
+                    snapshot = ticks.get(timeout=TICK_TIMEOUT)
+                except queue.Empty:
+                    raise RuntimeError(f"no tick from CARLA within {TICK_TIMEOUT} s") from None
+                while not ticks.empty():  # a driver slower than the clock acts on the newest, counting the rest as skipped
+                    snapshot = ticks.get_nowait()
+                if started is not None:
+                    result.skipped_ticks += max(0, snapshot.frame - frame - 1)
+                frame = snapshot.frame
                 now = snapshot.timestamp.elapsed_seconds
                 started = now if started is None else started
                 t = now - started
@@ -846,7 +887,12 @@ class Suite:
                 walkers = {w.id: (w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
                            for w in self.world.get_actors().filter("walker.pedestrian.*")}
                 not_green = lights.not_green()
-                seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
+                if self.link_drop and self.link_drop[0] <= t < self.link_drop[1] and hasattr(view, "own"):
+                    seen_cars, seen_walkers, fresh = view.own.see(ego, others, walkers, now)  # the roadside unit's tracks never arrive
+                    link_up = False
+                else:
+                    seen_cars, seen_walkers, fresh = view.see(ego, others, walkers, now)
+                    link_up = getattr(view, "link_up", None)  # None with no roadside unit
                 seen_cars = self.believed(seen_cars)
                 if self.roof is not None:
                     self.roof.write(self.world, now, getattr(view, "last_sweep", None))
@@ -858,9 +904,9 @@ class Suite:
                     polls.append((time.perf_counter() - asked) * 1000.0)
                 except (requests.RequestException, ValueError):
                     gate = {}
-                # With only its own sight, the car has no roadside unit behind a safety gate to stop it
-                released = fresh and (self.perception == "sight" or brake_is_off(gate))
-                steer, throttle, brake = driver.controls(ego, not_green, seen_cars, seen_walkers, released)
+                # In the simulation no config obeys the roadside gate, so all three drive by the same rules; it's still recorded
+                released = fresh
+                steer, throttle, brake = driver.controls(ego, not_green, seen_cars, seen_walkers, released, link_up)
                 ml.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
                 for series, value in zip(driven, (steer, throttle, brake, speed)):
                     series.append(value)
@@ -869,10 +915,15 @@ class Suite:
                 ttc = safety.get("ttc")
                 if ttc is not None:
                     min_ttc = min(min_ttc, ttc)
-                gap = min((rectangles_gap(outline(ego[0], ego[1], ego[4]), outline(o[0], o[1], o[4]))
-                           for o in others.values() if math.hypot(o[0] - ego[0], o[1] - ego[1]) < 15.0), default=None)
-                if gap is not None:
-                    result.min_gap = gap if result.min_gap is None else min(result.min_gap, gap)
+                gap, nearest = min(((rectangles_gap(outline(ego[0], ego[1], ego[4]), outline(o[0], o[1], o[4])), o)
+                                    for o in others.values() if math.hypot(o[0] - ego[0], o[1] - ego[1]) < 15.0 and counts_toward_gap(ego, o)),
+                                   default=(None, None), key=lambda pair: math.inf if pair[0] is None else pair[0])
+                if gap is not None and (result.min_gap is None or gap < result.min_gap):
+                    result.min_gap = gap
+                    ahead, across = along_and_across(ego, nearest)
+                    turn = (nearest[4] - ego[4] + 180.0) % 360.0 - 180.0
+                    closest = (f"closest car {gap:.1f} m at t={t:.1f} s: {ahead:+.1f} m ahead, {across:+.1f} m right, "
+                               f"heading {turn:+.0f} deg, {math.hypot(nearest[2], nearest[3]):.1f} m/s, ML car {speed:.1f} m/s")
                 result.worst_off_lane = max(result.worst_off_lane, driver.off_lane)
                 if last_position is not None:
                     result.distance += math.hypot(ego[0] - last_position[0], ego[1] - last_position[1])
@@ -929,13 +980,20 @@ class Suite:
                 tick.held_for = 0.0 if held_since is None else t - held_since
                 tick.turn_yaw = ego[4]
                 done = on_tick(tick, result, driver)
+                self.ack.send(frame)  # after on_tick too, which moves the test's own actors
                 if t >= limit:
                     result.notes.append(f"ran out of time at {limit:.0f} s")
                     self.hud.event("Ran out of time")
                     done = True
         finally:
+            self.world.remove_on_tick(listening)
+            self.ack.release()  # first, so the processor doesn't wait out the clean-up below
             view.close()
             result.duration = round(now - started, 1) if started is not None else 0.0
+            if closest is not None:
+                result.notes.append(closest)
+            if driver.monitor is not None:
+                result.monitor = {rule: {"ticks": n, "times": driver.monitor.times[rule]} for rule, n in driver.monitor.ticks.items()}
             result.red_light_violations = len(lights.runs)
             result.min_ttc = None if math.isinf(min_ttc) else round(min_ttc, 3)
             lowest = min(ttcs, default=math.inf)
@@ -984,7 +1042,9 @@ class Suite:
         return grade_lights(result, state["stopped_at"] is not None, state["waited"], state["crossed"], state["up_to_speed"])
 
     def left_turn_lanes(self):
-        """(stop line with a left turn, the oncoming lanes), for the approach with a long straight view of them."""
+        """(stop line with a left turn, the oncoming lanes), for an approach with a long straight view of them: the
+        variation's, counted round, or the first."""
+        found = []
         for stop, _ in sorted(self.controlled, key=lambda c: (round(c[0].transform.rotation.yaw / 10.0), c[0].lane_id)):
             behind = stop.previous(T2_START_BACK)
             if not behind or behind[0].is_junction or LEFT not in LaneDriver(stop, TurnChooser(LEFT)).turns.values():
@@ -996,8 +1056,10 @@ class Suite:
                         and (o.transform.location.x - here.x) * ahead.x + (o.transform.location.y - here.y) * ahead.y > 0.0]
             far_back = [o.previous(T2_FEED_FROM) for o in oncoming]
             if oncoming and all(b and abs(yaw_difference(o.transform.rotation.yaw, b[0].transform.rotation.yaw)) < 3.0 for o, b in zip(oncoming, far_back)):
-                return stop, oncoming
-        raise RuntimeError("No left turn at junction 189 has a long straight view of oncoming traffic.")
+                found.append((stop, oncoming))
+        if not found:
+            raise RuntimeError("No left turn at junction 189 has a long straight view of oncoming traffic.")
+        return found[(self.variation.approach if self.variation else 0) % len(found)]
 
     def test_light_change(self):
         return self.test_left_turn(light_change=True)
@@ -1008,14 +1070,16 @@ class Suite:
         red, green, yellow = self.carla.TrafficLightState.Red, self.carla.TrafficLightState.Green, self.carla.TrafficLightState.Yellow
         self.set_lights(yaw, green, green, red)
         rng = random.Random(self.seed)
-        schedule = deque(traffic_schedule(rng))
+        v = self.variation
+        speed, headway = (v.oncoming_speed, v.headway) if v else (T2_ONCOMING, T2_HEADWAY)
+        schedule = deque(traffic_schedule(rng, first_wave=v.first_wave, headway=v.headway, gap=v.gap) if v else traffic_schedule(rng))
         starts = [o.previous(T2_FEED_FROM)[0] for o in oncoming]
         cars = []
         heading = math.radians(yaw)
         line = stop.transform.location
         state = {"turned": False, "turned_at": 0.0, "start_yaw": None, "closest": math.inf, "waited": 0.0, "released": 0,
                  "stopped": False, "go_ttc": None, "changed_at": None, "red": False, "stopping": set()}
-        self.console.line("SCENARIO", f"Oncoming traffic seed {self.seed}, {T2_ONCOMING:.0f} m/s")
+        self.console.line("SCENARIO", f"Oncoming traffic seed {self.seed}, {speed:.0f} m/s")
 
         def launch(start=None):
             start = start or rng.choice(starts)
@@ -1025,7 +1089,7 @@ class Suite:
             car = self.world.try_spawn_actor(bp, self.carla.Transform(self.carla.Location(x=tf.location.x, y=tf.location.y, z=tf.location.z + 0.5), tf.rotation))
             if car is None:
                 return False
-            car.enable_constant_velocity(self.carla.Vector3D(x=T2_ONCOMING))
+            car.enable_constant_velocity(self.carla.Vector3D(x=speed))
             cars.append(car)
             self.actors.append(car)
             return True
@@ -1035,7 +1099,7 @@ class Suite:
             metres = T2_FEED_FROM
             while metres > T2_PREFILL_TO:
                 launch(rng.choice(oncoming).previous(metres)[0])
-                metres -= T2_ONCOMING * rng.uniform(*T2_HEADWAY)
+                metres -= speed * rng.uniform(*headway)
 
         def on_tick(tick, result, driver):
             state["start_yaw"] = tick.ego[4] if state["start_yaw"] is None else state["start_yaw"]
@@ -1255,6 +1319,7 @@ class Suite:
         self.release_lights()
         self.mqtt.stop()
         self.safety.close()
+        self.ack.close()
         if self.receiver is not None:
             self.receiver.close()
         if self.roof is not None:

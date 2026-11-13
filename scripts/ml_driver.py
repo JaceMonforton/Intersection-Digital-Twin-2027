@@ -25,7 +25,9 @@ import numpy as np
 import requests
 from central_gpu_processor import ML_PAINT
 from driving_features import CROSSING_LOOK, SpeedController, encode_inputs
+from planner import INSIDE_JUNCTION
 from roadside_link import MODES, make_view
+from safety_monitor import stopping_helps
 from traffic_monitor import (
     GATE_URL,
     LOOK_AHEAD,
@@ -46,6 +48,7 @@ CARLA_HOST = "localhost"
 CARLA_PORT = 2000
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "driving_policy.onnx"
 LANE_LOST = 2.5       # m from the route that means the car isn't following it
+PLAN_LOOK = 40         # m of the route ahead that the planner rolls the car out along
 CROSSING_WIDTH = 2.0  # m between a car's line and the route that counts as reaching it
 CROSSING_MOVING = 1.0  # m/s; slower cars are left to the car slots
 SAME_WAY = 0.5        # cosine of the angle under which a car is going along the route, not across it
@@ -135,6 +138,9 @@ class ModelDriver:
         self.off_lane = 0.0
         self.lost = False
         self.times_lost = 0
+        self.planner = None    # a planner.Planner, which may lower the model's speed or have it clear the junction
+        self.last_plan = None
+        self.monitor = None    # a safety_monitor.SafetyMonitor, which may hold or slow the car after the planner
 
     def _follow_route(self, x, y, yaw):
         self.off_lane = self.lane.advance_to(x, y)
@@ -150,14 +156,28 @@ class ModelDriver:
             self.lane = LaneDriver(waypoint, self.rng)
             self.off_lane = self.lane.advance_to(x, y)
 
-    def controls(self, ego, not_green, cars, walkers, brake_off):
-        """(steer, throttle, brake). The model runs either way, so its route stays current under the brake."""
+    def controls(self, ego, not_green, cars, walkers, brake_off, link_up=None):
+        """(steer, throttle, brake). The model runs either way, so its route stays current under the brake. link_up is
+        whether the roadside link is up, or None with no roadside unit; only the safety monitor reads it."""
         self._follow_route(ego[0], ego[1], ego[4])
         inputs = inputs_for(self.lane, ego, not_green, cars, walkers)
         output = self.policy(inputs)
-        applied = self.controller.step(output, math.hypot(ego[2], ego[3])) if brake_off else self.controller.hold()
+        drive = output
+        self.last_plan = None
+        if self.planner is not None:
+            self.last_plan = self.planner.plan(ego, self.lane.path_ahead(PLAN_LOOK), cars, walkers, float(output[1]))
+            if self.last_plan.changed:
+                drive = np.array((output[0], self.last_plan.speed), dtype=np.float32)  # the model's steering, the planner's speed
+        if self.monitor is not None:
+            inside = self.planner is not None and math.hypot(ego[0] - self.planner.junction[0], ego[1] - self.planner.junction[1]) < INSIDE_JUNCTION
+            conflict = stopping_helps(ego, self.lane.path_ahead(PLAN_LOOK), cars, walkers, float(drive[1]))
+            allowed = self.monitor.check(brake_off, link_up, float(drive[1]), inside, conflict)
+            brake_off = allowed is not None
+            if brake_off and allowed != float(drive[1]):
+                drive = np.array((drive[0], allowed), dtype=np.float32)
+        applied = self.controller.step(drive, math.hypot(ego[2], ego[3])) if brake_off else self.controller.hold()
         if self.telemetry is not None:
-            self.telemetry.send(inputs, output, applied, brake_off)
+            self.telemetry.send(inputs, output, applied, brake_off, plan=self.last_plan)  # output stays the model's own
         return applied
 
 

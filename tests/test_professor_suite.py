@@ -19,6 +19,7 @@ from run_professor_test_suite import (
     TurnChooser,
     alert_banner,
     along_and_across,
+    counts_toward_gap,
     follow_path,
     grade_blind_corner,
     grade_cut_in,
@@ -80,10 +81,11 @@ def test_a_left_turn_with_no_oncoming_traffic_tested_nothing():
     assert not grade_left_turn(_turn(), True, False, True).passed
 
 
-def test_a_left_turn_must_give_way_keep_its_distance_and_not_need_the_gate():
+def test_a_left_turn_must_give_way_and_keep_its_distance():
     assert not grade_left_turn(_turn(), True, True, False).passed
     assert not grade_left_turn(_turn(min_gap=T2_SAFE_GAP - 0.1), True, True, True).passed
-    assert not grade_left_turn(_turn(brake_events=1), True, True, True).passed
+    assert grade_left_turn(_turn(min_gap=None), True, True, True).passed  # no car that counts ever came within range
+    assert grade_left_turn(_turn(brake_events=1), True, True, True).passed  # the gate is recorded, not obeyed, so it isn't graded
 
 
 def test_the_light_change_test_needs_the_light_to_really_change():
@@ -327,3 +329,25 @@ def test_a_terminal_too_short_for_the_live_table_goes_without(monkeypatch):
     out = _Terminal()
     Console(stream=out).status(["1", "2", "3"])
     assert out.getvalue() == ""
+
+
+def test_only_cars_the_ml_car_could_have_avoided_count_toward_its_gap():
+    ego = (0.0, 0.0, 5.0, 0.0, 0.0)  # heading +x; CARLA's y is to the right
+    assert not counts_toward_gap(ego, (4.6, -3.4, 0.0, 0.0, 180.0))  # stopped in the opposite lane, as on seeds 5003 and 5007
+    assert not counts_toward_gap(ego, (0.0, 3.5, 5.0, 0.0, 5.0))     # alongside in the next lane, the same way
+    assert not counts_toward_gap(ego, (-5.0, 0.0, 8.0, 0.0, 0.0))    # coming up from behind
+    assert counts_toward_gap(ego, (6.0, 0.0, 0.0, 0.0, 0.0))         # the car ahead in its own lane
+    assert counts_toward_gap(ego, (6.0, 0.5, -9.0, 0.0, 180.0))      # oncoming in its path, as on a left turn
+    assert counts_toward_gap(ego, (4.2, -0.5, 0.0, 9.4, 121.0))      # crossing in front
+
+
+def test_a_track_inside_a_containers_footprint_is_dropped_but_not_a_car_in_the_lane_beside_it():
+    from run_rsu_comparison import in_footprint
+
+    container = (-42.0, 54.0, 0.0, 1.3, 3.0)  # centre, yaw, and half sizes: its long side along y, as the suite places it
+    assert in_footprint(-42.3, 50.5, *container)  # where the tracker put it, however fast it said it was
+    assert not in_footprint(-45.1, 54.0, *container)  # a car in the ML car's lane, 3 m to the side
+    assert in_footprint(54.0, 42.0, 0.0, 0.0, 0.0, 1.0, 1.0) is False
+    turned = (0.0, 0.0, 90.0, 1.3, 3.0)  # turned a quarter, its long side now along x
+    assert in_footprint(3.0, 0.0, *turned) and not in_footprint(0.0, 3.0, *turned)
+

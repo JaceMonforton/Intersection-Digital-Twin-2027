@@ -1,9 +1,13 @@
 """
 Starts the whole simulation with one command, runs it, then shuts down whatever it started. By default
-that's the five-test demonstration in scripts/run_professor_test_suite.py. Either way the ML car is driven
+that's each of the three scenarios (left_turn, red_light_runner, hidden_pedestrian) on every config in turn, with
+its windows open, through scripts/run_study.py. Either way the ML car is driven
 by the trained driving model and the others by CARLA's autopilot.
 
-    python run_simulation.py                  # the five tests
+    python run_simulation.py                  # the three scenarios on every config, with 15 cars
+    python run_simulation.py --planner        # the same, with planner.py choosing the ML car's speed
+    python run_simulation.py --lidar_only     # the three scenarios on one config
+    python run_simulation.py --scenario all   # every scenario, the five tests included, on one config
     python run_simulation.py --free-drive     # normal driving in traffic for 5 simulated minutes
     python run_simulation.py --free-drive --seconds 0   # until Ctrl+C
     python run_simulation.py --free-drive --traffic 30  # more cars
@@ -37,6 +41,8 @@ import requests
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from study_names import CONFIGS, SCENARIOS, VIEWS, add_config_flags, processor_args
+
+DEFAULT_SCENARIOS = ("left_turn", "red_light_runner", "hidden_pedestrian")
 
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "docker" / "docker-compose.yml")]
 LOG_DIR = ROOT / "output" / "logs"
@@ -187,7 +193,8 @@ class Launcher:
         self.ensure_docker()
         self.ensure_ditto()
         self.ensure_carla()
-        if self.args.run_study_matrix:
+        study_config = self.args.perception in ("truth", *CONFIGS.values())  # the older modes, such as --roadside, keep the five tests
+        if self.args.run_study_matrix or (study_config and not (self.args.scenario or self.args.free_drive)):
             return self.run_study()
         self.start_processor()
         self.spawn("subscriber", "scripts/physical_ml_subscriber.py", "--driver", "sim")
@@ -220,10 +227,13 @@ class Launcher:
     def run_study(self):
         """The comparative study runs the processor itself, once per config, so only the stack and CARLA are started here."""
         args = self.args
-        config = [flag for flag, mode in CONFIGS.items() if mode == args.perception]
-        self.log("Running the comparative study. It starts and stops the processor once per config, and takes hours.")
-        return self.run_stage("scripts/run_study.py", *(["--configs", *config] if config else ["--matrix"]),
-                              "--traffic", *(str(n) for n in (args.traffic or [0, 15])), "--repeat", str(args.repeat or 5),
+        configs = [flag for flag, mode in CONFIGS.items() if mode == args.perception] or list(CONFIGS)
+        matrix = args.run_study_matrix
+        self.log(f"Running {'the comparative study' if matrix else ', '.join(DEFAULT_SCENARIOS)} on {', '.join(configs)}. "
+                 "It starts and stops the processor once per config. Watch for the magenta ML car. Ctrl+C to stop early.")
+        return self.run_stage("scripts/run_study.py", "--configs", *configs, "--scenarios", *(["all"] if matrix else DEFAULT_SCENARIOS),
+                              "--traffic", *(str(n) for n in (args.traffic or ([0, 15] if matrix else [15]))),
+                              "--repeat", str(args.repeat or (5 if matrix else 1)), *(["--planner"] if args.planner else []),
                               *(["--no-view"] if args.no_view else []), *(["--quiet"] if args.quiet else []))
 
     def run_stage(self, *command):
@@ -297,6 +307,7 @@ def main():
     parser.add_argument("--scenario", nargs="+", choices=("all", *SCENARIOS), help="run these by name instead of the five tests, the hidden hazards included")
     parser.add_argument("--run_study_matrix", action="store_true", help="every scenario on every config (or just the config given), "
                         "at each --traffic load, --repeat times, then output/comparative_study_report.csv and _summary.md")
+    parser.add_argument("--planner", action="store_true", help="planner.py chooses the ML car's speed from what it perceives")
     parser.add_argument("--repeat", type=int, help="runs of each test or scenario: 1, or 5 in the study")
     parser.add_argument("--traffic", type=int, nargs="+", metavar="N", help="other vehicles: 15 in free driving, 0 in the tests, 0 15 in the study, "
                         "which runs every load given")
@@ -314,8 +325,10 @@ def main():
         parser.error("--lidar-view needs --lidar_and_rsu, as the LiDARs only exist when the detector is running")
     if (args.traffic and min(args.traffic) < 0) or (args.repeat is not None and args.repeat < 1):
         parser.error("--traffic must be 0 or more, and --repeat at least 1")
-    if args.traffic and len(args.traffic) > 1 and not args.run_study_matrix:
-        parser.error("several --traffic loads only work with --run_study_matrix")
+    if args.traffic and len(args.traffic) > 1 and (args.scenario or args.free_drive):
+        parser.error("several --traffic loads only work with the study, not --scenario or --free-drive")
+    if args.planner and (args.scenario or args.free_drive):
+        parser.error("--planner only works with the default run or --run_study_matrix")
 
     launcher = Launcher(args)
     code = 1

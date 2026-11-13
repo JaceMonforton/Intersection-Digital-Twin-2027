@@ -30,6 +30,7 @@ from detection_features import (
     encode_labels,
     load_sweep,
     rasterize,
+    sweep_order,
 )
 
 RAW_DIR = ROOT / "data" / "detection" / "raw"
@@ -114,11 +115,11 @@ def total_loss(output, target, weight, centres):
     return heat_loss(output[:, :CLASSES], target[:, :CLASSES], weight) + offset + SIZE_WEIGHT * size + YAW_WEIGHT * yaw
 
 
-def load_seeds(seeds, limit=None):
+def load_seeds(seeds, limit=None, data=RAW_DIR):
     """Every sweep's grid as uint8, which takes a quarter of the memory, and its labels."""
     grids, labels = [], []
     for seed in seeds:
-        files = sorted((RAW_DIR / f"seed_{seed}").glob("*.npz"), key=lambda path: int(path.stem))
+        files = sorted((Path(data) / f"seed_{seed}").glob("*.npz"), key=sweep_order)
         if not files:
             sys.exit(f"Nothing recorded for seed {seed}. See training/record_detection.py.")
         for path in files[:limit]:
@@ -181,15 +182,18 @@ def main():
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--limit", type=int, help="sweeps per seed, for a quick check")
+    parser.add_argument("--data", default=str(RAW_DIR), help="where the recordings are: data/detection/roof for the car's roof LiDAR")
+    parser.add_argument("--train-seeds", type=int, nargs="+", default=list(TRAIN_SEEDS))
+    parser.add_argument("--validation-seed", type=int, default=VALIDATION_SEED)
     args = parser.parse_args()
 
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[TRAIN] On {device}. Loading...", flush=True)
-    train_grids, train_labels = load_seeds(TRAIN_SEEDS, args.limit)
-    check_grids, check_labels = load_seeds((VALIDATION_SEED,), args.limit)
-    print(f"[TRAIN] {len(train_grids)} sweeps from seeds {TRAIN_SEEDS}; {len(check_grids)} from seed {VALIDATION_SEED} to choose the best epoch.", flush=True)
+    train_grids, train_labels = load_seeds(args.train_seeds, args.limit, args.data)
+    check_grids, check_labels = load_seeds((args.validation_seed,), args.limit, args.data)
+    print(f"[TRAIN] {len(train_grids)} sweeps from seeds {args.train_seeds}; {len(check_grids)} from seed {args.validation_seed} to choose the best epoch.", flush=True)
 
     model = Detector().to(device)
     print(f"[TRAIN] {sum(p.numel() for p in model.parameters()):,} parameters.", flush=True)

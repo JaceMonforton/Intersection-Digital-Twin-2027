@@ -29,6 +29,7 @@ from detection_features import (
     decode,
     load_sweep,
     rasterize,
+    sweep_order,
 )
 
 RAW_DIR = ROOT / "data" / "detection" / "raw"
@@ -155,8 +156,8 @@ def evaluate(session, files, thresholds=None, road=None):
     return result
 
 
-def seed_files(seed):
-    files = sorted((RAW_DIR / f"seed_{seed}").glob("*.npz"), key=lambda path: int(path.stem))
+def seed_files(seed, data=RAW_DIR):
+    files = sorted((Path(data) / f"seed_{seed}").glob("*.npz"), key=sweep_order)
     if not files:
         sys.exit(f"Nothing recorded for seed {seed}.")
     return files
@@ -168,13 +169,16 @@ def main():
     parser.add_argument("--seed", type=int, default=28)
     parser.add_argument("--threshold", type=float, nargs=CLASSES, help="vehicle and pedestrian; chosen for the best F1 if left out")
     parser.add_argument("--output", help="also save the results to this JSON file")
+    parser.add_argument("--data", default=str(RAW_DIR), help="where the recordings are: data/detection/roof for the car's roof LiDAR")
     args = parser.parse_args()
 
     import onnxruntime
 
     session = onnxruntime.InferenceSession(args.model, providers=["CPUExecutionProvider"])
-    files = seed_files(args.seed)
-    road = road_mask([load_sweep(path)[1] for path in sorted(RAW_DIR.glob("seed_*/*.npz"))])
+    files = seed_files(args.seed, args.data)
+    # The road mask is in the junction's frame, so it means nothing for sweeps centred on a moving car
+    roadside = Path(args.data).resolve() == RAW_DIR.resolve()
+    road = road_mask([load_sweep(path)[1] for path in sorted(RAW_DIR.glob("seed_*/*.npz"))]) if roadside else None
     result = evaluate(session, files, args.threshold, road)
     text = json.dumps({"seed": args.seed, **result}, indent=1)
     print(text)

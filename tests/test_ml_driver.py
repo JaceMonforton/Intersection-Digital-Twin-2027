@@ -88,8 +88,8 @@ def test_a_harsh_stop_is_counted_once():
 
 def test_the_display_gets_the_models_real_values_and_who_is_in_control():
     class Recorder:
-        def send(self, inputs, output, applied, model_driving):
-            self.sent = (inputs, output, applied, model_driving)
+        def send(self, inputs, output, applied, model_driving, plan=None):
+            self.sent = (inputs, output, applied, model_driving, plan)
 
     recorder = Recorder()
     driver = make_driver(FakePolicy((0.2, 5.0)))
@@ -101,6 +101,26 @@ def test_the_display_gets_the_models_real_values_and_who_is_in_control():
     assert recorder.sent[1] == (0.2, 5.0)  # still what the model said
     assert recorder.sent[2] == FULL_BRAKE  # not what the car did
     assert recorder.sent[3] is False
+
+
+def test_with_a_planner_the_controller_gets_its_speed_but_the_display_still_gets_the_models():
+    from planner import Plan
+
+    class Slower:
+        def plan(self, ego, route, cars, walkers, model_target):
+            return Plan(1.0, "stop", True, "a person ahead")
+
+    class Recorder:
+        def send(self, inputs, output, applied, model_driving, plan=None):
+            self.sent = (output, applied, plan)
+
+    alone = controls(make_driver(FakePolicy((0.2, 5.0))))
+    driver = make_driver(FakePolicy((0.2, 5.0)))
+    driver.planner, driver.telemetry = Slower(), Recorder()
+    planned = controls(driver)
+    assert planned[2] > alone[2] or planned[1] < alone[1]  # it brakes harder or opens the throttle less
+    output, _, plan = driver.telemetry.sent
+    assert tuple(output) == (0.2, 5.0) and plan.option == "stop"
 
 
 def test_a_low_target_speed_brakes():

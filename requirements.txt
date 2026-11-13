@@ -15,7 +15,8 @@ roslibpy>=1.5.0
 carla>=0.9.13
 numpy>=1.22.0
 
-# --- Inference (swap for onnxruntime-gpu on the GPU machine) ---
+# --- Inference. On a GPU machine use onnxruntime-gpu[cuda,cudnn]==1.23.2 with nvidia-cudnn-cu12==9.10.2.21 instead:
+# on the CPU the two LiDAR detectors take about 1 s a tick, and newer cuDNN fails to load in onnxruntime 1.23 ---
 onnxruntime>=1.16.0
 
 # --- Testing & Quality ---

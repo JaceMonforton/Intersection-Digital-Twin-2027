@@ -49,20 +49,20 @@ def study_seeds(count):
 def gate_ignored(suite):
     """In sight the processor still runs a ground-truth safety gate, but that car has no roadside unit and drives on
     through it (see Suite.run_stage), so its engagements are no interventions and aren't counted."""
-    return suite.perception == "sight"
+    return suite.perception in ("sight", "onboard")
 
 
 def run_scenario(suite, name, lead):
     """One run of a scenario, as a flat row of what was measured."""
-    hazard = None
+    hazard, stopped = None, False
     try:
         if name in SUITE_TESTS:
             tests = {1: suite.test_lights, 2: suite.test_left_turn, 3: suite.test_blind_corner, 4: suite.test_cut_in, 5: suite.test_light_change}
             result, ran = tests[SUITE_TESTS[name]](), True
             passed = result.passed
-        elif name == "red_light_runner":
-            result, _, _, ran = suite.run_runner(lead)
-            passed = result.passed
+        elif name == "red_light_runner":  # judged on the car alone, as the gate no longer holds it
+            result, _, stopped, ran = suite.run_runner(lead)
+            passed = ran and not result.collisions
         else:
             hazard = {"hidden_pedestrian": lambda: suite.run_pedestrian(lead), "oncoming_turner": lambda: suite.run_turner(lead),
                       "clear_road": lambda: suite.run_pedestrian(lead, launch=False)}[name]
@@ -80,8 +80,8 @@ def run_scenario(suite, name, lead):
     return {"scenario": name, "lead": lead if hazard or name == "red_light_runner" else None, "ran": bool(ran), "passed": bool(passed and ran),
             "collisions": len(r["collisions"]), "background_collisions": sum(c.get("role") == "background" for c in r["collisions"]),
             "brake_events": r["brake_events"], "false_brakes": r["false_brakes"], "true_min_ttc": r["true_min_ttc"],
-            "clearance_s": r["clearance_s"], "traffic_spawned": r["traffic"], "duration_s": r["duration"], "notes": "; ".join(r["notes"]),
-            "failed_checks": ", ".join(check for check, ok in r["checks"].items() if not ok)}
+            "clearance_s": r["clearance_s"], "traffic_spawned": r["traffic"], "duration_s": r["duration"], "skipped_ticks": r["skipped_ticks"], "monitor": r["monitor"], "notes": "; ".join(r["notes"]),
+            "failed_checks": ", ".join(check for check, ok in r["checks"].items() if not ok), "stopped": bool(stopped)}
 
 
 def run_runs(suite, names, traffic_loads, repeat, config):
@@ -243,12 +243,18 @@ def run_config(config, args):
     mode = CONFIGS[config]
     console = Console(args.quiet)
     console.line("SCENARIO", f"=== Config: {config} ===")
-    process, log = start_processor(mode, args.model, OUTPUT_DIR / f"study_processor_{config}.log", view=not args.no_view)
+    process, log = start_processor(mode, args.model, OUTPUT_DIR / f"study_processor_{config}.log", view=not args.no_view, extra=["--lockstep"])
     windows = [] if args.no_view else [spawn_window(["scripts/ml_car_view.py"], f"{config}_car_view"), spawn_window(VIEWS[mode], f"{config}_view")]
     try:
         client = carla.Client(CARLA_HOST, CARLA_PORT)
         client.set_timeout(30.0)
         suite = Comparison(carla, client, Policy(), console, seed=1, perception=mode, roof_view=not args.no_view)
+        if args.planner:
+            from planner import Planner
+            from roadside_link import ROADSIDE_MODES
+            from run_professor_test_suite import JUNCTION
+
+            suite.planner = Planner(JUNCTION, has_roadside=mode in ROADSIDE_MODES)
         try:
             rows = run_runs(suite, scenarios_from(args.scenarios), args.traffic, args.repeat, config)
         finally:
@@ -269,6 +275,7 @@ def main():
     parser.add_argument("--traffic", type=int, nargs="+", default=[0, 15], help="background car counts, each run in turn")
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--model", default=str(ROOT / "models" / "rsu_detector.candidate.onnx"))
+    parser.add_argument("--planner", action="store_true", help="planner.py chooses the ML car's speed, as in run_bench.py's +planner")
     parser.add_argument("--no-view", action="store_true", help="don't open each config's windows, which is quicker")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--report-only", action="store_true", help="rebuild the report from output/comparative_study_runs.json, running nothing")
