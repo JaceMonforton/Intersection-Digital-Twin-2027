@@ -303,6 +303,12 @@ The check starts the processor, drives the fake car through a 1 s silent outage,
 - the outage stops it, and it stays stopped while commands resume
 - the driver's last command is a hold
 
+**To check a Rosmaster is hooked up right,** follow the steps in [scripts/rosmaster_check/README.md](scripts/rosmaster_check/README.md). Two scripts there check it from each end:
+- **`check_rosmaster.py`, on the car,** checks the board (firmware, battery, IMU, and the wheel encoders while you turn a wheel by hand), the broker, the gate's state and any drive commands.
+- **`check_lab_link.py`, on the laptop,** checks Ditto and the broker. It pings the car 50 times and reports the round-trip delay against the gate's 0.3 s watchdog and any lost pings, shows the car's own report, and counts its poses.
+
+The board's readings use `Rosmaster_Lib` calls not yet tried on a real car, so one that errors shows as WARN "unverified" rather than as a broken car.
+
 **For a real car,** in this order:
 1. Run `physical_ml_subscriber.py` on the car, with its motor driver.
 2. Publish the car's pose from the overhead camera in the format above.
@@ -406,6 +412,9 @@ scripts/
   fake_lab_car.py             A stand-in lab car behind the real gate, with fault injection
   lab_frame.py                One pose reader and one lab-to-CARLA mapping, from config/lab_frame.json
   check_physical_loop.py      Pass/fail check of the whole lab-car loop, on the fake car
+  rosmaster_check/            Checks a Rosmaster is hooked up right, with step-by-step instructions in its README:
+    check_rosmaster.py          run on the car: its board and network, and it answers the laptop's pings
+    check_lab_link.py           run on the laptop: the stack, pings to the car, and its poses
   traffic_monitor.py          The ML car in normal traffic, for the training recordings and the pass test
   ml_car_view.py              Split-screen window following the ML car
   lidar_view.py               Top-down window of what the roadside LiDARs see
@@ -752,7 +761,7 @@ CI runs both on every push and pull request to `main`, on Ubuntu with no CARLA o
 | Test file | Needs |
 | --------- | ----- |
 | `test_safety_logic.py`, `test_geometry.py`, `test_ml_driving.py`, `test_traffic_monitor.py`, `test_driving_features.py`, `test_ml_driver.py`, `test_model_panel.py`, `test_pass_test.py`, `test_scenario_suite.py`, `test_record_driving.py`, `test_record_corrections.py`, `test_record_left_turns.py`, `test_lidar_coverage.py`, `test_detection_features.py`, `test_roadside_link.py`, `test_lidar_view.py`, `test_planner.py`, `test_safety_monitor.py`, `test_measure_braking.py`, `test_bench.py`, `test_camera_features.py`, `test_roof_features.py` | Nothing running. Some need `paho` or `pygame`, and skip themselves without them |
-| `test_onboard_perception.py`, `test_record_hazards.py`, `test_fake_lab_car.py` | Nothing running, and `paho`; skip themselves without it |
+| `test_onboard_perception.py`, `test_record_hazards.py`, `test_fake_lab_car.py`, `test_check_rosmaster.py`, `test_check_lab_link.py` | Nothing running, and `paho`; skip themselves without it |
 | `test_lab_frame.py`, `test_remote_driver.py`, `test_check_physical_loop.py`, `test_full_loop_sim.py` | Nothing running |
 | `test_agent_brake.py`, `test_ml_car_view.py` | The `carla` and `pygame` packages; skip themselves without them |
 | `test_training_data.py`, `test_train_driving.py`, `test_detection_training.py` | Nothing running. Their model tests need PyTorch, and skip themselves without it |
