@@ -542,6 +542,115 @@ def test_link_loss_holds_motors_until_explicit_release():
     assert not gate.held
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+def drive(seq, session="driver-a", **fields):
+    return json.dumps({"session": session, "seq": seq, **(fields or {"steer": 0.0, "speed": 1.0})}).encode()
+
+
+def released_gate(timeout=0.3):
+    clock = FakeClock()
+    gate = SafetyGateSubscriber(SimMotors(), watchdog_timeout=timeout, clock=clock)
+    gate.handle_payload(brake_event(False))
+    return gate, clock
+
+
+def test_an_unarmed_watchdog_never_trips():
+    gate, clock = released_gate()
+    clock.now += 60.0  # nothing has sent drive commands, as in today's setup
+    gate.check_watchdog()
+    assert not gate.held
+
+
+def test_silence_after_drive_commands_trips_the_watchdog_with_no_disconnect():
+    gate, clock = released_gate()
+    assert gate.handle_drive(drive(1))
+    clock.now += 0.3
+    gate.check_watchdog()
+    assert not gate.held  # exactly at the limit is still in time
+    clock.now += 0.01
+    gate.check_watchdog()
+    assert gate.held and "watchdog" in gate.reason
+
+
+def test_hold_commands_keep_the_watchdog_fed_but_never_release_a_brake():
+    gate, clock = released_gate()
+    gate.handle_drive(drive(1))
+    gate.handle_payload(brake_event(True))
+    for seq in range(2, 12):
+        clock.now += 0.1
+        assert gate.handle_drive(drive(seq, hold=True))
+        gate.check_watchdog()
+    assert gate.held and gate.reason == "emergency_brake == True"
+
+
+def test_a_watchdog_trip_latches_until_an_explicit_release_then_waits_for_a_new_command():
+    gate, clock = released_gate()
+    gate.handle_drive(drive(1))
+    clock.now += 1.0
+    gate.check_watchdog()
+    assert gate.held
+    gate.handle_drive(drive(2))
+    assert gate.held  # fresh commands alone don't release it
+    gate.handle_payload(brake_event(False))
+    assert not gate.held
+    clock.now += 1.0
+    gate.check_watchdog()
+    assert not gate.held  # released and not yet re-armed, so the old silence doesn't trip it again
+    gate.handle_drive(drive(3))
+    clock.now += 0.5
+    gate.check_watchdog()
+    assert gate.held
+
+
+@pytest.mark.parametrize("payload,retained", [
+    (b"not json", False),
+    (b"[]", False),
+    (drive(1, steer=float("nan"), speed=1.0), False),
+    (drive(1, steer=0.0, speed=float("inf")), False),
+    (drive(1, steer=0.0), False),                            # no speed
+    (json.dumps({"seq": 1, "steer": 0.0, "speed": 1.0}).encode(), False),  # no session
+    (json.dumps({"session": "a", "seq": "1", "steer": 0.0, "speed": 1.0}).encode(), False),
+    (drive(1), True),                                        # retained: could be from before this run
+])
+def test_invalid_commands_are_rejected_and_never_feed_the_watchdog(payload, retained):
+    gate, clock = released_gate()
+    assert not gate.handle_drive(payload, retained=retained)
+    assert gate.command is None
+    clock.now += 60.0
+    gate.check_watchdog()
+    assert not gate.held  # never armed
+
+
+def test_an_old_or_repeated_sequence_number_is_rejected():
+    gate, clock = released_gate()
+    assert gate.handle_drive(drive(5))
+    assert not gate.handle_drive(drive(5))
+    assert not gate.handle_drive(drive(4))
+    clock.now += 0.31
+    gate.check_watchdog()
+    assert gate.held  # the replays didn't count as fresh
+
+
+def test_a_restarted_driver_with_a_new_session_is_accepted_from_seq_zero():
+    gate, _ = released_gate()
+    assert gate.handle_drive(drive(500, session="driver-a"))
+    assert gate.handle_drive(drive(0, session="driver-b"))
+    assert gate.command["session"] == "driver-b"
+
+
+def test_drive_commands_are_ignored_until_the_first_gate_state():
+    gate = SafetyGateSubscriber(SimMotors(), clock=FakeClock())
+    assert not gate.handle_drive(drive(1))
+    assert gate.held
+
+
 class _Ok:
     is_failure = False
 
