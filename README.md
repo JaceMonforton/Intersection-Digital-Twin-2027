@@ -247,6 +247,62 @@ Each tick goes through four layers, and only the first is a trained model:
 
 **The safety gate fails safe.** It holds the motors off before it receives its first state, whenever it loses the broker, and until it hears an explicit release. The brake latches: nothing in the processor or the vehicle releases it by itself. In the simulation's scenarios it's recorded but doesn't hold the car; on a real vehicle it does.
 
+### Connecting a lab car
+
+A real RC car joins the twin as `vehicle_ml`: the models keep running on the central machine and drive it through its twin, and the car only follows commands, behind its safety gate.
+
+```
+overhead camera, or the fake car ──pose──▶ MQTT ──▶ Ditto ──▶ processor (brake) and twin mirror (CARLA)
+        ▲                                     │
+        │                                     └──▶ remote driver: model, planner, monitor, in CARLA's world
+        └──── safety gate on the car ◀── drive / hold commands, 10 Hz ◀──┘
+```
+
+**What the car side sends** is its pose, as a Ditto merge on `telemetry/vehicle_ml` to `/features/pose/properties`: `x` and `y` in lab metres, `heading` in degrees counter-clockwise, `speed` in m/s, `t` from its own clock, and `source`. The lab floor is right-handed, with y to the left.
+
+**One mapping** puts that pose into CARLA, for the processor's brake and the twin mirror alike: `scripts/lab_frame.py`, with its numbers in `config/lab_frame.json` (scale, rotation, a y-flip because CARLA is left-handed, and an offset onto the junction). The file in the repo is a guess, marked `"calibrated": false`: the lab origin at the junction centre at ×10. Replace it with a fit of known floor marks seen by the overhead camera. A missing or malformed file stops the processor rather than placing the car somewhere it isn't.
+
+**What the car receives** on `device/vehicle_ml/drive`:
+- `{"session", "seq", "steer", "speed"}`: steering from −1 to 1, positive to the right, and speed in lab m/s
+- `{"session", "seq", "hold": true}`
+
+**The gate** (`scripts/physical_ml_subscriber.py`) does three things:
+- **It passes on commands** only while nothing holds it. It clamps the speed to 1.5 m/s and rejects replayed, retained or malformed commands.
+- **It runs a watchdog.** Once commands have started, 0.3 s without a valid one holds the motors, by the car's own clock. That covers a dead link, a dead processor or a stalled simulation.
+- **It latches every hold.** Only an explicit release clears one: `python scripts/setup_entities.py --clear-brake`.
+
+**The remote driver** (`scripts/remote_driver.py`) gets the car's pose from its telemetry and the rest of the world from CARLA. It runs the same model, planner and safety monitor as the bench, and sends a command every tick.
+- **It holds when:**
+  - there's no pose yet
+  - the pose has stopped arriving or changing
+  - the gate or the monitor holds
+  - a decision fails
+- **It never releases a brake.**
+- **`--dry-run`** prints the commands and sends nothing.
+
+**The fake car** (`scripts/fake_lab_car.py`) stands in for the real one until it drives. It runs the unchanged gate in front of a simulated 1/10 car, and can drop, delay, replay or silence messages (`--drop`, `--delay`, `--replay`, `--outage`). Every pose it sends says `"simulated stand-in"`.
+
+**To check the whole loop**, with CARLA and the Docker stack up and nothing else using CARLA:
+
+```powershell
+python scripts/check_physical_loop.py
+```
+
+The check starts the processor, drives the fake car through a 1 s silent outage, and passes only if all of these hold:
+- poses arrive at 15 Hz or more
+- the car drives
+- the outage stops it, and it stays stopped while commands resume
+- the driver's last command is a hold
+
+**For a real car,** in this order:
+1. Run `physical_ml_subscriber.py` on the car, with its motor driver.
+2. Publish the car's pose from the overhead camera in the format above.
+3. Measure the calibration.
+4. Run the remote driver with `--dry-run`.
+5. Only then drive, with the wheels off the ground first.
+
+The real motor backends' `drive()` only stops the car for now. Driving it needs the ROS2 motor node and the motor calibration, which are still to come.
+
 ### The roadside sensors
 
 | What a LiDAR sees from its pole | A sweep's true boxes (left) and detected boxes (right) |
@@ -335,7 +391,11 @@ scripts/
   model_panel.py              The window's cards, and the live values sent to it
   central_gpu_processor.py    Simulation clock, roadside sensors and detectors, metrics, brake trigger
   waymo_predictor_node.py     History buffer, 3 s path prediction, drawn lines
-  physical_ml_subscriber.py   Safety gate that cuts the motors (runs on the vehicle)
+  physical_ml_subscriber.py   Safety gate on the vehicle: its watchdog, its latch, and the drive path to the motors
+  remote_driver.py            Drives a lab car through its twin, sending it drive and hold commands
+  fake_lab_car.py             A stand-in lab car behind the real gate, with fault injection
+  lab_frame.py                One pose reader and one lab-to-CARLA mapping, from config/lab_frame.json
+  check_physical_loop.py      Pass/fail check of the whole lab-car loop, on the fake car
   traffic_monitor.py          The ML car in normal traffic, for the training recordings and the pass test
   ml_car_view.py              Split-screen window following the ML car
   lidar_view.py               Top-down window of what the roadside LiDARs see
@@ -363,7 +423,7 @@ docs/results/        The measurements behind the results on this page
 
 > **Warning:** Nothing here authenticates. Anyone who can reach 8080 can write to the twins, and anyone who can reach 1883 can publish telemetry or brake commands. Keep these ports on a trusted lab network.
 
-Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.html) JSON to `telemetry/<thing name>`. The processor reads `location` + `velocity` (m/s), or `kinematics` as written by `hardware/kuksa_to_ditto.py` (`x`, `y`, `heading` in degrees, `speed` in km/h). Poses must already be in the CARLA frame.
+Vehicles publish [Ditto Protocol](https://eclipse.dev/ditto/protocol-overview.html) JSON to `telemetry/<thing name>`. The `pose` feature is in lab metres and goes through the [lab mapping](#connecting-a-lab-car). The older formats are already in CARLA's frame: `location` + `velocity` (m/s), or `kinematics` as written by `hardware/kuksa_to_ditto.py` (`x`, `y`, `heading` in degrees, `speed` in km/h). A Thing with a `pose` uses it first.
 
 ```json
 {
@@ -606,9 +666,10 @@ The bench's test seeds (9000–9999) have had their one `--final` run. Tune on t
 | Planner and onboard safety monitor | **Working in simulation.** About 2 % avoidable collisions on the held-back bench seeds; left turns often don't finish |
 | Path prediction | **Working.** The ML car uses a [model trained on Waymo data](#trajectory-model), falling back to road-following without it. Other cars follow the road |
 | ML car window and sensor windows | **Working**, showing the model's real inputs and outputs. `lidar_only` has no sensor window yet |
-| Physical vehicles (Rosmaster R2, KUKSA) | **Written, not yet run on hardware.** The motor drivers and KUKSA publisher have never run |
+| Lab car loop: gate watchdog, remote driver, lab-to-CARLA mapping | **Working with the fake car,** checked end to end by `check_physical_loop.py`. The mapping isn't calibrated yet |
+| Physical vehicles (Rosmaster R2, KUKSA) | **Written, not yet run on hardware.** The motor drivers can only stop the car until the ROS2 motor node exists, and the KUKSA publisher has never run |
 | Fully autonomous physical vehicle (Autoware) | **Not started.** Planned last |
-| Lab-to-CARLA coordinate mapping, SkyEye view, Kafka logging, AI recommendations | **Not started** |
+| Overhead camera tracking, SkyEye view, Kafka logging, AI recommendations | **Not started** |
 
 ### Engineering targets
 
@@ -648,7 +709,7 @@ These are the targets from the project report, against what has been measured so
 
 - **It's only tested at one junction.** On Town01's smaller junction it prevented none of the same collisions, so don't assume it carries over.
 - **It doesn't hold the simulated car in the scenarios,** so it's measured there by what it would have done, not by what it prevented.
-- **The path check needs a track in CARLA's frame.** Telemetry alone falls back to the 1.5 s TTC rule. That includes physical vehicles until lab positions are mapped into CARLA.
+- **A lab car is placed by a guessed calibration.** Its pose is mapped into CARLA, but `config/lab_frame.json` hasn't been measured, so the brake and the twin agree with each other but not yet with the floor.
 - **Live PET is predicted.** The `SafetyMetrics` Thing holds PET extrapolated from current velocities. The scenario report's PET is measured after the fact.
 
 **Simulation**
@@ -663,8 +724,9 @@ These are the targets from the project report, against what has been measured so
 **Hardware, models and infrastructure**
 
 - **No trained models are in the repo.** They're all trained locally, and the trajectory model stays out of git until the Waymo licence is checked. See [models/README.md](models/README.md).
-- **The vehicle can't tell if the processor has died.** The gate fails safe if the broker link drops, but a crashed processor simply stops sending hazards.
-- **A silent Wi-Fi drop took 3.8 s to detect** in testing, which is longer than the 1.5 s brake window. Lowering `MQTT_KEEPALIVE` shortens it.
+- **The car only notices silence once it's being driven.** Its gate's 0.3 s watchdog arms on the first drive command, so it stops for a dead link or processor while driving. Before that, it relies on the broker's keepalive, and a silent Wi-Fi drop then took 3.8 s to notice. The car is held until its first release anyway.
+- **The watchdog's 0.3 s isn't measured against real Wi-Fi.** Too tight, and the car will latch on ordinary jitter and need releasing often.
+- **A replayed brake release could free a latched car.** Ditto's brake events carry no sequence number, so the gate can't tell an old `emergency_brake == False` from a new one. Ditto's event `revision` could close this.
 
 ---
 
@@ -680,7 +742,8 @@ CI runs both on every push and pull request to `main`, on Ubuntu with no CARLA o
 | Test file | Needs |
 | --------- | ----- |
 | `test_safety_logic.py`, `test_geometry.py`, `test_ml_driving.py`, `test_traffic_monitor.py`, `test_driving_features.py`, `test_ml_driver.py`, `test_model_panel.py`, `test_pass_test.py`, `test_scenario_suite.py`, `test_record_driving.py`, `test_record_corrections.py`, `test_record_left_turns.py`, `test_lidar_coverage.py`, `test_detection_features.py`, `test_roadside_link.py`, `test_lidar_view.py`, `test_planner.py`, `test_safety_monitor.py`, `test_measure_braking.py`, `test_bench.py`, `test_camera_features.py`, `test_roof_features.py` | Nothing running. Some need `paho` or `pygame`, and skip themselves without them |
-| `test_onboard_perception.py`, `test_record_hazards.py` | Nothing running, and `paho`; skip themselves without it |
+| `test_onboard_perception.py`, `test_record_hazards.py`, `test_fake_lab_car.py` | Nothing running, and `paho`; skip themselves without it |
+| `test_lab_frame.py`, `test_remote_driver.py`, `test_check_physical_loop.py` | Nothing running |
 | `test_agent_brake.py`, `test_ml_car_view.py` | The `carla` and `pygame` packages; skip themselves without them |
 | `test_training_data.py`, `test_train_driving.py`, `test_detection_training.py` | Nothing running. Their model tests need PyTorch, and skip themselves without it |
 | `test_mqtt_pipeline.py` | The Docker stack, not CARLA. Skips itself when the stack is down, as on CI, and resets Thing state. Add `-s` to see the timings |
