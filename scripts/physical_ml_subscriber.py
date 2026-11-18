@@ -21,7 +21,12 @@ until the next valid command, so it can't trip again on the silence it was relea
 A drive command counts only if it is valid JSON with a session id, a sequence number above the last one from that
 session (a new session may start again from 0, after a driver restart) and either hold or finite steer and speed.
 Retained commands, and any before the first gate state, are ignored. Timestamps from the driver's clock are never
-compared with this one. Nothing here drives the motors yet: the command is kept for the drive path to come.
+compared with this one.
+
+An accepted command reaches the motors only while nothing holds them, checked under the same lock as the hold: a
+drive command calls motors.drive(steer, speed), clamped to -1..1 and 0..MAX_DRIVE_SPEED lab m/s, and a hold command
+calls motors.stop(). A drive that raises holds the car. A release drives nothing by itself, so the car moves again
+only on the next fresh command.
 
 Needs only paho-mqtt, plus Rosmaster_Lib or RPi.GPIO for the motors.
 
@@ -46,6 +51,7 @@ DRIVE_TOPIC = "device/vehicle_ml/drive"
 GATE_PREFIX = ("features", "SafetyGate", "properties")
 # shortcut: 0.3 s is three missed commands at 10 Hz, chosen before any real Wi-Fi was measured; tune it on the car
 WATCHDOG_TIMEOUT = 0.3  # seconds of driver silence, by this machine's clock, that hold the motors
+MAX_DRIVE_SPEED = 1.5   # lab m/s; a drive command asking for more is clamped to this
 
 REASSERT_HZ = 20        # re-send the stop while held, in case another process commands the motors
 PWM_FREQUENCY = 1000
@@ -68,6 +74,10 @@ class RosmasterMotors:
         self.bot.set_motor(0, 0, 0, 0)
         self.bot.set_car_motion(0, 0, 0)
 
+    def drive(self, steer, speed):
+        # shortcut: no drive mapping for the real car yet, so it stops; add it with the ROS2 motor node, measured on the car
+        self.stop()
+
 
 class GpioPwmMotors:
     """Motors on PWM pins owned by this process. Jetson.GPIO provides the same module name."""
@@ -88,16 +98,24 @@ class GpioPwmMotors:
         for pwm in self.channels:
             pwm.ChangeDutyCycle(0)
 
+    def drive(self, steer, speed):
+        # shortcut: no drive mapping for raw PWM yet, so it stops; add it once the motors are calibrated
+        self.stop()
+
 
 class SimMotors:
-    """Records stops instead of driving hardware."""
+    """Records stops and drives instead of driving hardware."""
     name = "sim"
 
     def __init__(self):
         self.stops = 0
+        self.drives = []
 
     def stop(self):
         self.stops += 1
+
+    def drive(self, steer, speed):
+        self.drives.append((steer, speed))
 
 
 def make_motors(driver, pins):
@@ -237,6 +255,7 @@ class SafetyGateSubscriber:
         """Takes a drive or hold command and feeds the watchdog with it. Returns whether it was accepted. It never
         releases a hold: only emergency_brake == False does."""
         command = None if retained else parse_drive_command(payload)
+        failure = None
         with self.lock:
             if command is None or not self.have_state:
                 return False
@@ -245,6 +264,16 @@ class SafetyGateSubscriber:
                 return False  # a replay, or one overtaken by a newer command
             self.command = command
             self.last_command_at = self.clock()
+            if not self.held:  # under the same lock as the hold, so nothing drives once a hold has been set
+                try:
+                    if command["hold"]:
+                        self.motors.stop()
+                    else:
+                        self.motors.drive(max(-1.0, min(1.0, command["steer"])), max(0.0, min(MAX_DRIVE_SPEED, command["speed"])))
+                except Exception as e:  # noqa: BLE001  # whatever went wrong, the car must not keep its last command
+                    failure = e
+        if failure is not None:
+            self._engage(f"drive failed: {failure}")  # outside the lock, which _engage takes
         return True
 
     def check_watchdog(self):

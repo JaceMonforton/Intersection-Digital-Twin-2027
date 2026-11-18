@@ -25,7 +25,12 @@ from central_gpu_processor import (
     time_to_collision,
     ttc_check_applies,
 )
-from physical_ml_subscriber import SafetyGateSubscriber, SimMotors, parse_gate_event
+from physical_ml_subscriber import (
+    MAX_DRIVE_SPEED,
+    SafetyGateSubscriber,
+    SimMotors,
+    parse_gate_event,
+)
 from waymo_predictor_node import (
     HISTORY_FRAMES,
     LEFT,
@@ -649,6 +654,60 @@ def test_drive_commands_are_ignored_until_the_first_gate_state():
     gate = SafetyGateSubscriber(SimMotors(), clock=FakeClock())
     assert not gate.handle_drive(drive(1))
     assert gate.held
+
+
+# --- The drive path ---
+def test_a_released_gate_passes_a_drive_command_to_the_motors_clamped():
+    gate, _ = released_gate()
+    gate.handle_drive(drive(1, steer=0.25, speed=1.0))
+    gate.handle_drive(drive(2, steer=-7.0, speed=99.0))
+    assert gate.motors.drives == [(0.25, 1.0), (-1.0, MAX_DRIVE_SPEED)]
+
+
+def test_a_held_gate_never_drives_whatever_arrives():
+    gate, clock = released_gate()
+    gate.handle_payload(brake_event(True))
+    for seq in range(1, 20):
+        gate.handle_drive(drive(seq))
+        clock.now += 0.1
+        gate.check_watchdog()
+    assert gate.motors.drives == []
+
+
+def test_nothing_drives_before_the_first_gate_state():
+    gate = SafetyGateSubscriber(SimMotors(), clock=FakeClock())
+    gate.handle_drive(drive(1))
+    assert gate.motors.drives == []
+
+
+def test_a_hold_command_stops_rather_than_driving_at_zero():
+    gate, _ = released_gate()
+    stops = gate.motors.stops
+    gate.handle_drive(drive(1, hold=True))
+    assert gate.motors.drives == [] and gate.motors.stops == stops + 1
+
+
+def test_a_release_doesnt_replay_the_command_from_before_the_hold():
+    gate, clock = released_gate()
+    gate.handle_drive(drive(1))
+    clock.now += 1.0
+    gate.check_watchdog()
+    gate.handle_payload(brake_event(False))
+    assert gate.motors.drives == [(0.0, 1.0)]  # only the one sent while it was released
+    gate.handle_drive(drive(2, steer=0.1, speed=0.5))
+    assert gate.motors.drives[-1] == (0.1, 0.5)
+
+
+class _FailingMotors(SimMotors):
+    def drive(self, steer, speed):
+        raise OSError("motor board gone")
+
+
+def test_a_drive_that_fails_holds_the_car():
+    gate = SafetyGateSubscriber(_FailingMotors(), clock=FakeClock())
+    gate.handle_payload(brake_event(False))
+    gate.handle_drive(drive(1))
+    assert gate.held and "drive failed" in gate.reason
 
 
 class _Ok:
