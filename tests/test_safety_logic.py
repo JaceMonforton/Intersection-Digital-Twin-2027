@@ -287,6 +287,16 @@ def test_thing_to_track_without_position():
     assert thing_to_track("v", {"features": {}}) is None
 
 
+def test_thing_to_track_maps_a_lab_pose_into_carla_like_the_twin():
+    from lab_frame import LabFrame
+
+    frame = LabFrame(scale=10.0, rotation_deg=0.0, flip_y=True, offset_x=-47.8, offset_y=20.4)
+    thing = {"features": {"pose": {"properties": {"x": 1.0, "y": 0.5, "heading": 90.0, "speed": 1.0}}}}
+    track = thing_to_track("v", thing, frame)
+    assert (track.x, track.y) == pytest.approx((-37.8, 15.4))
+    assert (track.vx, track.vy) == pytest.approx((0.0, -10.0), abs=1e-9)
+
+
 def test_apply_event_merges_partial_updates():
     thing = {"features": {"location": {"properties": {"x": 1, "y": 2}}}}
     apply_event(thing, "/features/location/properties/x", 5)

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import lab_frame
 import numpy as np
 import requests
 import websocket
@@ -143,8 +144,7 @@ PERSON_MOVING_SPEED = 1.0   # m/s; below this a person's track is mostly positio
 TELEMETRY_STALE_AFTER = 1.0 # seconds without an update before a vehicle leaves the evaluation
 FUSION_GATE = 3.0           # metres; max distance to associate a detection with telemetry
 TELEMETRY_WEIGHT = 0.7      # share of the fused position taken from telemetry
-TELEMETRY_SCALE = 1.0       # lab metres -> CARLA metres (10.0 for a 1:10 testbed)
-KINEMATICS_SPEED_TO_MS = 1 / 3.6  # kuksa_to_ditto forwards VSS Vehicle.Speed, which is km/h
+LAB_FRAME = lab_frame.load()  # lab metres -> CARLA, shared with the twin mirror; a bad file stops the processor here
 BRAKE_RETRY_AFTER = 0.25    # seconds before re-sending a brake Ditto has not yet confirmed
 METRICS_INTERVAL = 1.0      # seconds between SafetyMetrics writes and log lines
 HEADLESS_RATE = 20          # Hz, used with --no-carla
@@ -271,31 +271,13 @@ def _dig(d, *keys):
     return d
 
 
-def _prop(thing, feature, field):
-    v = _dig(thing, "features", feature, "properties", field)
-    return float(v) if isinstance(v, (int, float)) else None
-
-
-def thing_to_track(name, thing):
-    """Track from a Ditto thing, or None without a position. Accepts location + velocity
-    or the kinematics feature written by hardware/kuksa_to_ditto.py."""
-    x = _prop(thing, "location", "x")
-    y = _prop(thing, "location", "y")
-    vx = _prop(thing, "velocity", "vx")
-    vy = _prop(thing, "velocity", "vy")
-    if x is None or y is None:
-        x, y = _prop(thing, "kinematics", "x"), _prop(thing, "kinematics", "y")
-    if x is None or y is None:
+def thing_to_track(name, thing, frame=None):
+    """Track in CARLA's frame from a Ditto thing, or None without a usable position. Reads every telemetry format
+    through lab_frame, as the twin mirror does, so the brake and CARLA put the car in the same place."""
+    pose = lab_frame.carla_pose(thing, frame or LAB_FRAME)
+    if pose is None:
         return None
-    if vx is None or vy is None:
-        speed = (_prop(thing, "kinematics", "speed") or 0.0) * KINEMATICS_SPEED_TO_MS
-        heading = _prop(thing, "kinematics", "heading")
-        if heading is None:
-            heading = _prop(thing, "orientation", "yaw") or 0.0
-        vx = speed * math.cos(math.radians(heading))
-        vy = speed * math.sin(math.radians(heading))
-    return Track(name, x * TELEMETRY_SCALE, y * TELEMETRY_SCALE,
-                 vx * TELEMETRY_SCALE, vy * TELEMETRY_SCALE)
+    return Track(name, pose["x"], pose["y"], pose["vx"], pose["vy"])
 
 
 def fuse(telemetry, detections, gate=FUSION_GATE):
@@ -539,7 +521,7 @@ class DittoLink:
         path = env.get("path", "/")
         with self.lock:
             apply_event(self.things[name], path, env.get("value"))
-            if path.startswith(("/features/location", "/features/velocity", "/features/kinematics",
+            if path.startswith(("/features/pose", "/features/location", "/features/velocity", "/features/kinematics",
                                 "/features/orientation")) or path in ("/", "/features"):
                 self.updated[name] = time.time()
 

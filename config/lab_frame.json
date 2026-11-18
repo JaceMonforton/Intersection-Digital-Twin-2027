@@ -1,0 +1,9 @@
+{
+  "calibrated": false,
+  "note": "Not measured yet. Puts the lab origin at junction 189's centre, at 10x for 1/10 cars, with the lab's x along CARLA's x. Replace with a fit of known floor marks seen by the overhead camera, and set calibrated to true with who measured it and when.",
+  "scale": 10.0,
+  "rotation_deg": 0.0,
+  "flip_y": true,
+  "offset_x": -47.8,
+  "offset_y": 20.4
+}

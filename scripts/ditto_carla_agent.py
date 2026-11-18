@@ -14,6 +14,7 @@ import threading
 import time
 
 import carla
+import lab_frame
 import numpy as np
 import pygame
 import requests
@@ -33,15 +34,9 @@ DITTO_AUTH = ("ditto", "ditto")
 FPS = 30
 LOG_INTERVAL = 0.5  # seconds between telemetry log lines (0 = log every poll)
 
-# --- Mapping from the physical / Ditto frame to the CARLA world ---
-# Order applied: scale -> flip -> offset (offsets are in CARLA metres).
-POSITION_SCALE = 1.0    # e.g. 10.0 for a 1:10 scale testbed
-FLIP_Y = False          # ROS is right-handed (y left); CARLA is left-handed (y right).
-                        # True also negates the yaw.
-X_OFFSET = 0.0
-Y_OFFSET = 0.0
-YAW_IN_RADIANS = False  # True if the publisher sends yaw in radians (ROS style)
-YAW_OFFSET_DEG = 0.0
+# --- Mapping from the lab to the CARLA world ---
+# One mapping, shared with the processor, from config/lab_frame.json: see scripts/lab_frame.py
+LAB_FRAME = lab_frame.load()
 
 # --- Ground handling ---
 SNAP_TO_GROUND = True   # use the road height at (x, y) instead of the published z
@@ -91,20 +86,13 @@ def find_signal(thing, group, field):
     return None
 
 
-def parse_pose(thing):
-    """Return (pose, missing). pose values are None where absent;
-    missing lists which of x / y could not be found."""
-    pose = {
-        "x": find_signal(thing, "location", "x"),
-        "y": find_signal(thing, "location", "y"),
-        "z": find_signal(thing, "location", "z"),
-        "yaw": find_signal(thing, "orientation", "yaw"),
-        "speed_kmh": find_signal(thing, "kuksa", "Vehicle.Speed"),
-    }
-    if pose["yaw"] is None:
-        pose["yaw"] = find_signal(thing, "location", "yaw")
-    missing = [k for k in ("x", "y") if pose[k] is None]
-    return pose, missing
+def parse_pose(thing, frame=None):
+    """Return (pose, missing): the pose in CARLA's frame, read and mapped by lab_frame exactly as the processor
+    reads it, with None where a value is absent; missing lists x and y if there's no usable position."""
+    pose = lab_frame.carla_pose(thing, frame or LAB_FRAME)
+    if pose is None:
+        return {"x": None, "y": None, "z": None, "yaw": None, "speed_kmh": None}, ["x", "y"]
+    return {"x": pose["x"], "y": pose["y"], "z": pose["z"], "yaw": pose["yaw"], "speed_kmh": pose["speed"] * 3.6}, []
 
 
 def parse_emergency_brake(thing):
@@ -149,18 +137,6 @@ def step_bicycle(x, y, yaw_deg, speed, steer, dt):
     x += v * math.cos(yaw) * dt
     y += v * math.sin(yaw) * dt
     return x, y, math.degrees(yaw + yaw_rate * dt)
-
-
-def map_to_carla(x, y, yaw):
-    """Map a Ditto pose (x, y, yaw) into the CARLA frame; yaw returned in degrees."""
-    x *= POSITION_SCALE
-    y *= POSITION_SCALE
-    if YAW_IN_RADIANS:
-        yaw = math.degrees(yaw)
-    if FLIP_Y:
-        y = -y
-        yaw = -yaw
-    return x + X_OFFSET, y + Y_OFFSET, yaw + YAW_OFFSET_DEG
 
 
 def carla_img_to_pygame_surface(image):
@@ -376,7 +352,7 @@ class DigitalTwinAgent:
         if not t["connected"] or self._braked:
             return  # stay put; dead reckoning resumes from here, a live pose jumps back to the feed
         if t["has_pose"]:
-            x, y, yaw = map_to_carla(t["x"], t["y"], t["yaw"])
+            x, y, yaw = t["x"], t["y"], t["yaw"]  # already in CARLA's frame: see parse_pose
             self._dr = None  # re-seed dead reckoning from the real pose if pose later vanishes
         elif DEAD_RECKON and t["has_drive"]:
             if self._dr is None:
@@ -396,7 +372,7 @@ class DigitalTwinAgent:
             )
             z = (wp.transform.location.z if wp else 0.0) + GROUND_CLEARANCE
         else:
-            z = t["z"] * POSITION_SCALE
+            z = t["z"]  # only the older, CARLA-frame telemetry carries one
 
         self.vehicle.set_transform(
             carla.Transform(
