@@ -10,6 +10,7 @@ Usage:
 import argparse
 import json
 import math
+import signal
 import threading
 import time
 
@@ -487,7 +488,17 @@ class DigitalTwinAgent:
         print("[CLEANUP] Done.")
 
 
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--thing", default=DEFAULT_THING, help=f"Thing name in the {NAMESPACE} namespace")
-    DigitalTwinAgent(parser.parse_args().thing).run()
+    for name in ("SIGBREAK", "SIGTERM"):  # so being stopped still removes the twin from CARLA
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
+    try:
+        DigitalTwinAgent(parser.parse_args().thing).run()
+    except KeyboardInterrupt:
+        pass

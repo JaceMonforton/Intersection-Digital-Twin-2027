@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import random
+import signal
 import threading
 import time
 
@@ -136,6 +137,10 @@ class FaultyLink:
         return [item for _, _, item in due]
 
 
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def pair(text):
     a, b = (float(v) for v in text.split(","))
     return a, b
@@ -158,6 +163,9 @@ def main():
     if not (0.0 <= args.drop < 1.0 and 0.0 <= args.replay <= 1.0 and 0.0 <= args.delay[0] <= args.delay[1]):
         parser.error("--drop must be in [0, 1), --replay in [0, 1] and --delay MIN,MAX with 0 <= MIN <= MAX")
 
+    for name in ("SIGBREAK", "SIGTERM"):  # how full_loop_sim.py and check_physical_loop.py stop it on Windows
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
     started = time.monotonic()
     outages = [(started + a, started + b) for a, b in args.outage]
     rng = random.Random(args.seed)

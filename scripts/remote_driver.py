@@ -20,6 +20,7 @@ import argparse
 import json
 import math
 import random
+import signal
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ import uuid
 import lab_frame
 
 POSE_MAX_AGE = 0.25  # s since a new pose last arrived; inside the gate's 0.3 s, at the fake car's 20 Hz
+SLOW_TICK = 0.2      # s between commands that's logged, with where the time went: at 0.3 s the car's watchdog holds it
 
 
 class PoseTracker:
@@ -98,7 +100,14 @@ def next_command(stream, tracker, decide, frame):
     return stream.drive(steer, max(0.0, speed / frame.scale))
 
 
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
+    for name in ("SIGBREAK", "SIGTERM"):  # so being stopped still sends the hold on the way out
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--car", default="vehicle_ml", help="the Thing name: its telemetry and command topics")
     parser.add_argument("--broker", default="localhost")
@@ -150,8 +159,11 @@ def main():
     started = time.monotonic()
     print(f"[REMOTE] Driving {args.car} through its twin{' (dry run)' if args.dry_run else ''}. Session {stream.session}.", flush=True)
     try:
+        last_sent = None
         while args.seconds <= 0 or time.monotonic() - started < args.seconds:
+            marks = [time.perf_counter()]
             world.wait_for_tick(10.0)  # a stalled simulation stops the commands, and the car's watchdog then holds it
+            marks.append(time.perf_counter())
             ego = tracker.ego()
             if ego is not None and driver is None:
                 driver = ModelDriver(policy, LaneDriver(find_waypoint(ego[0], ego[1]), rng), find_waypoint, rng)
@@ -163,15 +175,22 @@ def main():
             cars = [actor_state(a) for a in world.get_actors().filter("vehicle.*") if a.attributes.get("role_name") != args.car]
             walkers = [(w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
                        for w in world.get_actors().filter("walker.pedestrian.*")]
+            marks.append(time.perf_counter())
             try:
                 released = brake_is_off(session.get(GATE_URL, timeout=0.2).json())
             except (requests.RequestException, ValueError):
                 released = False  # can't read the gate, so don't drive
+            marks.append(time.perf_counter())
 
             def decide(ego, driver=driver, cars=cars, walkers=walkers, released=released):
                 return driver.decide(ego, lights.not_green(), cars, walkers, released)
 
             send(next_command(stream, tracker, decide, frame))
+            marks.append(time.perf_counter())
+            if last_sent is not None and marks[-1] - last_sent > SLOW_TICK:
+                parts = ", ".join(f"{name} {1000 * (b - a):.0f} ms" for name, a, b in zip(("tick", "actors", "gate", "decide"), marks, marks[1:]))
+                print(f"[REMOTE] {1000 * (marks[-1] - last_sent):.0f} ms between commands: {parts}", flush=True)
+            last_sent = marks[-1]
     except KeyboardInterrupt:
         pass
     finally:

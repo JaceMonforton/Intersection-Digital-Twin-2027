@@ -282,6 +282,15 @@ overhead camera, or the fake car ──pose──▶ MQTT ──▶ Ditto ──
 
 **The fake car** (`scripts/fake_lab_car.py`) stands in for the real one until it drives. It runs the unchanged gate in front of a simulated 1/10 car, and can drop, delay, replay or silence messages (`--drop`, `--delay`, `--replay`, `--outage`). Every pose it sends says `"simulated stand-in"`.
 
+**To watch the whole loop**, run one command. It starts whatever isn't running, opens the twin's chase-camera window, and drives the fake car until Ctrl+C:
+
+```powershell
+python full_loop_sim.py
+python full_loop_sim.py --seconds 120 --outage 20,22   # with 2 s of silence 20 s in: the gate holds the car
+```
+
+It takes the fake car's fault options too (`--drop`, `--delay`, `--replay`), plus `--no-view`, `--dry-run` and `--leave-running`. On the way out it stops the driver first, so a hold is the car's last command. If the car latched, release it with `python scripts/setup_entities.py --clear-brake`.
+
 **To check the whole loop**, with CARLA and the Docker stack up and nothing else using CARLA:
 
 ```powershell
@@ -350,6 +359,7 @@ It reads the sweeps through shared memory, so it can't hold up the clock, and th
 
 ```
 run_simulation.py    Starts everything and runs the chosen configs on the chosen scenarios
+full_loop_sim.py     Starts everything and drives the fake lab car through its twin, until Ctrl+C
 docker/              Ditto stack: docker-compose.yml, mosquitto.conf, nginx.conf
 config/              Ditto policies, Things and connections, and the CARLA 0.9.16 client
 models/              Where trained models go, and the contract they must meet
@@ -743,7 +753,7 @@ CI runs both on every push and pull request to `main`, on Ubuntu with no CARLA o
 | --------- | ----- |
 | `test_safety_logic.py`, `test_geometry.py`, `test_ml_driving.py`, `test_traffic_monitor.py`, `test_driving_features.py`, `test_ml_driver.py`, `test_model_panel.py`, `test_pass_test.py`, `test_scenario_suite.py`, `test_record_driving.py`, `test_record_corrections.py`, `test_record_left_turns.py`, `test_lidar_coverage.py`, `test_detection_features.py`, `test_roadside_link.py`, `test_lidar_view.py`, `test_planner.py`, `test_safety_monitor.py`, `test_measure_braking.py`, `test_bench.py`, `test_camera_features.py`, `test_roof_features.py` | Nothing running. Some need `paho` or `pygame`, and skip themselves without them |
 | `test_onboard_perception.py`, `test_record_hazards.py`, `test_fake_lab_car.py` | Nothing running, and `paho`; skip themselves without it |
-| `test_lab_frame.py`, `test_remote_driver.py`, `test_check_physical_loop.py` | Nothing running |
+| `test_lab_frame.py`, `test_remote_driver.py`, `test_check_physical_loop.py`, `test_full_loop_sim.py` | Nothing running |
 | `test_agent_brake.py`, `test_ml_car_view.py` | The `carla` and `pygame` packages; skip themselves without them |
 | `test_training_data.py`, `test_train_driving.py`, `test_detection_training.py` | Nothing running. Their model tests need PyTorch, and skip themselves without it |
 | `test_mqtt_pipeline.py` | The Docker stack, not CARLA. Skips itself when the stack is down, as on CI, and resets Thing state. Add `-s` to see the timings |
