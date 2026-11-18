@@ -108,8 +108,10 @@ def main():
     args = parser.parse_args()
 
     import carla
+    import numpy as np
     import paho.mqtt.client as mqtt
     import requests
+    from driving_features import INPUT_SIZE
     from ml_driver import DrivingPolicy, ModelDriver, actor_state, brake_is_off
     from planner import Planner
     from safety_monitor import SafetyMonitor
@@ -139,6 +141,7 @@ def main():
     world.wait_for_tick(10.0)
     world_map, lights, session = world.get_map(), RedLightWatch(carla, world), requests.Session()
     policy, rng = DrivingPolicy(), random.Random(0)
+    policy(np.zeros(INPUT_SIZE, dtype=np.float32))  # the first run is slow, and would outlast the gate's watchdog
 
     def find_waypoint(x, y):
         return world_map.get_waypoint(carla.Location(x=float(x), y=float(y), z=0.0), project_to_road=True, lane_type=carla.LaneType.Driving)
@@ -153,6 +156,10 @@ def main():
             if ego is not None and driver is None:
                 driver = ModelDriver(policy, LaneDriver(find_waypoint(ego[0], ego[1]), rng), find_waypoint, rng)
                 driver.planner, driver.monitor = Planner(JUNCTION, has_roadside=False), SafetyMonitor()
+            if driver is None:
+                # Nothing is sent until it can drive: the first command arms the gate's watchdog, and setting up
+                # took longer than its 0.3 s. Until then the gate isn't armed and nothing drives the car.
+                continue
             cars = [actor_state(a) for a in world.get_actors().filter("vehicle.*") if a.attributes.get("role_name") != args.car]
             walkers = [(w.get_location().x, w.get_location().y, w.get_velocity().x, w.get_velocity().y)
                        for w in world.get_actors().filter("walker.pedestrian.*")]
