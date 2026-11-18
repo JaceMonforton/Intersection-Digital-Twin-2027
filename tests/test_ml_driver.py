@@ -40,6 +40,72 @@ def controls(driver, x=1.0, y=0.0, yaw=0.0, brake_off=True):
     return driver.controls((x, y, 5.0, 0.0, yaw), [], [], [], brake_off)
 
 
+class ScriptedPolicy:
+    def __init__(self):
+        self.tick = 0
+
+    def __call__(self, inputs):
+        self.tick += 1
+        return (0.05 * ((self.tick % 7) - 3), 3.0 + (self.tick % 5))
+
+
+def scripted_drive(driver):
+    """40 ticks with a car closing in ahead, a person by the road, two held ticks and a flickering roadside link."""
+    out, x, speed = [], 1.0, 4.0
+    for tick in range(40):
+        cars = [(x + 30.0 - 0.8 * tick, 0.0, 0.0, 0.0, 0.0)] if 10 <= tick < 30 else []
+        walkers = [(x + 15.0, 3.0, 0.0, -1.2)] if 20 <= tick < 25 else []
+        brake_off = tick not in (33, 34)
+        link_up = None if tick < 36 else (tick % 2 == 0)
+        out.append(tuple(float(v) for v in driver.controls((x, 0.0, speed, 0.0, 0.0), [], cars, walkers, brake_off, link_up)))
+        x += speed * 0.1
+    return out
+
+
+# Recorded from controls() before it was split into decide() and the speed controller, so the bench drives exactly
+# as it did when its results were measured. Regenerate only for a change meant to alter how the car drives.
+GOLDEN_DRIVE = [
+    (-0.05, 0.08, 0.0), (-0.05, 0.16, 0.0), (-0.025, 0.24, 0.0), (0.012500000000000004, 0.32, 0.0), (0.05625, 0.0, 0.2),
+    (0.10312500000000002, 0.0, 0.17000000000000004), (-0.0234375, 0.0, 0.11450000000000005), (-0.06171875, 0.08, 0.0),
+    (-0.055859375, 0.16, 0.0), (-0.0279296875, 0.0, 0.2), (0.011035156622529026, 0.0, 0.3199999809265137),
+    (0.055517579056322576, 0.0, 0.3199999809265137), (0.10275879250839354, 0.0, 0.3199999809265137),
+    (-0.02362060672603547, 0.0, 0.3199999809265137), (-0.061810304108075795, 0.0, 0.3199999809265137),
+    (-0.05590515242656693, 0.0, 0.3199999809265137), (-0.027952576213283464, 0.0, 0.3199999809265137),
+    (0.0110237122658873, 0.0, 0.5199999809265137), (0.05551185687800171, 0.0, 0.6000000000000001),
+    (0.10275593141923309, 0.0, 0.6000000000000001), (-0.02362203727061571, 0.0, 0.6000000000000001),
+    (-0.061811019380365914, 0.0, 0.6000000000000001), (-0.05590551006271199, 0.0, 0.6000000000000001),
+    (-0.027952755031355993, 0.0, 0.6000000000000001), (0.011023622856851035, 0.0, 0.6000000000000001),
+    (0.05551181217348358, 0.0, 0.6000000000000001), (0.10275590906697403, 0.0, 0.6000000000000001),
+    (-0.023622048446745217, 0.0, 0.8), (-0.06181102496843067, 0.0, 0.8), (-0.05590551285674436, 0.0, 0.8),
+    (-0.02795275642837218, 0.0, 0.68), (0.011023621785813911, 0.0, 0.548), (0.05551181089290696, 0.0, 0.4058),
+    (0.0, 0.0, 1.0), (0.0, 0.0, 1.0), (0.0, 0.0, 1.0), (0.0, 0.0, 1.0), (0.0, 0.0, 1.0), (0.0, 0.0, 1.0),
+    (0.05, 0.0, 0.2),
+]
+
+
+def planned_driver():
+    from planner import Planner
+    from safety_monitor import SafetyMonitor
+
+    driver = make_driver(ScriptedPolicy())
+    driver.planner, driver.monitor = Planner((500.0, 500.0)), SafetyMonitor()
+    return driver
+
+
+def test_direct_driving_is_exactly_what_the_bench_measured():
+    assert scripted_drive(planned_driver()) == GOLDEN_DRIVE
+
+
+def test_decide_gives_the_steering_and_target_speed_that_controls_then_applies():
+    driver = planned_driver()
+    inputs, output, drive, allowed = driver.decide((1.0, 0.0, 4.0, 0.0, 0.0), [], [], [], True)
+    assert inputs.shape == (INPUT_SIZE,) and allowed
+    assert float(drive[0]) == pytest.approx(output[0])  # the model's steering; the planner only touches the speed
+    held = planned_driver()
+    held.decide((1.0, 0.0, 4.0, 0.0, 0.0), [], [], [], True)
+    assert held.decide((1.4, 0.0, 4.0, 0.0, 0.0), [], [], [], False)[3] is False  # the brake holds it
+
+
 def test_no_model_file_is_a_refusal(tmp_path):
     with pytest.raises(FileNotFoundError):
         DrivingPolicy(tmp_path / "missing.onnx")

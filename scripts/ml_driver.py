@@ -159,6 +159,16 @@ class ModelDriver:
     def controls(self, ego, not_green, cars, walkers, brake_off, link_up=None):
         """(steer, throttle, brake). The model runs either way, so its route stays current under the brake. link_up is
         whether the roadside link is up, or None with no roadside unit; only the safety monitor reads it."""
+        inputs, output, drive, brake_off = self.decide(ego, not_green, cars, walkers, brake_off, link_up)
+        applied = self.controller.step(drive, math.hypot(ego[2], ego[3])) if brake_off else self.controller.hold()
+        if self.telemetry is not None:
+            self.telemetry.send(inputs, output, applied, brake_off, plan=self.last_plan)  # output stays the model's own
+        return applied
+
+    def decide(self, ego, not_green, cars, walkers, brake_off, link_up=None):
+        """Everything before the speed controller: (inputs, the model's output, the drive as (steer, target speed in
+        m/s), and whether it may drive). The model, then the planner, then the safety monitor. A car whose own
+        controller works its motors, such as a real one driven through its twin, is sent the drive itself."""
         self._follow_route(ego[0], ego[1], ego[4])
         inputs = inputs_for(self.lane, ego, not_green, cars, walkers)
         output = self.policy(inputs)
@@ -175,10 +185,7 @@ class ModelDriver:
             brake_off = allowed is not None
             if brake_off and allowed != float(drive[1]):
                 drive = np.array((drive[0], allowed), dtype=np.float32)
-        applied = self.controller.step(drive, math.hypot(ego[2], ego[3])) if brake_off else self.controller.hold()
-        if self.telemetry is not None:
-            self.telemetry.send(inputs, output, applied, brake_off, plan=self.last_plan)  # output stays the model's own
-        return applied
+        return inputs, output, drive, brake_off
 
 
 def is_new_contact(last_seen, other_id, now):
